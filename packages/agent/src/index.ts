@@ -23,6 +23,7 @@ export {
 export { runSetup, type SetupIO } from "./setup.js";
 export {
   GitError,
+  commitWorktree,
   prepareWorktree,
   pushBranch,
   removeWorktree,

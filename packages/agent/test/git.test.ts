@@ -2,10 +2,13 @@ import { execFile, execFileSync } from "node:child_process";
 import {
   chmodSync,
   existsSync,
+  lstatSync,
   mkdirSync,
   mkdtempSync,
   readdirSync,
   readFileSync,
+  realpathSync,
+  renameSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -14,8 +17,16 @@ import { createServer, type AddressInfo, type Socket } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { prepareWorktree, pushBranch, removeWorktree, validateBranch, validateJobId, validateRepo } from "../src/index.js";
-import { defaultRemote, MIRROR_CONFIG, runGit, scrubbedEnv } from "../src/git.js";
+import {
+  commitWorktree,
+  prepareWorktree,
+  pushBranch,
+  removeWorktree,
+  validateBranch,
+  validateJobId,
+  validateRepo,
+} from "../src/index.js";
+import { defaultRemote, MIRROR_CONFIG, mirrorGit, runGit, scrubbedEnv } from "../src/git.js";
 
 // Fixture git: isolated from the developer's own config so fixtures build the same everywhere.
 const FIXTURE_ENV = {
@@ -645,5 +656,352 @@ describe("removeWorktree", () => {
     symlinkSync(outside, join(cache, "work"));
     await expect(removeWorktree("o/n", "rm4", cache)).rejects.toThrow(/refusing to remove/);
     expect(readFileSync(join(outside, "rm4", "keep.txt"), "utf8")).toBe("keep\n");
+  });
+});
+
+/** A bare repo whose config redirects the canonical remote to `evil` and defines a smudge filter writing `marker`. */
+function attackerCommonDir(evil: string, marker: string): string {
+  const att = join(temp(), "attacker.git");
+  fx(["init", "-q", "--bare", "-b", "main", att]);
+  writeFileSync(
+    join(att, "config"),
+    `${MIRROR_CONFIG}[filter "p"]\n\tsmudge = "sh -c 'touch ${marker}; cat'"\n[url "${evil}"]\n\tinsteadOf = ${remote}\n`,
+  );
+  mkdirSync(join(att, "info"), { recursive: true });
+  writeFileSync(join(att, "info", "attributes"), "* filter=p\n");
+  return att;
+}
+
+/** A bare "evil" remote with a main branch carrying `evilfile` and a .gitattributes naming filter p. */
+function evilWithMain(): string {
+  const evil = emptyBare();
+  const seed = join(temp(), "seed");
+  fx(["init", "-q", "-b", "main", seed]);
+  writeFileSync(join(seed, "evilfile"), "evil\n");
+  writeFileSync(join(seed, ".gitattributes"), "* filter=p\n");
+  fx(["add", "evilfile", ".gitattributes"], seed);
+  fx(["commit", "-q", "-m", "evil"], seed);
+  fx(["push", "-q", evil, "main"], seed);
+  return evil;
+}
+
+describe("a runner redirecting the mirror's common dir", () => {
+  it("cannot make the agent use another repo's config through <mirror>/commondir", async () => {
+    const cache = temp();
+    await prepareWorktree("o/n", "main", "j1", cache, file);
+    const mirror = mirrorOf(cache);
+    const marker = join(cache, "SMUDGE_RAN");
+    const evil = evilWithMain();
+    const att = attackerCommonDir(evil, marker);
+    writeFileSync(join(mirror, "commondir"), `${att}\n`);
+
+    // Control: plain git honors the planted commondir: the attacker's config applies and a fetch of the canonical
+    // URL is served by evil.
+    expect(fx(["--git-dir", mirror, "config", "--list"])).toMatch(/filter\.p\.smudge/);
+    fx(["--git-dir", mirror, "fetch", "-q", "--", remote, "+refs/heads/main:refs/x/probe"]);
+    expect(shaIn(att, "refs/x/probe")).toBe(shaIn(evil, "refs/heads/main"));
+
+    const ws = await prepareWorktree("o/n", "main", "j2", cache, file);
+    expect(readFileSync(join(ws.dir, "README"), "utf8")).toBe("main\n");
+    expect(existsSync(join(ws.dir, "evilfile"))).toBe(false);
+    expect(existsSync(marker)).toBe(false);
+    expect(existsSync(join(mirror, "commondir"))).toBe(false);
+  });
+
+  it("pins GIT_DIR and GIT_COMMON_DIR so a commondir planted after the reset is ignored", async () => {
+    const cache = temp();
+    await prepareWorktree("o/n", "main", "j1", cache, file);
+    const mirror = mirrorOf(cache);
+    const att = attackerCommonDir(emptyBare(), join(cache, "m"));
+    writeFileSync(join(mirror, "commondir"), `${att}\n`);
+    // Control: plain git with --git-dir alone follows the commondir.
+    const real = (p: string) => realpathSync(p.trim());
+    expect(real(fx(["--git-dir", mirror, "rev-parse", "--git-common-dir"]))).toBe(real(att));
+    const git = mirrorGit(cache, mirror, {});
+    expect(real((await git(["rev-parse", "--git-common-dir"])).stdout)).toBe(real(mirror));
+    expect((await git(["config", "--list"])).stdout).not.toMatch(/filter|url\./);
+  });
+
+  it("deletes planted gitdir and object alternates", async () => {
+    const cache = temp();
+    await prepareWorktree("o/n", "main", "j1", cache, file);
+    const mirror = mirrorOf(cache);
+    // An object that exists only in the evil repo.
+    const evil = evilWithMain();
+    const evilSha = shaIn(evil, "refs/heads/main") as string;
+    writeFileSync(join(mirror, "objects", "info", "alternates"), `${join(evil, "objects")}\n`);
+    writeFileSync(join(mirror, "objects", "info", "http-alternates"), "https://evil.example/objects\n");
+    writeFileSync(join(mirror, "gitdir"), "/nowhere/.git\n");
+    // Control: plain git sees the borrowed object.
+    expect(() => fx(["--git-dir", mirror, "cat-file", "-e", evilSha])).not.toThrow();
+
+    await prepareWorktree("o/n", "main", "j2", cache, file);
+    for (const p of ["objects/info/alternates", "objects/info/http-alternates", "gitdir"]) {
+      expect(existsSync(join(mirror, p))).toBe(false);
+    }
+    expect(() => fx(["--git-dir", mirror, "cat-file", "-e", evilSha])).toThrow();
+  });
+
+  it("resets the mirror (commondir included) before removeWorktree prunes", async () => {
+    const cache = temp();
+    const ws = await prepareWorktree("o/n", "main", "rm5", cache, file);
+    const mirror = mirrorOf(cache);
+    const att = attackerCommonDir(emptyBare(), join(cache, "m"));
+    writeFileSync(join(mirror, "commondir"), `${att}\n`);
+    await removeWorktree("o/n", "rm5", cache);
+    expect(existsSync(join(mirror, "commondir"))).toBe(false);
+    expect(fx(["--git-dir", mirror, "worktree", "list", "--porcelain"])).not.toContain(ws.dir);
+  });
+});
+
+describe("the mirror reset never follows symlinks", () => {
+  /** A victim directory outside the mirror with one precious file in it (optionally under a subpath). */
+  function victimDir(sub = ""): string {
+    const v = temp();
+    mkdirSync(join(v, sub), { recursive: true });
+    writeFileSync(join(v, sub, "precious.txt"), "keep\n");
+    return v;
+  }
+
+  async function poisoned(plant: (mirror: string) => void): Promise<string> {
+    const cache = temp();
+    await prepareWorktree("o/n", "main", "j1", cache, file);
+    plant(mirrorOf(cache));
+    await prepareWorktree("o/n", "main", "j2", cache, file);
+    return mirrorOf(cache);
+  }
+
+  it("removes a hooks symlink instead of emptying its target", async () => {
+    const victim = victimDir();
+    // Control: emptying a symlinked directory's entries the naive way destroys the victim.
+    const copy = victimDir();
+    const link = join(temp(), "hooks");
+    symlinkSync(copy, link);
+    for (const e of readdirSync(link)) rmSync(join(link, e), { recursive: true, force: true });
+    expect(readdirSync(copy)).toEqual([]);
+
+    const mirror = await poisoned((m) => {
+      rmSync(join(m, "hooks"), { recursive: true, force: true });
+      symlinkSync(victim, join(m, "hooks"));
+    });
+    expect(readdirSync(victim)).toEqual(["precious.txt"]);
+    expect(lstatSync(join(mirror, "hooks")).isDirectory()).toBe(true);
+    expect(readdirSync(join(mirror, "hooks"))).toEqual([]);
+  });
+
+  it("replaces a config symlink instead of writing through it", async () => {
+    const victim = join(temp(), "victim.txt");
+    writeFileSync(victim, "precious content\n");
+    // Control: a naive write through the link overwrites the victim.
+    const copy = join(temp(), "copy.txt");
+    writeFileSync(copy, "precious content\n");
+    const link = join(temp(), "config");
+    symlinkSync(copy, link);
+    writeFileSync(link, MIRROR_CONFIG);
+    expect(readFileSync(copy, "utf8")).toBe(MIRROR_CONFIG);
+
+    const mirror = await poisoned((m) => {
+      rmSync(join(m, "config"));
+      symlinkSync(victim, join(m, "config"));
+    });
+    expect(readFileSync(victim, "utf8")).toBe("precious content\n");
+    expect(lstatSync(join(mirror, "config")).isFile()).toBe(true);
+    expect(readFileSync(join(mirror, "config"), "utf8")).toBe(MIRROR_CONFIG);
+  });
+
+  it("removes an info symlink instead of deleting attributes through it", async () => {
+    const victim = victimDir();
+    writeFileSync(join(victim, "attributes"), "victim\n");
+    // Control: a naive delete of info/attributes through the link destroys the victim's file.
+    const copy = victimDir();
+    writeFileSync(join(copy, "attributes"), "victim\n");
+    const link = join(temp(), "info");
+    symlinkSync(copy, link);
+    rmSync(join(link, "attributes"), { force: true });
+    expect(existsSync(join(copy, "attributes"))).toBe(false);
+
+    const mirror = await poisoned((m) => {
+      rmSync(join(m, "info"), { recursive: true, force: true });
+      symlinkSync(victim, join(m, "info"));
+    });
+    expect(readFileSync(join(victim, "attributes"), "utf8")).toBe("victim\n");
+    expect(existsSync(join(victim, "precious.txt"))).toBe(true);
+    expect(lstatSync(join(mirror, "info"), { throwIfNoEntry: false })?.isSymbolicLink() ?? false).toBe(false);
+  });
+
+  it("unlinks an info/attributes symlink without touching its target", async () => {
+    const victim = join(temp(), "victim-attributes");
+    writeFileSync(victim, "precious\n");
+    const mirror = await poisoned((m) => {
+      mkdirSync(join(m, "info"), { recursive: true });
+      symlinkSync(victim, join(m, "info", "attributes"));
+    });
+    expect(readFileSync(victim, "utf8")).toBe("precious\n");
+    expect(lstatSync(join(mirror, "info", "attributes"), { throwIfNoEntry: false })).toBeUndefined();
+  });
+
+  it("removes a worktrees symlink instead of deleting config.worktree through it", async () => {
+    const victim = victimDir("x");
+    writeFileSync(join(victim, "x", "config.worktree"), "victim\n");
+    // Control: the naive per-entry delete reaches through the link.
+    const copy = victimDir("x");
+    writeFileSync(join(copy, "x", "config.worktree"), "victim\n");
+    const link = join(temp(), "worktrees");
+    symlinkSync(copy, link);
+    for (const e of readdirSync(link)) rmSync(join(link, e, "config.worktree"), { force: true });
+    expect(existsSync(join(copy, "x", "config.worktree"))).toBe(false);
+
+    await poisoned((m) => {
+      renameSync(join(m, "worktrees"), join(temp(), "saved-worktrees"));
+      symlinkSync(victim, join(m, "worktrees"));
+    });
+    expect(readFileSync(join(victim, "x", "config.worktree"), "utf8")).toBe("victim\n");
+    expect(existsSync(join(victim, "x", "precious.txt"))).toBe(true);
+  });
+
+  it("removes a worktrees/<entry> symlink instead of deleting config.worktree through it", async () => {
+    const victim = victimDir();
+    writeFileSync(join(victim, "config.worktree"), "victim\n");
+    const mirror = await poisoned((m) => {
+      symlinkSync(victim, join(m, "worktrees", "evil"));
+    });
+    expect(readFileSync(join(victim, "config.worktree"), "utf8")).toBe("victim\n");
+    expect(existsSync(join(victim, "precious.txt"))).toBe(true);
+    expect(lstatSync(join(mirror, "worktrees", "evil"), { throwIfNoEntry: false })).toBeUndefined();
+  });
+
+  it("removes an objects/info symlink instead of deleting alternates through it", async () => {
+    const victim = victimDir();
+    writeFileSync(join(victim, "alternates"), "victim\n");
+    await poisoned((m) => {
+      rmSync(join(m, "objects", "info"), { recursive: true, force: true });
+      symlinkSync(victim, join(m, "objects", "info"));
+    });
+    expect(readFileSync(join(victim, "alternates"), "utf8")).toBe("victim\n");
+    expect(existsSync(join(victim, "precious.txt"))).toBe(true);
+  });
+});
+
+describe("commitWorktree", () => {
+  const log = (mirror: string, ref: string) => fx(["--git-dir", mirror, "log", "--format=%s", ref]).trim().split("\n");
+  const show = (mirror: string, ref: string, path: string) => fx(["--git-dir", mirror, "show", `${ref}:${path}`]);
+  const adminOf = (mirror: string, id: string) => {
+    const name = readdirSync(join(mirror, "worktrees")).find((e) => e.startsWith(id)) as string;
+    return join(mirror, "worktrees", name);
+  };
+
+  it("commits untracked and modified files on hoistline/<jobId> in the mirror", async () => {
+    const cache = temp();
+    const ws = await prepareWorktree("o/n", "main", "c1", cache, file);
+    writeFileSync(join(ws.dir, "README"), "changed\n");
+    mkdirSync(join(ws.dir, "sub"));
+    writeFileSync(join(ws.dir, "sub", "new.txt"), "new\n");
+    const res = await commitWorktree("o/n", "c1", cache, file);
+    const mirror = mirrorOf(cache);
+    expect(res.committed).toBe(true);
+    expect(res.sha).toBe(shaIn(mirror, "refs/heads/hoistline/c1"));
+    expect(log(mirror, "refs/heads/hoistline/c1")).toEqual(["hoistline: job c1", "main"]);
+    expect(show(mirror, "refs/heads/hoistline/c1", "README")).toBe("changed\n");
+    expect(show(mirror, "refs/heads/hoistline/c1", "sub/new.txt")).toBe("new\n");
+    const author = fx(["--git-dir", mirror, "log", "-1", "--format=%an <%ae>", "refs/heads/hoistline/c1"]).trim();
+    expect(author).toBe("Hoistline <hoistline@users.noreply.github.com>");
+
+    const custom = await prepareWorktree("o/n", "main", "c1b", cache, file);
+    writeFileSync(join(custom.dir, "x"), "x\n");
+    await commitWorktree("o/n", "c1b", cache, { ...file, message: "-n --amend $(x)" });
+    expect(log(mirror, "refs/heads/hoistline/c1b")[0]).toBe("-n --amend $(x)");
+  });
+
+  it("returns committed:false when there is nothing to commit", async () => {
+    const cache = temp();
+    const ws = await prepareWorktree("o/n", "main", "c2", cache, file);
+    expect(await commitWorktree("o/n", "c2", cache, file)).toEqual({ committed: false });
+    // A runner that committed itself: nothing new to commit, and the branch carries its commit.
+    const head = runnerCommit(ws.dir, "own.txt");
+    expect(await commitWorktree("o/n", "c2", cache, file)).toEqual({ committed: false });
+    expect(shaIn(mirrorOf(cache), "refs/heads/hoistline/c2")).toBe(head);
+  });
+
+  it("validates its input and refuses a job with no worktree", async () => {
+    const cache = temp();
+    await prepareWorktree("o/n", "main", "c3", cache, file);
+    await expect(commitWorktree("o/n", "../c3", cache, file)).rejects.toThrow(/invalid job id/);
+    await expect(commitWorktree("--upload-pack=x", "c3", cache, file)).rejects.toThrow(/invalid repository/);
+    await expect(commitWorktree("o/n", "never", cache, file)).rejects.toThrow(/refusing to commit/);
+  });
+
+  it("commits to the mirror even if the runner rewrote the worktree's .git file", async () => {
+    const cache = temp();
+    const ws = await prepareWorktree("o/n", "main", "c4", cache, file);
+    const attacker = join(temp(), "attacker");
+    fx(["init", "-q", "-b", "main", attacker]);
+    const attackerHead = runnerCommit(attacker, "a.txt");
+    writeFileSync(join(ws.dir, ".git"), `gitdir: ${join(attacker, ".git")}\n`);
+    writeFileSync(join(ws.dir, "work.txt"), "work\n");
+    // Control: plain git in the worktree now operates on the attacker's repo.
+    expect(fx(["rev-parse", "HEAD"], ws.dir).trim()).toBe(attackerHead);
+
+    const res = await commitWorktree("o/n", "c4", cache, file);
+    expect(res.committed).toBe(true);
+    const mirror = mirrorOf(cache);
+    expect(show(mirror, "refs/heads/hoistline/c4", "work.txt")).toBe("work\n");
+    expect(fx(["rev-parse", "HEAD"], attacker).trim()).toBe(attackerHead);
+    expect(fx(["log", "--format=%H"], attacker).trim()).toBe(attackerHead);
+  });
+
+  it("refuses when the admin dir's HEAD was pointed at another branch", async () => {
+    const cache = temp();
+    const ws = await prepareWorktree("o/n", "main", "c5", cache, file);
+    writeFileSync(join(ws.dir, "w.txt"), "w\n");
+    writeFileSync(join(adminOf(mirrorOf(cache), "c5"), "HEAD"), "ref: refs/heads/hoistline/other\n");
+    await expect(commitWorktree("o/n", "c5", cache, file)).rejects.toThrow(/refusing to commit/);
+  });
+
+  it("runs no filter, hook or config.worktree planted by the runner", async () => {
+    const cache = temp();
+    const ws = await prepareWorktree("o/n", "main", "c6", cache, file);
+    const mirror = mirrorOf(cache);
+    const marker = join(cache, "ran");
+    const admin = adminOf(mirror, "c6");
+    // .gitattributes naming a filter: with no configured command it must be inert.
+    writeFileSync(join(ws.dir, ".gitattributes"), "* filter=nocmd\n");
+    writeFileSync(join(ws.dir, "data.txt"), "data\n");
+    for (const dir of [join(mirror, "hooks"), join(admin, "hooks")]) {
+      mkdirSync(dir, { recursive: true });
+      for (const hook of ["pre-commit", "commit-msg", "post-commit", "prepare-commit-msg"]) {
+        writeFileSync(join(dir, hook), `#!/bin/sh\necho ${hook} >> "${marker}"\n`);
+        chmodSync(join(dir, hook), 0o755);
+      }
+    }
+    const filterCmd = `sh -c 'echo clean >> ${marker}; cat'`;
+    // The runner defines the filter in the shared config and in its worktree's config.worktree.
+    writeFileSync(join(admin, "config.worktree"), `[filter "nocmd"]\n\tclean = ${filterCmd}\n`);
+    fx(["config", "filter.nocmd.clean", filterCmd], ws.dir);
+    // Control: plain git in a worktree of this mirror runs the planted clean filter and commit hooks.
+    const control = join(temp(), "control");
+    fx(["--git-dir", mirror, "worktree", "add", "-q", "-b", "control", control, "refs/remotes/origin/main"]);
+    writeFileSync(join(control, ".gitattributes"), "* filter=nocmd\n");
+    writeFileSync(join(control, "c.txt"), "c\n");
+    fx(["add", "-A"], control);
+    fx(["commit", "-q", "-m", "control"], control);
+    expect(readFileSync(marker, "utf8")).toMatch(/clean[\s\S]*pre-commit/);
+    rmSync(marker);
+
+    const res = await commitWorktree("o/n", "c6", cache, file);
+    expect(res.committed).toBe(true);
+    expect(existsSync(marker)).toBe(false);
+    expect(existsSync(join(admin, "config.worktree"))).toBe(false);
+    expect(show(mirror, "refs/heads/hoistline/c6", "data.txt")).toBe("data\n");
+  });
+
+  it("round-trips commit then push to the remote", async () => {
+    const cache = temp();
+    const ws = await prepareWorktree("o/n", "dev", "c7", cache, file);
+    writeFileSync(join(ws.dir, "result.txt"), "result\n");
+    const res = await commitWorktree("o/n", "c7", cache, file);
+    await pushBranch("o/n", "c7", cache, file);
+    expect(remoteSha("refs/heads/hoistline/c7")).toBe(res.sha);
+    expect(fx(["show", "refs/heads/hoistline/c7:result.txt"], remote)).toBe("result\n");
+    expect(fx(["show", "refs/heads/hoistline/c7:README"], remote)).toBe("dev\n");
   });
 });

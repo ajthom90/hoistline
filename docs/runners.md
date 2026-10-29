@@ -41,19 +41,38 @@ runner does:
 
 ## Workspace and push
 
-The runner runs inside the job's worktree (`<cacheDir>/work/<jobId>`, on branch `hoistline/<jobId>`), created by
-`prepareWorktree(repo, baseBranch, jobId, cacheDir)` from a persistent bare mirror at
-`<cacheDir>/repos/<owner>__<name>.git`. The result is pushed with `pushBranch(repo, jobId, cacheDir)`, and the worktree
-is removed with `removeWorktree(repo, jobId, cacheDir)`.
+Every job goes through four steps in this order, all keyed by the canonical repo and the job id:
+
+1. `prepareWorktree(repo, baseBranch, jobId, cacheDir)` creates the worktree `<cacheDir>/work/<jobId>` on a new branch
+   `hoistline/<jobId>` from the persistent bare mirror `<cacheDir>/repos/<owner>__<name>.git`.
+2. The runner runs with the worktree as its working directory.
+3. `commitWorktree(repo, jobId, cacheDir, { message? })` commits everything in the worktree onto `hoistline/<jobId>`.
+   It returns `{ committed: true, sha }`, or `{ committed: false }` when there is nothing to commit; a runner that
+   commits by itself leaves its commits on the branch. The author is `Hoistline <hoistline@users.noreply.github.com>`
+   and the default message is `hoistline: job <jobId>`.
+4. `pushBranch(repo, jobId, cacheDir)` pushes `hoistline/<jobId>` to the same branch on GitHub.
+
+`removeWorktree(repo, jobId, cacheDir)` deletes the worktree afterwards. The branch stays in the mirror, so a job id
+can never be reused.
 
 The worktree shares the mirror's git directory, so a runner can write the mirror's config, `info/attributes` and
 hooks, and it owns the worktree's `.git` file. The agent defends against that as follows:
 
-- It never runs git through the worktree. Every git call uses `--git-dir=<mirror>`, and the push goes from the
-  mirror, never from the worktree's `.git` file or with the worktree as the working directory.
-- Before every fetch, every `worktree add` and every push, the mirror is reset. Its `config` is rewritten from a
-  fixed template (`[core]`, `repositoryformatversion = 0`, `bare = true`, nothing else), and `info/attributes`,
-  `config.worktree`, every `worktrees/*/config.worktree` and every hook are deleted.
+- It never runs git through the worktree's `.git` file. Mirror operations use `--git-dir=<mirror>`, with `GIT_DIR`
+  and `GIT_COMMON_DIR` pinned to the mirror in the environment, so a planted `commondir` cannot redirect git to
+  another repository. The push goes from the mirror.
+- The commit finds the worktree's record `<mirror>/worktrees/<name>` by its `gitdir` file and runs with
+  `GIT_DIR=<that record>`, `GIT_COMMON_DIR=<mirror>` and `GIT_WORK_TREE=<worktree>`. It requires exactly one record
+  whose HEAD is `hoistline/<jobId>`.
+- Before every fetch, `worktree add`, commit, push and prune, the mirror is reset, without ever following a
+  symlink:
+  - Its `config` is unlinked and written fresh from a fixed template: `[core]`, `repositoryformatversion = 0`,
+    `bare = true`, nothing else.
+  - `hooks` is removed and recreated as an empty real directory.
+  - These files are deleted: `commondir`, `gitdir`, `config.worktree`, every `worktrees/*/config.worktree`,
+    `info/attributes`, `objects/info/alternates` and `objects/info/http-alternates`.
+  - A symlink found in place of `info`, `objects/info`, `worktrees` or a `worktrees/<entry>` is removed, never
+    followed.
 - No remote is stored. The URL `https://github.com/<owner>/<name>.git`, derived only from the canonical repo, is
   passed explicitly to every fetch and push.
 - Every git call also gets `-c` overrides: hooks pointed at an empty directory, fsmonitor off, submodule recursion
@@ -62,16 +81,25 @@ hooks, and it owns the worktree's `.git` file. The agent defends against that as
 - Network calls also abort a transfer that stays below 1 byte/s for 60 s. They have an overall timeout (5 minutes
   by default) that kills git's whole process tree: the process group on macOS and Linux, `taskkill /T` on Windows.
 
-**Residual risk, stated plainly.** Restricted mode checks the repo, runner and model before the job starts. It does
-not sandbox the runner. Once started, a runner can do whatever that CLI can do as the owner's user. In particular:
+**Accepted residual risk, stated plainly.** Restricted mode checks the repo, runner and model before the job
+starts. It does not sandbox the runner. Runners run as the owner, so a runner can do whatever that CLI can do as the
+owner's user. In particular:
 
 - It can modify `~/.gitconfig` and any other file the owner can write. That includes `include.path` and
   `includeIf` entries in the owner's global git config, which the agent reads (it needs the owner's credential
   helpers) and cannot control.
 - It can push or otherwise use the owner's credentials directly.
+- A runner still running during another job's git operation can race the mirror: it can write between the reset
+  and the git call that follows it.
 
-The resets above stop a runner from steering the agent's own git calls through the shared repository. They do not
-contain the runner.
+The hardening above protects against accidental or prompt-injected runner behavior, and against poison left in the
+shared mirror carrying over from one job into the next. It does not protect against a deliberately malicious runner.
+
+**Rules for adapters:**
+
+- Do not rely on a CLI's own sandbox to isolate one job from another.
+- Never add the shared mirror (`<cacheDir>/repos/...`) to a CLI sandbox's writable roots. Note that a worktree's git
+  metadata lives in the mirror, so a sandbox that lets the runner commit already has write access to it.
 
 ## Invocations
 

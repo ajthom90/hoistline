@@ -1,5 +1,5 @@
 import { execFile, spawn } from "node:child_process";
-import { lstat, mkdir, readdir, realpath, rm, writeFile } from "node:fs/promises";
+import { lstat, mkdir, readdir, readFile, realpath, rm, unlink, writeFile } from "node:fs/promises";
 import { dirname, join, resolve, sep } from "node:path";
 import { canonicalRepo } from "./repo.js";
 
@@ -113,6 +113,8 @@ export type GitRunOptions = {
   cwd?: string;
   allowFileProtocol?: boolean;
   timeoutMs?: number;
+  /** Variables set on top of the scrubbed environment (the agent's own GIT_DIR / GIT_COMMON_DIR pins). */
+  env?: Record<string, string>;
 };
 
 /** The environment git runs with. Internal; exported for tests. */
@@ -170,12 +172,14 @@ export async function runGit(args: string[], opts: GitRunOptions): Promise<{ std
   const argv = [...hardeningFlags(cacheDir, opts.allowFileProtocol === true), ...args];
   const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   // The subcommand, for error messages: the first positional that is not the value of a global option.
-  const sub = args.find((a, i) => !a.startsWith("-") && !["--git-dir", "-c", "-C"].includes(args[i - 1] ?? "")) ?? "";
+  const sub =
+    args.find((a, i) => !a.startsWith("-") && !["--git-dir", "--work-tree", "-c", "-C"].includes(args[i - 1] ?? "")) ??
+    "";
   return new Promise((resolvePromise, reject) => {
     // Detached on POSIX makes git a process-group leader, so a timeout can kill its helpers too.
     const child = spawn("git", argv, {
       cwd: opts.cwd ?? cacheDir,
-      env: scrubbedEnv(),
+      env: { ...scrubbedEnv(), ...opts.env },
       shell: false,
       windowsHide: true,
       detached: process.platform !== "win32",
@@ -244,22 +248,69 @@ function mirrorPath(cacheDir: string, canonical: string): string {
   return join(cacheDir, "repos", `${canonical.replace("/", "__")}.git`);
 }
 
+function lstatOrNull(path: string) {
+  return lstat(path).catch(() => null);
+}
+
+/** Removes `path` itself: a file or symlink is unlinked (never followed); a real directory is removed as a tree. */
+async function removeEntry(path: string): Promise<void> {
+  const stat = await lstatOrNull(path);
+  if (!stat) return;
+  // fs.rm lstat()s every entry and unlinks symlinks instead of descending into them.
+  if (stat.isDirectory()) await rm(path, { recursive: true, force: true });
+  else await unlink(path);
+}
+
+/** True if `path` is a real directory. Anything else in its place (a symlink, a file) is removed, not followed. */
+async function realDirOrRemove(path: string): Promise<boolean> {
+  const stat = await lstatOrNull(path);
+  if (!stat) return false;
+  if (stat.isDirectory()) return true;
+  await unlink(path);
+  return false;
+}
+
+async function assertRealDir(path: string): Promise<void> {
+  if (!(await lstatOrNull(path))?.isDirectory()) throw new Error(`refusing to use ${path}: not a plain directory`);
+}
+
+/** Reads a small control file only if it is a regular file (never through a symlink). */
+async function readRegularFile(path: string): Promise<string | null> {
+  if (!(await lstatOrNull(path))?.isFile()) return null;
+  return readFile(path, "utf8");
+}
+
 /**
- * Undoes anything a runner may have written into the shared git directory: the config is rewritten from a fixed
- * template (no remote, url, include, credential, http, filter or core.* overrides), and info/attributes, every
- * config.worktree and every hook are deleted.
+ * Undoes anything a runner may have written into the shared git directory, without ever following a symlink: the
+ * config is rewritten from a fixed template (no remote, url, include, credential, http, filter or core.* overrides),
+ * the hooks directory is recreated empty, and commondir, gitdir, config.worktree, every worktrees/<x>/config.worktree,
+ * info/attributes and the object alternates are deleted. A targeted list, so a concurrent job's lock files survive.
  */
 async function resetMirror(mirror: string): Promise<void> {
-  await writeFile(join(mirror, "config"), MIRROR_CONFIG);
-  await rm(join(mirror, "info", "attributes"), { recursive: true, force: true });
-  await rm(join(mirror, "config.worktree"), { recursive: true, force: true });
-  for (const entry of await readdir(join(mirror, "worktrees")).catch(() => [])) {
-    await rm(join(mirror, "worktrees", entry, "config.worktree"), { recursive: true, force: true });
+  await assertRealDir(dirname(mirror));
+  await assertRealDir(mirror);
+  await assertRealDir(join(mirror, "objects"));
+
+  const config = join(mirror, "config");
+  await removeEntry(config);
+  await writeFile(config, MIRROR_CONFIG, { flag: "wx" });
+  for (const name of ["commondir", "gitdir", "config.worktree"]) await removeEntry(join(mirror, name));
+  if (await realDirOrRemove(join(mirror, "info"))) await removeEntry(join(mirror, "info", "attributes"));
+  const objectsInfo = join(mirror, "objects", "info");
+  if (await realDirOrRemove(objectsInfo)) {
+    await removeEntry(join(objectsInfo, "alternates"));
+    await removeEntry(join(objectsInfo, "http-alternates"));
+  }
+  const worktrees = join(mirror, "worktrees");
+  if (await realDirOrRemove(worktrees)) {
+    for (const entry of await readdir(worktrees)) {
+      const admin = join(worktrees, entry);
+      if (await realDirOrRemove(admin)) await removeEntry(join(admin, "config.worktree"));
+    }
   }
   const hooks = join(mirror, "hooks");
-  for (const entry of await readdir(hooks).catch(() => [])) {
-    await rm(join(hooks, entry), { recursive: true, force: true });
-  }
+  await removeEntry(hooks);
+  await mkdir(hooks);
 }
 
 export type PrepareOptions = {
@@ -270,12 +321,17 @@ export type PrepareOptions = {
   timeoutMs?: number;
 };
 
-function mirrorGit(cache: string, mirror: string, opts: PrepareOptions) {
+/**
+ * Git scoped to the mirror. GIT_DIR and GIT_COMMON_DIR are pinned in the environment because git otherwise honors a
+ * `commondir` file planted in the mirror and would read another repository's config. Internal; exported for tests.
+ */
+export function mirrorGit(cache: string, mirror: string, opts: PrepareOptions) {
   return (args: string[]) =>
     runGit(["--git-dir", mirror, ...args], {
       cacheDir: cache,
       allowFileProtocol: opts.allowFileProtocol,
       timeoutMs: opts.timeoutMs,
+      env: { GIT_DIR: mirror, GIT_COMMON_DIR: mirror },
     });
 }
 
@@ -311,6 +367,7 @@ export async function prepareWorktree(
   return withRepoLock(mirror, async () => {
     if (!(await exists(join(mirror, "HEAD")))) {
       await mkdir(dirname(mirror), { recursive: true });
+      await assertRealDir(dirname(mirror));
       // Pin the formats so the fixed config template always matches the repository on disk.
       await runGit(
         ["-c", "init.defaultObjectFormat=sha1", "-c", "init.defaultRefFormat=files", "init", "--quiet", "--bare", "--",
@@ -398,6 +455,91 @@ export async function removeWorktree(repo: string, jobId: string, cacheDir: stri
   }
   const mirror = mirrorPath(cache, canonical);
   if (await exists(join(mirror, "HEAD"))) {
-    await withRepoLock(mirror, () => mirrorGit(cache, mirror, {})(["worktree", "prune"]));
+    await withRepoLock(mirror, async () => {
+      await resetMirror(mirror);
+      await mirrorGit(cache, mirror, {})(["worktree", "prune"]);
+    });
   }
+}
+
+const COMMIT_IDENTITY = [
+  "-c",
+  "user.name=Hoistline",
+  "-c",
+  "user.email=hoistline@users.noreply.github.com",
+  "-c",
+  "commit.gpgsign=false",
+  "-c",
+  "core.autocrlf=false",
+];
+
+/**
+ * Finds the worktree's admin directory `<mirror>/worktrees/<name>` by its `gitdir` file, never through the
+ * runner-owned `.git` file in the worktree. Requires exactly one match whose HEAD is `hoistline/<jobId>`.
+ */
+async function findAdminDir(mirror: string, dir: string, ref: string): Promise<string> {
+  const expected = new Set([join(dir, ".git"), join(await realpath(dir), ".git")]);
+  const worktrees = join(mirror, "worktrees");
+  const matches: string[] = [];
+  if ((await lstatOrNull(worktrees))?.isDirectory()) {
+    for (const entry of await readdir(worktrees)) {
+      const admin = join(worktrees, entry);
+      if (!(await lstatOrNull(admin))?.isDirectory()) continue;
+      const gitdir = await readRegularFile(join(admin, "gitdir"));
+      if (gitdir !== null && expected.has(gitdir.trim())) matches.push(admin);
+    }
+  }
+  if (matches.length !== 1) {
+    throw new Error(`refusing to commit: expected one worktree record for ${dir}, found ${matches.length}`);
+  }
+  const admin = matches[0] as string;
+  const head = await readRegularFile(join(admin, "HEAD"));
+  if (head?.trim() !== `ref: ${ref}`) throw new Error(`refusing to commit: the worktree is not on ${ref}`);
+  return admin;
+}
+
+/**
+ * Commits everything in `<cacheDir>/work/<jobId>` (tracked, modified and untracked files) onto `hoistline/<jobId>`.
+ * Git runs against the mirror's own record of the worktree, with no hooks, filters from planted config or signing.
+ * Returns `{ committed: false }` when there is nothing to commit (a runner that committed itself leaves its commits
+ * on the branch).
+ */
+export async function commitWorktree(
+  repo: string,
+  jobId: string,
+  cacheDir: string,
+  opts: PrepareOptions & { message?: string } = {},
+): Promise<{ committed: boolean; sha?: string }> {
+  const canonical = validateRepo(repo);
+  const id = validateJobId(jobId);
+  const cache = resolve(cacheDir);
+  const mirror = mirrorPath(cache, canonical);
+  const dir = join(cache, "work", id);
+  const ref = `refs/heads/hoistline/${id}`;
+  const message = opts.message ?? `hoistline: job ${id}`;
+  if (typeof message !== "string" || message.length === 0) throw new Error("invalid commit message");
+
+  return withRepoLock(mirror, async () => {
+    if (!(await exists(join(mirror, "HEAD")))) throw new Error(`refusing to commit: no mirror for ${canonical}`);
+    await resetMirror(mirror);
+    await assertRealDir(join(cache, "work")).catch(() => {
+      throw new Error(`refusing to commit: ${join(cache, "work")} is not a plain directory`);
+    });
+    if (!(await lstatOrNull(dir))?.isDirectory()) throw new Error(`refusing to commit: no worktree at ${dir}`);
+    const admin = await findAdminDir(mirror, dir, ref);
+    const git = (args: string[]) =>
+      runGit(["--git-dir", admin, "--work-tree", dir, ...COMMIT_IDENTITY, ...args], {
+        cacheDir: cache,
+        allowFileProtocol: opts.allowFileProtocol,
+        timeoutMs: opts.timeoutMs,
+        env: { GIT_DIR: admin, GIT_COMMON_DIR: mirror, GIT_WORK_TREE: dir },
+      });
+
+    await git(["add", "--all"]);
+    const staged = await git(["diff", "--cached", "--name-only", "-z"]);
+    if (staged.stdout === "") return { committed: false };
+    await git(["commit", "--quiet", "--no-verify", "-m", message]);
+    const sha = (await mirrorGit(cache, mirror, opts)(["rev-parse", "--verify", "--end-of-options", ref])).stdout.trim();
+    return { committed: true, sha };
+  });
 }
