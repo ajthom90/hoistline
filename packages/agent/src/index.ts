@@ -54,6 +54,15 @@ export {
   type RunnerTemplate,
 } from "./runners/index.js";
 export {
+  createExecutor,
+  execute,
+  specHash,
+  type ApprovalRequest,
+  type Executor,
+  type ExecutorDeps,
+} from "./executor.js";
+export { claimJob } from "./seen-jobs.js";
+export {
   agentSocketUrl,
   connect,
   type AgentConnection,
