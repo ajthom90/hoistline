@@ -14,6 +14,8 @@ const hubToAgent: unknown[] = [
   { type: "job.cancel", jobId: "j" },
   { type: "tools.list", callId: "c1" },
   { type: "tools.call", callId: "c1", userId: "u", server: "s", tool: "t", args: { a: 1 } },
+  { type: "challenge", nonce: "bm9uY2U" },
+  { type: "welcome" },
 ];
 const agentToHub: unknown[] = [
   {
@@ -23,6 +25,7 @@ const agentToHub: unknown[] = [
     runners: ["muse", "build-test"],
     runningJobs: ["j"],
     servers: ["s"],
+    signature: "c2ln",
   },
   { type: "job.event", jobId: "j", stream: "stdout", data: "hi" },
   { type: "job.event", jobId: "j", stream: "status", data: "running" },
@@ -54,6 +57,8 @@ describe("HubToAgent", () => {
   it("rejects unknown type, unknown keys, agent-side types and bad specs", () => {
     expect(HubToAgent.safeParse({ type: "nope" }).success).toBe(false);
     expect(HubToAgent.safeParse({ type: "job.cancel", jobId: "j", x: 1 }).success).toBe(false);
+    expect(HubToAgent.safeParse({ type: "welcome", x: 1 }).success).toBe(false);
+    expect(HubToAgent.safeParse({ type: "challenge" }).success).toBe(false);
     expect(HubToAgent.safeParse(agentToHub[0]).success).toBe(false);
     const badSpec = { ...signedJob, spec: { ...signedJob.spec, repo: "" } };
     expect(HubToAgent.safeParse({ type: "job.assign", job: badSpec }).success).toBe(false);
@@ -110,6 +115,9 @@ describe("AgentToHub", () => {
     const hello = agentToHub[0] as object;
     expect(AgentToHub.safeParse({ ...hello, extra: 1 }).success).toBe(false);
     expect(AgentToHub.safeParse({ ...hello, runners: ["bogus"] }).success).toBe(false);
+    const unsigned: Record<string, unknown> = { ...hello };
+    delete unsigned.signature;
+    expect(AgentToHub.safeParse(unsigned).success).toBe(false);
     expect(AgentToHub.safeParse(hubToAgent[0]).success).toBe(false);
   });
 });

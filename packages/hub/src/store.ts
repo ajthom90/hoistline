@@ -1,4 +1,12 @@
-import { createHash, randomBytes, randomUUID } from "node:crypto";
+import {
+  createHash,
+  createPrivateKey,
+  createPublicKey,
+  generateKeyPairSync,
+  randomBytes,
+  randomUUID,
+  type KeyObject,
+} from "node:crypto";
 import { readdirSync, readFileSync } from "node:fs";
 import Database from "better-sqlite3";
 
@@ -46,6 +54,7 @@ const PAIRING_CODE_TTL_MS = 10 * 60 * 1000;
 // Crockford base32: no I, L, O, U.
 const CODE_ALPHABET = "0123456789ABCDEFGHJKMNPQRSTVWXYZ";
 const CODE_LENGTH = 12;
+const SIGNING_KEY_SECRET = "hub-signing-key";
 
 const sha256 = (value: string) => createHash("sha256").update(value).digest("hex");
 
@@ -196,6 +205,20 @@ export class Store {
     return this.machinesFor(userId).find((m) => m.id === machineId) ?? null;
   }
 
+  /**
+   * Unscoped lookup for agent authentication only (the agent proves the machine key). Never use it to answer a
+   * user's request; use getMachine, which is scoped to the caller.
+   */
+  getMachineById(machineId: string): Machine | null {
+    const row = this.db.prepare("SELECT * FROM machines WHERE id = ?").get(machineId) as MachineRecord | undefined;
+    return row ? toMachine(row) : null;
+  }
+
+  getUser(userId: string): User | null {
+    const row = this.db.prepare("SELECT * FROM users WHERE id = ?").get(userId) as UserRecord | undefined;
+    return row ? toUser(row) : null;
+  }
+
   markMachineSeen(machineId: string): void {
     this.db.prepare("UPDATE machines SET last_seen_at = ? WHERE id = ?").run(this.now(), machineId);
   }
@@ -298,6 +321,17 @@ export class Store {
       .prepare("INSERT OR IGNORE INTO secrets (name, value) VALUES (?, ?)")
       .run(name, randomBytes(32).toString("hex"));
     return (this.db.prepare("SELECT value FROM secrets WHERE name = ?").get(name) as { value: string }).value;
+  }
+
+  /** The hub's Ed25519 job-signing key pair, generated on first use and stored (PKCS8 PEM) in `secrets`. */
+  getOrCreateSigningKey(): { privateKey: KeyObject; publicKey: KeyObject } {
+    const fresh = generateKeyPairSync("ed25519").privateKey.export({ format: "pem", type: "pkcs8" }).toString();
+    this.db.prepare("INSERT OR IGNORE INTO secrets (name, value) VALUES (?, ?)").run(SIGNING_KEY_SECRET, fresh);
+    const row = this.db.prepare("SELECT value FROM secrets WHERE name = ?").get(SIGNING_KEY_SECRET) as {
+      value: string;
+    };
+    const privateKey = createPrivateKey(row.value);
+    return { privateKey, publicKey: createPublicKey(privateKey) };
   }
 
   /** Deletes expired pairing codes (`now` in milliseconds). */

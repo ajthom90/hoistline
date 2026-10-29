@@ -1,7 +1,9 @@
 import { mkdirSync } from "node:fs";
+import { createServer } from "node:http";
 import { dirname } from "node:path";
 import { SqliteOAuthProvider } from "./auth/sqlite-provider.js";
 import { configFromEnv } from "./config.js";
+import { Gateway } from "./gateway.js";
 import { createApp } from "./server.js";
 import { Store } from "./store.js";
 
@@ -20,7 +22,11 @@ const sweep = setInterval(() => {
 }, 60 * 60 * 1000);
 sweep.unref();
 
-createApp({ ...deps, oauthProvider, cookieSecret: store.getOrCreateSecret("cookie") }).listen(port, () => {
+const gateway = new Gateway(store, store.getOrCreateSigningKey());
+const app = createApp({ ...deps, oauthProvider, store, gateway, cookieSecret: store.getOrCreateSecret("cookie") });
+const server = createServer(app);
+gateway.attach(server);
+server.listen(port, () => {
   console.log(`Hoistline hub listening on port ${port}`);
   console.log(`MCP endpoint: ${deps.publicUrl}/mcp (login via ${login}); database: ${databasePath}`);
 });

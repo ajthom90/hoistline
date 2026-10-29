@@ -9,6 +9,9 @@ const id = z.string().min(1).max(200);
  * - job.cancel: cancel a running job
  * - tools.list: request the agent's MCP tool inventory (answered by AgentToHub tools.list)
  * - tools.call: invoke an MCP tool on the agent (answered by AgentToHub tools.result)
+ * - challenge: first message on a new connection; the agent answers with a signed hello
+ *   (see agentAuthPayload)
+ * - welcome: the hub accepted the hello; the connection is authenticated
  *
  * Trust model: tools.call carries the userId so the agent can apply per-user policy, but it is
  * not separately signed. The connection is machine-authenticated and the hub is the signer anyway.
@@ -27,8 +30,15 @@ export const HubToAgent = z.discriminatedUnion("type", [
       args: z.record(z.string(), z.unknown()),
     })
     .strict(),
+  z.object({ type: z.literal("challenge"), nonce: z.string().min(1).max(200) }).strict(),
+  z.object({ type: z.literal("welcome") }).strict(),
 ]);
 export type HubToAgent = z.infer<typeof HubToAgent>;
+
+/** Exact bytes an agent signs with its machine key to answer a hub challenge. */
+export function agentAuthPayload(machineId: string, nonce: string): Buffer {
+  return Buffer.from(`hoistline-agent-auth-v1:${machineId}:${nonce}`, "utf8");
+}
 
 const ToolInfo = z
   .object({
@@ -40,7 +50,8 @@ const ToolInfo = z
 
 /**
  * Messages sent from an agent to the hub.
- * - hello: agent announces itself and its state
+ * - hello: agent announces itself and its state, proving its machine key by signing the
+ *   hub's challenge nonce (signature over agentAuthPayload, Ed25519, base64url)
  * - job.event: streamed output or status line for a job
  * - job.result: terminal outcome of a job
  * - tools.list: response to HubToAgent tools.list
@@ -58,6 +69,7 @@ export const AgentToHub = z.discriminatedUnion("type", [
       runners: z.array(RunnerName),
       runningJobs: z.array(id),
       servers: z.array(z.string().max(200)),
+      signature: z.string().min(1).max(200),
     })
     .strict(),
   z

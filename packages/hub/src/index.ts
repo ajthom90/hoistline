@@ -11,3 +11,4 @@ export {
   type IdentityProvider,
   type UserIdentity,
 } from "./auth/identity.js";
+export { Gateway, type AgentInfo, type GatewayOptions } from "./gateway.js";

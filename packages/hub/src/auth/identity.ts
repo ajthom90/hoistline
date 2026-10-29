@@ -21,6 +21,8 @@ export interface UserIdentity {
   provider: "github" | "oidc";
   /** Stable id at the provider (GitHub numeric id, OIDC `sub`). */
   subject: string;
+  /** OIDC only: the issuer `subject` belongs to. */
+  issuer?: string;
   /** Human-readable name (GitHub login, OIDC preferred_username or email). */
   name: string;
   /**
@@ -29,6 +31,18 @@ export interface UserIdentity {
    * Display-only fields such as preferred_username are never included.
    */
   identifiers: string[];
+}
+
+/**
+ * The hub users-table key for an identity: provider "github" with the numeric id, or "oidc:<issuer>" with
+ * `sub`. Returns undefined when an OIDC identity lacks its issuer.
+ */
+export function userKey(identity: UserIdentity): { provider: string; subject: string } | undefined {
+  if (identity.provider === "github") return { provider: "github", subject: identity.subject };
+  if (identity.provider === "oidc" && identity.issuer) {
+    return { provider: `oidc:${identity.issuer}`, subject: identity.subject };
+  }
+  return undefined;
 }
 
 export interface IdentityProvider {
@@ -174,6 +188,7 @@ export class OidcIdentityProvider implements IdentityProvider {
     return {
       provider: "oidc",
       subject,
+      issuer: this.config.issuer,
       name,
       // `sub` comes from the one configured issuer. Email counts only when explicitly verified.
       identifiers: [

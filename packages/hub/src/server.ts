@@ -12,9 +12,15 @@ import {
   type GithubOAuthConfig,
   type IdentityProvider,
   type OidcConfig,
+  type UserIdentity,
+  userKey,
 } from "./auth/identity.js";
 import { InMemoryOAuthProvider, type HubOAuthProvider } from "./auth/in-memory-provider.js";
 import { CONSENT_PATH, LOGIN_CALLBACK_PATH, LoginFlow } from "./auth/login-flow.js";
+import type { Gateway } from "./gateway.js";
+import { pairRouter } from "./pairing.js";
+import type { Store, User } from "./store.js";
+import { registerMachineTools } from "./tools/machines.js";
 
 export type { FetchFn, GithubOAuthConfig, OidcConfig } from "./auth/identity.js";
 export type { HubOAuthProvider } from "./auth/in-memory-provider.js";
@@ -38,13 +44,25 @@ export interface AppDeps {
   oauthProvider?: HubOAuthProvider;
   /** Secret for signing browser cookies; random per process when omitted. */
   cookieSecret?: string;
+  /** Hub database. With `gateway`, enables machine pairing (`POST /pair`) and the machine tools. */
+  store?: Store;
+  /** Agent connections; attach it to the http.Server separately. */
+  gateway?: Gateway;
 }
 
-function buildMcpServer(): McpServer {
+interface ToolContext {
+  store: Store;
+  gateway: Gateway;
+  /** The hub user the bearer token belongs to. */
+  user: User;
+}
+
+function buildMcpServer(ctx?: ToolContext): McpServer {
   const server = new McpServer({ name: "hoistline", version: "0.0.0" });
   server.registerTool("ping", { description: "Check that the Hoistline hub is reachable." }, async () => ({
     content: [{ type: "text", text: "pong" }],
   }));
+  if (ctx) registerMachineTools(server, ctx.store, ctx.gateway, ctx.user);
   return server;
 }
 
@@ -76,6 +94,9 @@ export function createApp(deps: AppDeps): express.Express {
     metadataHandler({ resource: publicUrl.href, authorization_servers: [publicUrl.href], resource_name: "Hoistline" }),
   );
 
+  const machines = deps.store && deps.gateway ? { store: deps.store, gateway: deps.gateway } : undefined;
+  if (machines) app.use(pairRouter(machines.store, machines.gateway.hubPublicKey));
+
   app.post(CONSENT_PATH, express.urlencoded({ extended: false }), async (req, res, next) => {
     try {
       await login.consent(req, res);
@@ -98,7 +119,18 @@ export function createApp(deps: AppDeps): express.Express {
 
   // Stateless Streamable HTTP: a fresh server and transport per request.
   app.post("/mcp", bearer, express.json(), async (req, res, next) => {
-    const server = buildMcpServer();
+    let ctx: ToolContext | undefined;
+    if (machines) {
+      // Tools act as the hub user the token was issued to, keyed on provider and subject, never on a login.
+      const identity = req.auth?.extra?.user as UserIdentity | undefined;
+      const key = identity && userKey(identity);
+      if (!identity || !key) {
+        res.status(401).json({ error: "invalid_token", error_description: "Unrecognized identity" });
+        return;
+      }
+      ctx = { ...machines, user: machines.store.upsertUser({ ...key, login: identity.name }) };
+    }
+    const server = buildMcpServer(ctx);
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
     res.on("close", () => {
       void transport.close();

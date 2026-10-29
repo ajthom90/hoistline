@@ -1,4 +1,4 @@
-import { createHash } from "node:crypto";
+import { createHash, sign, verify, type KeyObject } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -120,6 +120,14 @@ describe("machines and sharing", () => {
     expect(store.getMachine(bob.id, machine.id)?.id).toBe(machine.id);
     store.unshareMachine(alice.id, machine.id, "bob");
     expect(store.machinesFor(bob.id).map((m) => m.id)).toEqual([bobsOwn.id]);
+  });
+
+  it("getMachineById and getUser look up by id only", () => {
+    const { store, alice, machine } = setup();
+    expect(store.getMachineById(machine.id)?.ownerId).toBe(alice.id);
+    expect(store.getMachineById("nope")).toBeNull();
+    expect(store.getUser(alice.id)?.login).toBe("Alice");
+    expect(store.getUser("nope")).toBeNull();
   });
 
   it("only the owner can share or unshare", () => {
@@ -310,6 +318,20 @@ describe("persistence", () => {
     expect(first.getOrCreateSecret("other")).not.toBe(secret);
     first.close();
     expect(open().getOrCreateSecret("cookie")).toBe(secret);
+  });
+
+  it("getOrCreateSigningKey returns one Ed25519 pair, stable across reopen", () => {
+    const first = open();
+    const key = first.getOrCreateSigningKey();
+    expect(key.privateKey.asymmetricKeyType).toBe("ed25519");
+    expect(key.publicKey.type).toBe("public");
+    const der = (k: KeyObject) => k.export({ format: "der", type: "spki" }).toString("base64");
+    expect(der(first.getOrCreateSigningKey().publicKey)).toBe(der(key.publicKey));
+    first.close();
+    const second = open().getOrCreateSigningKey();
+    expect(der(second.publicKey)).toBe(der(key.publicKey));
+    const signature = sign(null, Buffer.from("x"), second.privateKey);
+    expect(verify(null, Buffer.from("x"), key.publicKey, signature)).toBe(true);
   });
 
   it("re-running migrations on an existing database is a no-op", () => {
