@@ -12,21 +12,36 @@ export const JobSpecSchema = z
     repo: z.string().min(1).max(200),
     baseBranch: z.string().min(1).max(255),
     prompt: z.string().min(1).max(100_000),
-    model: z.string().max(100).optional(),
-    command: z.string().max(10_000).optional(),
+    model: z.string().min(1).max(100).optional(),
+    command: z.string().min(1).max(10_000).optional(),
   })
   .strict();
 export type JobSpec = z.infer<typeof JobSpecSchema>;
 
+/**
+ * Parsing with this schema checks shape only. It does NOT verify the signature;
+ * only verifyJob does.
+ */
 export const SignedJobSchema = z
   .object({
     spec: JobSpecSchema,
+    machineId: z.string().min(1).max(100),
     userId: z.string().min(1).max(200),
     issuedAt: z.number().int().nonnegative().max(Number.MAX_SAFE_INTEGER),
     signature: z.string(),
   })
   .strict();
 export type SignedJob = z.infer<typeof SignedJobSchema>;
+
+/*
+ * Responsibilities that remain with the AGENT after verifyJob succeeds (Tasks 7 and 9):
+ * - Replay defense: remember seen jobIds for MAX_JOB_AGE_MS + MAX_CLOCK_SKEW_MS, durably
+ *   across restarts, and refuse duplicates.
+ * - Validate repo, baseBranch and jobId before use. They flow into branch names and
+ *   worktree paths, so inputs such as `../`, `ext::` or `--upload-pack=` must be refused.
+ */
+
+const DOMAIN_TAG = "hoistline-job-v1";
 
 /** Jobs older than this are rejected. */
 export const MAX_JOB_AGE_MS = 5 * 60_000;
@@ -58,8 +73,11 @@ export function canonicalJson(value: unknown): string {
   throw new Error(`canonicalJson: unsupported type ${typeof value}`);
 }
 
-function signedBytes(spec: JobSpec, userId: string, issuedAt: number): Buffer {
-  return Buffer.from(canonicalJson({ spec, userId, issuedAt }), "utf8");
+function signedBytes(spec: JobSpec, userId: string, machineId: string, issuedAt: number): Buffer {
+  return Buffer.from(
+    canonicalJson({ v: DOMAIN_TAG, machineId, spec, userId, issuedAt }),
+    "utf8",
+  );
 }
 
 function assertEd25519(key: KeyObject): void {
@@ -69,17 +87,19 @@ function assertEd25519(key: KeyObject): void {
 export function signJob(
   spec: JobSpec,
   userId: string,
+  machineId: string,
   hubPrivateKey: KeyObject,
   now: number = Date.now(),
 ): SignedJob {
   assertEd25519(hubPrivateKey);
-  const parsed = SignedJobSchema.parse({ spec, userId, issuedAt: now, signature: "" });
-  const signature = sign(null, signedBytes(parsed.spec, parsed.userId, parsed.issuedAt), hubPrivateKey);
+  const parsed = SignedJobSchema.parse({ spec, machineId, userId, issuedAt: now, signature: "" });
+  const bytes = signedBytes(parsed.spec, parsed.userId, parsed.machineId, parsed.issuedAt);
   return {
     spec: parsed.spec,
+    machineId: parsed.machineId,
     userId: parsed.userId,
     issuedAt: parsed.issuedAt,
-    signature: signature.toString("base64url"),
+    signature: sign(null, bytes, hubPrivateKey).toString("base64url"),
   };
 }
 
@@ -94,23 +114,29 @@ function decodeSignature(signature: string): Buffer {
 }
 
 /**
- * Trust boundary: returns the spec and userId only if the signature is valid and the job is fresh.
- * Throws otherwise; never returns partial data.
+ * Trust boundary: returns the spec, userId and machineId only if the signature is valid, the job
+ * is addressed to expectedMachineId and the job is fresh. Throws otherwise; never returns partial data.
  */
 export function verifyJob(
   job: SignedJob,
   hubPublicKey: KeyObject,
+  expectedMachineId: string,
   now: number = Date.now(),
-): { spec: JobSpec; userId: string } {
+): { spec: JobSpec; userId: string; machineId: string } {
   assertEd25519(hubPublicKey);
+  if (typeof expectedMachineId !== "string" || expectedMachineId.length === 0) {
+    throw new Error("expectedMachineId is required");
+  }
+  if (!Number.isSafeInteger(now)) throw new Error("invalid clock");
   const parsed = SignedJobSchema.safeParse(job);
   if (!parsed.success) throw new Error("invalid signed job");
-  const { spec, userId, issuedAt, signature } = parsed.data;
+  const { spec, userId, machineId, issuedAt, signature } = parsed.data;
   const sigBytes = decodeSignature(signature);
-  if (!verify(null, signedBytes(spec, userId, issuedAt), hubPublicKey, sigBytes)) {
+  if (!verify(null, signedBytes(spec, userId, machineId, issuedAt), hubPublicKey, sigBytes)) {
     throw new Error("invalid job signature");
   }
+  if (machineId !== expectedMachineId) throw new Error("job addressed to a different machine");
   if (now - issuedAt > MAX_JOB_AGE_MS) throw new Error("job expired");
   if (issuedAt - now > MAX_CLOCK_SKEW_MS) throw new Error("job issued in the future");
-  return { spec, userId };
+  return { spec, userId, machineId };
 }

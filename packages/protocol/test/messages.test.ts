@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest";
 import { AgentToHub, HubToAgent } from "../src";
 
 const signedJob = {
+  machineId: "m",
   spec: { jobId: "j", runner: "grok", repo: "o/r", baseBranch: "main", prompt: "p" },
   userId: "u",
   issuedAt: 1,
@@ -12,7 +13,7 @@ const hubToAgent: unknown[] = [
   { type: "job.assign", job: signedJob },
   { type: "job.cancel", jobId: "j" },
   { type: "tools.list", callId: "c1" },
-  { type: "tools.call", callId: "c1", server: "s", tool: "t", args: { a: 1 } },
+  { type: "tools.call", callId: "c1", userId: "u", server: "s", tool: "t", args: { a: 1 } },
 ];
 const agentToHub: unknown[] = [
   {
@@ -45,6 +46,11 @@ describe("HubToAgent", () => {
   it.each(hubToAgent)("round-trips %j", (m) => {
     expect(HubToAgent.parse(m)).toEqual(m);
   });
+  it("requires userId on tools.call", () => {
+    const noUser = { ...(hubToAgent[3] as Record<string, unknown>) };
+    delete noUser.userId;
+    expect(HubToAgent.safeParse(noUser).success).toBe(false);
+  });
   it("rejects unknown type, unknown keys, agent-side types and bad specs", () => {
     expect(HubToAgent.safeParse({ type: "nope" }).success).toBe(false);
     expect(HubToAgent.safeParse({ type: "job.cancel", jobId: "j", x: 1 }).success).toBe(false);
@@ -57,6 +63,42 @@ describe("HubToAgent", () => {
 describe("AgentToHub", () => {
   it.each(agentToHub)("round-trips %j", (m) => {
     expect(AgentToHub.parse(m)).toEqual(m);
+  });
+  it("rejects oversized fields", () => {
+    const big = (n: number) => "x".repeat(n + 1);
+    const bad: unknown[] = [
+      { type: "job.event", jobId: "j", stream: "stdout", data: big(65_536) },
+      { type: "job.result", jobId: "j", status: "failed", output: big(1_048_576) },
+      { type: "job.result", jobId: "j", status: "failed", reason: big(2000) },
+      { type: "job.result", jobId: "j", status: "failed", branch: big(255) },
+      { type: "tools.result", callId: "c", ok: false, error: big(10_000) },
+      {
+        type: "tools.list",
+        callId: "c",
+        servers: Array.from({ length: 51 }, () => ({ name: "s", tools: [] })),
+      },
+      {
+        type: "tools.list",
+        callId: "c",
+        servers: [{ name: "s", tools: Array.from({ length: 501 }, () => ({ name: "t" })) }],
+      },
+      { type: "tools.list", callId: "c", servers: [{ name: "s", tools: [{ name: big(200) }] }] },
+      {
+        type: "tools.list",
+        callId: "c",
+        servers: [{ name: "s", tools: [{ name: "t", description: big(2000) }] }],
+      },
+    ];
+    for (const m of bad) expect(AgentToHub.safeParse(m).success).toBe(false);
+  });
+  it("tools.result is exclusive on ok", () => {
+    const both = { type: "tools.result", callId: "c", ok: true, result: 1, error: "e" };
+    expect(AgentToHub.safeParse(both).success).toBe(false);
+    const bothFalse = { type: "tools.result", callId: "c", ok: false, result: 1, error: "e" };
+    expect(AgentToHub.safeParse(bothFalse).success).toBe(false);
+    expect(AgentToHub.safeParse({ type: "tools.result", callId: "c", ok: false }).success).toBe(
+      false,
+    );
   });
   it("rejects unknown type, unknown keys, bad enums", () => {
     expect(AgentToHub.safeParse({ type: "nope" }).success).toBe(false);
