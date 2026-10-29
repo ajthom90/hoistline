@@ -12,7 +12,9 @@ import {
   registerRunner,
   type AgentConnection,
   type AgentIdentity,
+  type ApprovalRequest,
   type Executor,
+  type PolicyConfig,
 } from "@hoistline/agent";
 import { InMemoryOAuthProvider } from "../src/auth/in-memory-provider.js";
 import { Gateway } from "../src/gateway.js";
@@ -125,32 +127,61 @@ async function startHub(opts: { port?: number; graceMs?: number } = {}): Promise
   return { url, store, gateway, jobs, owner, stop };
 }
 
-function startAgent(identity: AgentIdentity): { conn: AgentConnection; executor: Executor } {
-  let conn: AgentConnection | undefined = undefined;
+type Agent = {
+  conn: AgentConnection;
+  executor: Executor;
+  /** runningJobs of every hello sent. */
+  hellos: string[][];
+  /** Opens a new connection for the same executor (the previous one must be closed). */
+  reconnect(): AgentConnection;
+};
+
+function startAgent(
+  identity: AgentIdentity,
+  opts: { policy?: PolicyConfig; requestApproval?: (req: ApprovalRequest) => Promise<boolean> } = {},
+): Agent {
+  let current: AgentConnection | undefined = undefined;
+  const hellos: string[][] = [];
   const executor = createExecutor({
     machineId: identity.machineId,
     hubPublicKey: identity.hubPublicKey,
     cacheDir: join(dir, "agent-cache"),
-    loadPolicy: () => ({ mode: "trusted" }),
+    loadPolicy: () => opts.policy ?? { mode: "trusted" },
+    requestApproval: opts.requestApproval,
     send: (msg) => {
-      if (!conn) throw new Error("not connected");
-      conn.send(msg);
+      if (!current) throw new Error("not connected");
+      current.send(msg);
     },
     prepareOptions: { remoteFor: () => remote, allowFileProtocol: true },
   });
-  conn = connect(
-    identity,
-    {
-      hello: () => ({ agentVersion: "0.0.0", runners: ["muse"], runningJobs: executor.runningJobs(), servers: [] }),
-      onMessage: (msg) => executor.onMessage(msg),
-    },
-    { initialDelayMs: 20, maxDelayMs: 100 },
-  );
+  const open = () => {
+    current = connect(
+      identity,
+      {
+        hello: () => {
+          const runningJobs = executor.runningJobs();
+          hellos.push(runningJobs);
+          return { agentVersion: "0.0.0", runners: ["muse"], runningJobs, servers: [] };
+        },
+        onMessage: (msg) => executor.onMessage(msg),
+        // Unacknowledged results go out again after every welcome.
+        onConnected: () => executor.flushOutbox(),
+      },
+      { initialDelayMs: 20, maxDelayMs: 100 },
+    );
+    return current;
+  };
+  const agent: Agent = {
+    conn: open(),
+    executor,
+    hellos,
+    reconnect: () => (agent.conn = open()),
+  };
   perTest.push(async () => {
-    conn!.close();
+    agent.conn.close();
     await executor.close();
   });
-  return { conn, executor };
+  return agent;
 }
 
 async function waitFor(check: () => boolean, what: string, timeoutMs = 15_000): Promise<void> {
@@ -163,12 +194,14 @@ async function waitFor(check: () => boolean, what: string, timeoutMs = 15_000): 
 
 const remoteFile = (branch: string, file: string) => fx(["show", `refs/heads/${branch}:${file}`], remote);
 
-async function pairedAgent(hub: Hub) {
+async function pairedAgent(hub: Hub, opts: Parameters<typeof startAgent>[1] = {}) {
   const identity = await pairMachine(hub.url, hub.store.createPairingCode(hub.owner.id), "laptop");
-  const agent = startAgent(identity);
+  const agent = startAgent(identity, opts);
   await waitFor(() => hub.gateway.isOnline(identity.machineId), "agent online");
-  return { identity, ...agent };
+  return { identity, agent, ...agent };
 }
+
+const outboxFile = (jobId: string) => join(dir, "agent-cache", "outbox", `${jobId}.json`);
 
 function delegate(hub: Hub, machine: string, script: { write?: Record<string, string>; gate?: string }) {
   return hub.jobs.delegate(hub.owner.id, {
@@ -226,5 +259,72 @@ describe("end to end", () => {
     await waitFor(() => hub.jobs.status(hub.owner.id, job.id) === "succeeded", "job to succeed");
     expect(hub.jobs.result(hub.owner.id, job.id)).toMatchObject({ branch: `hoistline/${job.id}` });
     expect(remoteFile(`hoistline/${job.id}`, "restart.txt")).toBe("survived\n");
+  });
+
+  it("delivers a result produced while the agent was disconnected once it reconnects, then forgets it", async () => {
+    const hub = await startHub({ graceMs: 10_000 });
+    const { identity, agent } = await pairedAgent(hub);
+    const gate = join(dir, "gate");
+    const job = delegate(hub, "laptop", { write: { "offline.txt": "finished offline\n" }, gate });
+    await waitFor(() => hub.jobs.status(hub.owner.id, job.id) === "running", "job running");
+
+    agent.conn.close();
+    await waitFor(() => !hub.gateway.isOnline(identity.machineId), "hub notices the disconnect");
+    writeFileSync(gate, "");
+    await waitFor(() => existsSync(outboxFile(job.id)), "result stored in the outbox");
+    expect(hub.jobs.status(hub.owner.id, job.id)).toBe("running");
+
+    agent.reconnect();
+    await waitFor(() => hub.jobs.status(hub.owner.id, job.id) === "succeeded", "replayed result lands");
+    expect(agent.hellos.at(-1)).toEqual([job.id]);
+    expect(hub.jobs.result(hub.owner.id, job.id)).toMatchObject({ branch: `hoistline/${job.id}` });
+    expect(remoteFile(`hoistline/${job.id}`, "offline.txt")).toBe("finished offline\n");
+    await waitFor(() => !existsSync(outboxFile(job.id)), "ack removes the outbox entry");
+    expect(agent.executor.runningJobs()).toEqual([]);
+  });
+
+  it("replaces agent_disconnected with the real outcome when the result arrives after the grace", async () => {
+    const hub = await startHub({ graceMs: 300 });
+    const { identity, agent } = await pairedAgent(hub);
+    const gate = join(dir, "gate");
+    const job = delegate(hub, "laptop", { write: { "late.txt": "late\n" }, gate });
+    await waitFor(() => hub.jobs.status(hub.owner.id, job.id) === "running", "job running");
+
+    agent.conn.close();
+    await waitFor(() => hub.jobs.status(hub.owner.id, job.id) === "failed", "grace expires");
+    expect(hub.jobs.result(hub.owner.id, job.id)).toMatchObject({ reason: "agent_disconnected" });
+    writeFileSync(gate, "");
+    await waitFor(() => existsSync(outboxFile(job.id)), "result stored in the outbox");
+
+    agent.reconnect();
+    await waitFor(() => hub.jobs.status(hub.owner.id, job.id) === "succeeded", "late result upgrades the job");
+    expect(hub.jobs.result(hub.owner.id, job.id)).toMatchObject({ branch: `hoistline/${job.id}` });
+    await waitFor(() => !existsSync(outboxFile(job.id)), "ack removes the outbox entry");
+    expect(hub.gateway.isOnline(identity.machineId)).toBe(true);
+  });
+
+  it("cancels on reconnect a job cancelled on the hub while it awaited approval offline; a later approval runs nothing", async () => {
+    let approve: (ok: boolean) => void = () => {};
+    const hub = await startHub({ graceMs: 10_000 });
+    const { identity, agent } = await pairedAgent(hub, {
+      policy: { mode: "restricted", repos: ["someone/else"], runners: ["muse"], onViolation: "ask" },
+      requestApproval: () => new Promise<boolean>((r) => (approve = r)),
+    });
+    const job = delegate(hub, "laptop", { write: { "never.txt": "x" } });
+    await waitFor(() => hub.jobs.status(hub.owner.id, job.id) === "awaiting_approval", "awaiting approval");
+
+    agent.conn.close();
+    await waitFor(() => !hub.gateway.isOnline(identity.machineId), "hub notices the disconnect");
+    expect(hub.jobs.cancel(hub.owner.id, job.id)).toBe(true);
+    expect(hub.jobs.status(hub.owner.id, job.id)).toBe("failed");
+
+    agent.reconnect();
+    await waitFor(() => hub.jobs.status(hub.owner.id, job.id) === "cancelled", "agent cancels it");
+    await waitFor(() => agent.executor.runningJobs().length === 0, "agent forgets it");
+    approve(true);
+    await new Promise((r) => setTimeout(r, 500));
+    expect(hub.jobs.status(hub.owner.id, job.id)).toBe("cancelled");
+    expect(existsSync(join(dir, "agent-cache", "work", job.id))).toBe(false);
+    expect(() => remoteFile(`hoistline/${job.id}`, "never.txt")).toThrow();
   });
 });

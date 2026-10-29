@@ -195,6 +195,12 @@ once (`realpath`), builds the command with `buildCommand(spec, { cwd: <real path
   and the job carries on, so a bad callback cannot crash or hang a job.
 - runJob keeps no output. Every chunk goes to `onOutput` and nowhere else, so the caller must enforce any size cap
   (such as the `task_result` cap) on what it keeps.
+- Output is passed on unredacted: what a runner prints (streamed job events, the result's output tail, the job log)
+  may contain paths on the owner's machine, such as the worktree's location under the agent's cache directory, and
+  whoever delegated the job sees it.
+- A cancel stops a job up to the moment its branch is pushed. The executor checks for one before committing and
+  again right before `pushBranch`; once the push has started it cannot be called back, and the job reports what
+  actually happened.
 - Abort (`signal`) and the maximum runtime (`opts.timeoutMs`, default 60 minutes) take the same path: SIGTERM to
   the whole process group, then SIGKILL to the group after `opts.termGraceMs` (default 1.5 s), even if the leader
   has already exited, but never after the promise has resolved (by then the group is gone). On Windows:
