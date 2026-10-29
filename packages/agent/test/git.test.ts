@@ -234,11 +234,18 @@ describe("prepareWorktree", () => {
       writeFileSync(p, `#!/bin/sh\necho ${hook} >> "${marker}"\n`);
       chmodSync(p, 0o755);
     }
+    // A poisoned mirror config: its own hooks path and an fsmonitor command.
+    const fsmon = join(cache, "fsmonitor.sh");
+    writeFileSync(fsmon, `#!/bin/sh\necho fsmonitor >> "${marker}"\n`);
+    chmodSync(fsmon, 0o755);
+    fx(["config", "core.hooksPath", join(mirror, "hooks")], mirror);
+    fx(["config", "core.fsmonitor", fsmon], mirror);
     const ws = await prepareWorktree("o/n", "main", "second", cache, file);
     writeFileSync(join(ws.dir, "new.txt"), "x\n");
-    // The worktree shares the mirror's hooks directory, so the fixture's own commit must skip them too.
-    fx(["-c", "core.hooksPath=/dev/null", "add", "new.txt"], ws.dir);
-    fx(["-c", "core.hooksPath=/dev/null", "commit", "-q", "-m", "x"], ws.dir);
+    // The worktree shares the mirror's hooks and config, so the fixture's own commit must skip them too.
+    const safe = ["-c", "core.hooksPath=/dev/null", "-c", "core.fsmonitor=false"];
+    fx([...safe, "add", "new.txt"], ws.dir);
+    fx([...safe, "commit", "-q", "-m", "x"], ws.dir);
     await pushBranch(ws.dir, ws.branch, { allowFileProtocol: true });
     await removeWorktree("o/n", "second", cache);
     expect(existsSync(marker)).toBe(false);
