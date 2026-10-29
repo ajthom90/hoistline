@@ -19,6 +19,7 @@ import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import {
   commitWorktree,
+  GitError,
   prepareWorktree,
   pushBranch,
   removeWorktree,
@@ -26,7 +27,17 @@ import {
   validateJobId,
   validateRepo,
 } from "../src/index.js";
-import { defaultRemote, MIRROR_CONFIG, mirrorGit, runGit, scrubbedEnv } from "../src/git.js";
+import {
+  _resetPlatformProbeForTests,
+  defaultRemote,
+  MIRROR_CONFIG,
+  mirrorConfig,
+  mirrorGit,
+  parsePlatformConfig,
+  probePlatformConfig,
+  runGit,
+  scrubbedEnv,
+} from "../src/git.js";
 
 // Fixture git: isolated from the developer's own config so fixtures build the same everywhere.
 const FIXTURE_ENV = {
@@ -108,6 +119,18 @@ function runnerCommit(dir: string, name: string): string {
 }
 
 const mirrorOf = (cache: string) => join(cache, "repos", "o__n.git");
+
+/** True when the temp filesystem ignores case (the macOS default). */
+function caseInsensitiveFs(): boolean {
+  const d = mkdtempSync(join(tmpdir(), "hoistline-case-"));
+  try {
+    writeFileSync(join(d, "CaseProbe"), "");
+    return existsSync(join(d, "caseprobe"));
+  } finally {
+    rmSync(d, { recursive: true, force: true });
+  }
+}
+const CASE_INSENSITIVE = caseInsensitiveFs();
 
 beforeAll(() => {
   root = temp();
@@ -236,7 +259,7 @@ describe("prepareWorktree", () => {
     expect(existsSync(join(mirror, "HEAD"))).toBe(true);
     expect(fx(["rev-parse", "HEAD"], ws.dir).trim()).toBe(remoteSha("refs/heads/dev"));
     // No remote (or anything else) is stored in the mirror's config.
-    expect(readFileSync(join(mirror, "config"), "utf8")).toBe(MIRROR_CONFIG);
+    expect(readFileSync(join(mirror, "config"), "utf8")).toBe(await mirrorConfig(cache));
 
     const main = await prepareWorktree("owner/name", "main", "job2", cache, file);
     expect(readFileSync(join(main.dir, "README"), "utf8")).toBe("main\n");
@@ -311,7 +334,7 @@ describe("a runner poisoning the shared mirror", () => {
     await removeWorktree("o/n", "second", cache);
     expect(existsSync(marker)).toBe(false);
     expect(readdirSync(hooks)).toEqual([]);
-    expect(readFileSync(join(mirror, "config"), "utf8")).toBe(MIRROR_CONFIG);
+    expect(readFileSync(join(mirror, "config"), "utf8")).toBe(await mirrorConfig(cache));
   });
 
   it("cannot get a smudge filter (config plus info/attributes) run by the next prepareWorktree", async () => {
@@ -340,7 +363,7 @@ describe("a runner poisoning the shared mirror", () => {
     expect(existsSync(marker)).toBe(false);
     expect(existsSync(join(mirror, "info", "attributes"))).toBe(false);
     expect(existsSync(join(mirror, "config.worktree"))).toBe(false);
-    expect(readFileSync(join(mirror, "config"), "utf8")).toBe(MIRROR_CONFIG);
+    expect(readFileSync(join(mirror, "config"), "utf8")).toBe(await mirrorConfig(cache));
   });
 
   it("cannot redirect the push with pushurl, insteadOf or include.path", async () => {
@@ -404,7 +427,7 @@ describe("a runner poisoning the shared mirror", () => {
     const ws = await prepareWorktree("o/n", "main", "job1", cache, file);
     expect(readFileSync(join(ws.dir, "README"), "utf8")).toBe("main\n");
     expect(existsSync(marker)).toBe(false);
-    expect(readFileSync(join(mirror, "config"), "utf8")).toBe(MIRROR_CONFIG);
+    expect(readFileSync(join(mirror, "config"), "utf8")).toBe(await mirrorConfig(cache));
   });
 
   it("removes per-worktree config.worktree files", async () => {
@@ -415,6 +438,114 @@ describe("a runner poisoning the shared mirror", () => {
     runnerCommit(ws.dir, "x.txt");
     await pushBranch("o/n", "wtcfg", cache, file);
     expect(existsSync(planted)).toBe(false);
+  });
+
+  /** The runner of `dir` replaces the README blob with INJECTED via plain `git replace`. */
+  function plantReplacement(dir: string): void {
+    const evilBlob = execFileSync("git", ["hash-object", "-w", "--stdin"], {
+      cwd: dir,
+      input: "INJECTED\n",
+      env: FIXTURE_ENV,
+      encoding: "utf8",
+    }).trim();
+    const realBlob = fx(["rev-parse", "HEAD:README"], dir).trim();
+    fx(["replace", realBlob, evilBlob], dir);
+  }
+
+  function controlCheckout(mirror: string): string {
+    const control = join(temp(), "control");
+    fx(["--git-dir", mirror, "worktree", "add", "-q", "-b", "control", control, "refs/remotes/origin/main"]);
+    return readFileSync(join(control, "README"), "utf8");
+  }
+
+  it("cannot substitute objects for the next job through refs/replace", async () => {
+    const cache = temp();
+    const first = await prepareWorktree("o/n", "main", "first", cache, file);
+    const mirror = mirrorOf(cache);
+    plantReplacement(first.dir);
+    // Control: plain git checks out the injected content.
+    expect(controlCheckout(mirror)).toBe("INJECTED\n");
+
+    const ws = await prepareWorktree("o/n", "main", "second", cache, file);
+    expect(readFileSync(join(ws.dir, "README"), "utf8")).toBe("main\n");
+    expect(existsSync(join(mirror, "refs", "replace"))).toBe(false);
+  });
+
+  it("ignores a replace ref the reset cannot see (packed into packed-refs)", async () => {
+    const cache = temp();
+    const first = await prepareWorktree("o/n", "main", "first", cache, file);
+    const mirror = mirrorOf(cache);
+    plantReplacement(first.dir);
+    fx(["pack-refs", "--all"], first.dir);
+    expect(readFileSync(join(mirror, "packed-refs"), "utf8")).toMatch(/refs\/replace\//);
+    // Control: plain git still checks out the injected content.
+    expect(controlCheckout(mirror)).toBe("INJECTED\n");
+
+    const ws = await prepareWorktree("o/n", "main", "second", cache, file);
+    expect(readFileSync(join(ws.dir, "README"), "utf8")).toBe("main\n");
+    writeFileSync(join(ws.dir, "x.txt"), "x\n");
+    await commitWorktree("o/n", "second", cache, file);
+    const show = (path: string) =>
+      fx(["--no-replace-objects", "--git-dir", mirror, "show", `refs/heads/hoistline/second:${path}`]);
+    expect(show("README")).toBe("main\n");
+    expect(show("x.txt")).toBe("x\n");
+  });
+
+  it("cannot hide new files from the commit with info/exclude", async () => {
+    const cache = temp();
+    const ws = await prepareWorktree("o/n", "main", "excl", cache, file);
+    const mirror = mirrorOf(cache);
+    mkdirSync(join(mirror, "info"), { recursive: true });
+    writeFileSync(join(mirror, "info", "exclude"), "*\n");
+    writeFileSync(join(ws.dir, "new.txt"), "new\n");
+    // Control: plain git in the worktree would stage nothing.
+    expect(fx(["add", "--all", "--dry-run"], ws.dir)).toBe("");
+
+    const res = await commitWorktree("o/n", "excl", cache, file);
+    expect(res.committed).toBe(true);
+    expect(fx(["--git-dir", mirror, "show", "refs/heads/hoistline/excl:new.txt"])).toBe("new\n");
+    expect(existsSync(join(mirror, "info", "exclude"))).toBe(false);
+  });
+});
+
+describe("the platform config probe", () => {
+  it("parses only core.ignorecase, precomposeunicode, filemode and symlinks, and only boolean values", () => {
+    const hostile = [
+      "[core]",
+      "\trepositoryformatversion = 0",
+      "\tfilemode = true",
+      "\tbare = false",
+      "\tlogallrefupdates = true",
+      "\tignorecase = true",
+      "\tprecomposeunicode = true",
+      "\tsymlinks = $(touch x)",
+      "\thooksPath = /evil",
+      "\tfsmonitor = /evil",
+      '[core "x"]',
+      "\tsymlinks = false",
+      '[filter "p"]',
+      "\tsmudge = evil",
+      "\tignorecase = false",
+    ].join("\n");
+    expect(parsePlatformConfig(hostile)).toEqual({ ignorecase: "true", precomposeunicode: "true", filemode: "true" });
+  });
+
+  it("probes once per process in a throwaway repo under the cache and cleans it up", async () => {
+    _resetPlatformProbeForTests();
+    const cache = temp();
+    const probed = await probePlatformConfig(cache);
+    for (const [k, v] of Object.entries(probed)) {
+      expect(["ignorecase", "precomposeunicode", "filemode", "symlinks"]).toContain(k);
+      expect(["true", "false"]).toContain(v);
+    }
+    if (CASE_INSENSITIVE) expect(probed.ignorecase).toBe("true");
+    expect(readdirSync(cache).filter((e) => e.startsWith("probe"))).toEqual([]);
+    // Cached: a second cache dir is not probed again.
+    const other = temp();
+    expect(await probePlatformConfig(other)).toBe(probed);
+    expect(readdirSync(other)).toEqual([]);
+    const lines = Object.entries(probed).map(([k, v]) => `\t${k} = ${v}\n`);
+    expect(await mirrorConfig(cache)).toBe(MIRROR_CONFIG + lines.join(""));
   });
 });
 
@@ -806,7 +937,7 @@ describe("the mirror reset never follows symlinks", () => {
     });
     expect(readFileSync(victim, "utf8")).toBe("precious content\n");
     expect(lstatSync(join(mirror, "config")).isFile()).toBe(true);
-    expect(readFileSync(join(mirror, "config"), "utf8")).toBe(MIRROR_CONFIG);
+    expect(readFileSync(join(mirror, "config"), "utf8")).toBe(await mirrorConfig(temp()));
   });
 
   it("removes an info symlink instead of deleting attributes through it", async () => {
@@ -1003,5 +1134,74 @@ describe("commitWorktree", () => {
     expect(remoteSha("refs/heads/hoistline/c7")).toBe(res.sha);
     expect(fx(["show", "refs/heads/hoistline/c7:result.txt"], remote)).toBe("result\n");
     expect(fx(["show", "refs/heads/hoistline/c7:README"], remote)).toBe("dev\n");
+  });
+
+  it.skipIf(!CASE_INSENSITIVE)("commits a case-only rename as a single rename", async () => {
+    const cache = temp();
+    const ws = await prepareWorktree("o/n", "main", "c8", cache, file);
+    renameSync(join(ws.dir, "README"), join(ws.dir, "readme"));
+    const res = await commitWorktree("o/n", "c8", cache, file);
+    expect(res.committed).toBe(true);
+    const mirror = mirrorOf(cache);
+    const ref = "refs/heads/hoistline/c8";
+    expect(fx(["--git-dir", mirror, "diff", "--name-status", "-M", `${ref}~1`, ref]).trim()).toBe("R100\tREADME\treadme");
+    expect(fx(["--git-dir", mirror, "ls-tree", "--name-only", ref]).trim()).toBe("readme");
+  });
+
+  it("checks for staged changes without listing them (a change set larger than any output buffer)", async () => {
+    const cache = temp();
+    const ws = await prepareWorktree("o/n", "main", "c9", cache, file);
+    // 20,500 empty files under a ~800-byte directory path: listing their names takes about 17 MB.
+    const deep = join(ws.dir, ...["a", "b", "c", "d"].map((c) => c.repeat(200)));
+    mkdirSync(deep, { recursive: true });
+    for (let i = 0; i < 20_500; i++) writeFileSync(join(deep, `file-${i}`.padEnd(60, "x")), "");
+    const res = await commitWorktree("o/n", "c9", cache, file);
+    expect(res.committed).toBe(true);
+    const ref = "refs/heads/hoistline/c9";
+    expect(fx(["--git-dir", mirrorOf(cache), "diff", "--shortstat", `${ref}~1`, ref]).trim()).toBe(
+      "20500 files changed, 0 insertions(+), 0 deletions(-)",
+    );
+  }, 30_000);
+
+  const nestedMessage = (path: string) =>
+    `nested repository at ${path} cannot be committed; remove its .git directory or add it to .gitignore`;
+
+  it("refuses a nested repository with commits, naming it, and leaves the branch alone", async () => {
+    const cache = temp();
+    const ws = await prepareWorktree("o/n", "main", "c10", cache, file);
+    const lib = join(ws.dir, "vendor", "lib");
+    mkdirSync(lib, { recursive: true });
+    fx(["init", "-q", "-b", "main", lib]);
+    runnerCommit(lib, "code.c");
+    writeFileSync(join(ws.dir, "other.txt"), "o\n");
+    const err = await commitWorktree("o/n", "c10", cache, file).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(GitError);
+    expect((err as Error).message).toBe(nestedMessage("vendor/lib"));
+    expect(shaIn(mirrorOf(cache), "refs/heads/hoistline/c10")).toBe(remoteSha("refs/heads/main"));
+
+    // In a job where it is ignored from the start, the rest commits.
+    const ok = await prepareWorktree("o/n", "main", "c10b", cache, file);
+    mkdirSync(join(ok.dir, "vendor", "lib"), { recursive: true });
+    fx(["init", "-q", "-b", "main", join(ok.dir, "vendor", "lib")]);
+    runnerCommit(join(ok.dir, "vendor", "lib"), "code.c");
+    writeFileSync(join(ok.dir, ".gitignore"), "vendor/\n");
+    expect((await commitWorktree("o/n", "c10b", cache, file)).committed).toBe(true);
+    expect(fx(["--git-dir", mirrorOf(cache), "ls-tree", "--name-only", "refs/heads/hoistline/c10b"]).trim()).toBe(
+      ".gitignore\nREADME",
+    );
+  });
+
+  it("refuses a nested repository without commits, naming it", async () => {
+    const cache = temp();
+    const ws = await prepareWorktree("o/n", "main", "c11", cache, file);
+    const empty = join(ws.dir, "empty");
+    mkdirSync(empty);
+    fx(["init", "-q", empty]);
+    writeFileSync(join(empty, "f"), "f");
+    writeFileSync(join(ws.dir, "other.txt"), "o\n");
+    const err = await commitWorktree("o/n", "c11", cache, file).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(GitError);
+    expect((err as Error).message).toBe(nestedMessage("empty"));
+    expect(shaIn(mirrorOf(cache), "refs/heads/hoistline/c11")).toBe(remoteSha("refs/heads/main"));
   });
 });

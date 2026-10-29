@@ -67,12 +67,27 @@ hooks, and it owns the worktree's `.git` file. The agent defends against that as
 - Before every fetch, `worktree add`, commit, push and prune, the mirror is reset, without ever following a
   symlink:
   - Its `config` is unlinked and written fresh from a fixed template: `[core]`, `repositoryformatversion = 0`,
-    `bare = true`, nothing else.
+    `bare = true`, plus the platform values described below, nothing else.
   - `hooks` is removed and recreated as an empty real directory.
-  - These files are deleted: `commondir`, `gitdir`, `config.worktree`, every `worktrees/*/config.worktree`,
-    `info/attributes`, `objects/info/alternates` and `objects/info/http-alternates`.
+  - These are deleted: `commondir`, `gitdir`, `config.worktree`, every `worktrees/*/config.worktree`,
+    `info/attributes`, `info/exclude`, `refs/replace`, `objects/info/alternates` and
+    `objects/info/http-alternates`.
   - A symlink found in place of `info`, `objects/info`, `worktrees` or a `worktrees/<entry>` is removed, never
-    followed.
+    followed. `refs/replace` is only deleted when `refs` is a real directory.
+- Platform values: once per process the agent runs `git init` in a throwaway directory under the cache, keeps only
+  `core.ignorecase`, `core.precomposeunicode`, `core.filemode` and `core.symlinks` (each only if present, and only
+  as `true` or `false`), and deletes the directory. Those values go into the mirror template and are passed as `-c`
+  to the commit, so a case-only rename on macOS is not committed as a second file.
+- Replacement objects are off for every git call: `GIT_NO_REPLACE_OBJECTS=1` in the environment and
+  `-c core.useReplaceRefs=false`, which also covers replace refs packed into `packed-refs` that the reset cannot see.
+  The commit-graph file is ignored (`-c core.commitGraph=false`).
+- The commit checks for staged changes by exit code (`git diff --cached --quiet`), so a large change set cannot
+  overflow an output buffer. It refuses to commit a nested repository (a new gitlink, mode 160000, or a nested
+  repository with no commits): it throws `nested repository at <path> cannot be committed; remove its .git
+  directory or add it to .gitignore` and leaves the index as is.
+- On a case-insensitive filesystem `git add --all` cannot see a case-only rename (the index entry still matches the
+  file), so the commit restages tracked paths whose on-disk spelling differs only in case under the on-disk name.
+  The commit then records a single rename.
 - No remote is stored. The URL `https://github.com/<owner>/<name>.git`, derived only from the canonical repo, is
   passed explicitly to every fetch and push.
 - Every git call also gets `-c` overrides: hooks pointed at an empty directory, fsmonitor off, submodule recursion
@@ -91,6 +106,14 @@ owner's user. In particular:
 - It can push or otherwise use the owner's credentials directly.
 - A runner still running during another job's git operation can race the mirror: it can write between the reset
   and the git call that follows it.
+- A runner can write into the shared object store and its metadata: corrupt or substitute packs, loose objects,
+  pack indexes or the commit-graph file. Ignoring the commit-graph and replace refs removes the easy routes, but
+  only a per-job git directory (no shared object store) would close this. That is not adopted in v1.
+
+**Git LFS is unsupported in v1.** The commit runs without the mirror's config, but the owner's global config still
+applies, so on a machine with git-lfs installed its clean filter runs when the commit stages LFS-tracked files. The
+push runs with hooks disabled, so git-lfs's pre-push hook never uploads the LFS objects, and the pushed branch would
+point at LFS objects GitHub does not have.
 
 The hardening above protects against accidental or prompt-injected runner behavior, and against poison left in the
 shared mirror carrying over from one job into the next. It does not protect against a deliberately malicious runner.
