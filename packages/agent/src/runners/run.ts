@@ -169,6 +169,7 @@ export async function runJob(
     let outputErrors = 0;
     let pipeGrace: NodeJS.Timeout | undefined;
     let reapTimer: NodeJS.Timeout | undefined;
+    let termKillTimer: NodeJS.Timeout | undefined;
     let reapKilledAt: number | null = null;
     let reapDeadline = 0;
 
@@ -196,6 +197,7 @@ export async function runJob(
       clearTimeout(timer);
       clearTimeout(pipeGrace);
       clearTimeout(reapTimer);
+      clearTimeout(termKillTimer);
       signal.removeEventListener("abort", onAbort);
     };
     const finish = () => {
@@ -263,8 +265,10 @@ export async function runJob(
         if (windows) return taskkillTree(child.pid);
         signalGroup(child.pid, "SIGTERM");
         const pid = child.pid;
-        // Runs even if the leader exits first: a descendant in the group may ignore SIGTERM.
-        setTimeout(() => signalGroup(pid, "SIGKILL"), termGraceMs).unref();
+        // Runs even if the leader exits first: a descendant in the group may ignore SIGTERM. Cleared on settle (by
+        // then the post-exit reap has seen the group gone), so it never signals a group id after runJob resolves.
+        termKillTimer = setTimeout(() => signalGroup(pid, "SIGKILL"), termGraceMs);
+        termKillTimer.unref();
       } else if (!groupDone) {
         // Leader gone, group still being stopped: escalate to SIGKILL now.
         clearTimeout(reapTimer);

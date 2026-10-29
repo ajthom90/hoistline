@@ -197,7 +197,8 @@ once (`realpath`), builds the command with `buildCommand(spec, { cwd: <real path
   (such as the `task_result` cap) on what it keeps.
 - Abort (`signal`) and the maximum runtime (`opts.timeoutMs`, default 60 minutes) take the same path: SIGTERM to
   the whole process group, then SIGKILL to the group after `opts.termGraceMs` (default 1.5 s), even if the leader
-  has already exited. On Windows: `taskkill /T /F`.
+  has already exited, but never after the promise has resolved (by then the group is gone). On Windows:
+  `taskkill /T /F`.
 - When the runner (the group leader) exits for any reason, nothing it backgrounded may outlive the job: before the
   promise resolves, the agent sends SIGTERM to what is left of the process group, SIGKILL after
   `opts.postExitGraceMs` (default min(termGraceMs, 1 s)), and waits for the group to disappear (at most 1 s after

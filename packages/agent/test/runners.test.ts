@@ -13,7 +13,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 import type { JobSpec } from "@hoistline/protocol";
-import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
   PROMPT_DELIMITER,
   PromptTooLargeError,
@@ -23,8 +23,9 @@ import {
   buildCommand,
   registerBuiltinRunners,
   registerRunner,
-  runJob,
+  runJob as realRunJob,
 } from "../src/index.js";
+import { findRunnerCLIs } from "./path-guard.js";
 import { buildTestTemplateFor } from "../src/runners/build-test.js";
 import { _resetRunnersForTests } from "../src/runners/template.js";
 
@@ -80,6 +81,18 @@ function collector(): { chunks: Chunk[]; onOutput: (chunk: string, stream: "stdo
 const never = () => new AbortController().signal;
 
 /**
+ * Every job a test starts, so afterEach can stop and await the ones still running BEFORE it restores the
+ * environment: a job left behind by a failed or timed-out test must never spawn with a restored PATH.
+ */
+const pending: Promise<unknown>[] = [];
+let teardown = new AbortController();
+const runJob: typeof realRunJob = (s, dir, onOutput, signal, opts) => {
+  const p = realRunJob(s, dir, onOutput, AbortSignal.any([signal, teardown.signal]), opts);
+  pending.push(p);
+  return p;
+};
+
+/**
  * A build-test command whose background node process ignores SIGTERM, writes its pid to ./bgpid once the handler is
  * installed, and (unless redirected) keeps the job's stdout open. The leader waits for bgpid, then exits.
  */
@@ -109,6 +122,9 @@ beforeEach(() => {
   // muse and codex live there, and execvp keeps searching PATH after a non-executable match (EACCES), so a broken
   // shim would otherwise start a real, paid model run.
   process.env.PATH = `${bin}:/usr/bin:/bin`;
+  // The fake bin is under the OS temp dir and so exempt; anything else naming a runner CLI fails the test.
+  expect(findRunnerCLIs(process.env.PATH)).toEqual([]);
+  teardown = new AbortController();
   process.env.FAKECLI_RECORD = recordFile;
   process.env.FAKECLI_PIDS = pidsFile;
   delete process.env.FAKECLI_MODE;
@@ -116,7 +132,9 @@ beforeEach(() => {
   registerBuiltinRunners();
 });
 
-afterEach(() => {
+afterEach(async () => {
+  teardown.abort();
+  await Promise.allSettled(pending.splice(0));
   for (const pid of strays.splice(0)) {
     try {
       process.kill(pid, "SIGKILL");
@@ -347,6 +365,31 @@ describe.skipIf(!posix)("runJob", () => {
     expect(res).toEqual({ exitCode: 143, aborted: true });
   });
 
+  it("sends no SIGKILL after it resolves when an abort stopped the runner", async () => {
+    process.env.FAKECLI_MODE = "sleep";
+    const ac = new AbortController();
+    let resolved = false;
+    const late: unknown[][] = [];
+    const kill = process.kill.bind(process);
+    const spy = vi.spyOn(process, "kill").mockImplementation((pid, sig) => {
+      if (resolved && (sig === "SIGKILL" || sig === 9)) late.push([pid, sig]);
+      return kill(pid, sig);
+    });
+    try {
+      const p = runJob(spec(), work, () => undefined, ac.signal, { termGraceMs: 300 });
+      await waitFor(() => existsSync(recordFile));
+      ac.abort();
+      const res = await p;
+      resolved = true;
+      expect(res).toEqual({ exitCode: 143, aborted: true });
+      // Well past termGraceMs: a leftover timer would have fired by now.
+      await new Promise((r) => setTimeout(r, 900));
+      expect(late).toEqual([]);
+    } finally {
+      spy.mockRestore();
+    }
+  });
+
   it("times out with exit code 124", async () => {
     process.env.FAKECLI_MODE = "sleep";
     const res = await runJob(spec(), work, () => undefined, never(), { timeoutMs: 300 });
@@ -479,6 +522,8 @@ describe.skipIf(!posix)("runJob", () => {
 
   it("turns an asynchronous non-ENOENT spawn failure into RunnerSpawnError", async () => {
     chmodSync(join(bin, "muse"), 0o644);
+    // Only the fake bin: execvp keeps searching PATH after a non-executable match, so no other directory may follow.
+    process.env.PATH = bin;
     const err = await runJob(spec(), work, () => undefined, never()).catch((e: unknown) => e);
     expect(err).toBeInstanceOf(RunnerSpawnError);
     expect((err as Error).message).toBe("runner_spawn_failed: EACCES");
