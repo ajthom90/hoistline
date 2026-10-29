@@ -623,6 +623,7 @@ describe("runGit protocol policy", () => {
       for (const [k, v] of Object.entries(kept)) expect(env[k]).toBe(v);
       for (const k of Object.keys(dropped)) expect(env[k]).toBeUndefined();
       expect(env.GIT_TERMINAL_PROMPT).toBe("0");
+      expect(env.GIT_NO_REPLACE_OBJECTS).toBe("1");
     } finally {
       for (const k of [...Object.keys(kept), ...Object.keys(dropped)]) {
         if (saved[k] === undefined) delete process.env[k];

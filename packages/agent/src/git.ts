@@ -626,13 +626,18 @@ function nestedRepoError(path: string): GitError {
   );
 }
 
-/** The first directory below `root` (relative, `/`-separated) that holds a `.git` entry, never following symlinks. */
+/**
+ * The first directory below `root` (relative, `/`-separated) that holds a `.git` entry, never following symlinks.
+ * Gives up (null) after 200,000 entries; it only runs after `add --all` has already failed.
+ */
 async function findNestedRepo(root: string): Promise<string | null> {
   const stack = [""];
+  let seen = 0;
   while (stack.length > 0) {
     const rel = stack.pop() as string;
     const entries = await readdir(join(root, rel), { withFileTypes: true }).catch(() => []);
     for (const entry of entries) {
+      if (++seen > 200_000) return null;
       const child = rel === "" ? entry.name : `${rel}/${entry.name}`;
       if (entry.name === ".git") {
         if (rel !== "") return rel;
@@ -720,13 +725,19 @@ async function stageCaseRenames(git: WorktreeGit, root: string): Promise<void> {
     }
     if (changed && actual.length === parts.length) renames.push([path, actual.join("/")]);
   }
+  // Two tracked paths that fold to the same file (A/b and a/B from a case-sensitive checkout) are left alone, as
+  // plain git would leave them.
+  const targets = new Map<string, number>();
+  for (const [, to] of renames) targets.set(to, (targets.get(to) ?? 0) + 1);
+  const trackedSet = new Set(tracked);
+  const safe = renames.filter(([, to]) => targets.get(to) === 1 && !trackedSet.has(to));
 
   // Batched to stay well under any command-line length limit; literal pathspecs, so no name is a pattern.
-  for (let i = 0; i < renames.length; ) {
+  for (let i = 0; i < safe.length; ) {
     const batch: Array<[string, string]> = [];
     let bytes = 0;
-    while (i < renames.length && (batch.length === 0 || bytes < 64 * 1024)) {
-      const pair = renames[i++] as [string, string];
+    while (i < safe.length && (batch.length === 0 || bytes < 64 * 1024)) {
+      const pair = safe[i++] as [string, string];
       batch.push(pair);
       bytes += pair[0].length + pair[1].length;
     }

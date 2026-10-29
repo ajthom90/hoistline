@@ -110,7 +110,7 @@ owner's user. In particular:
   pack indexes or the commit-graph file. Ignoring the commit-graph and replace refs removes the easy routes, but
   only a per-job git directory (no shared object store) would close this. That is not adopted in v1.
 
-**Git LFS is unsupported in v1.** The commit runs without the mirror's config, but the owner's global config still
+**Git LFS is unsupported in v1.** The commit runs with the reset mirror template, but the owner's global config still
 applies, so on a machine with git-lfs installed its clean filter runs when the commit stages LFS-tracked files. The
 push runs with hooks disabled, so git-lfs's pre-push hook never uploads the LFS objects, and the pushed branch would
 point at LFS objects GitHub does not have.
