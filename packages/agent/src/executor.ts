@@ -34,6 +34,8 @@ export type ApprovalRequest = {
   reason: string;
   /** sha256 hex of canonicalJson({ jobId, repo, runner, model, command, prompt, baseBranch }) of `spec`. */
   specHash: string;
+  /** Aborts once the executor stops waiting (job cancelled, approval timed out): the request can be withdrawn. */
+  signal?: AbortSignal;
 };
 
 /** The git operations a job uses. */
@@ -287,13 +289,15 @@ async function askApproval(
   if (signal.aborted) return "aborted";
   let timer: unknown;
   let onAbort: (() => void) | undefined;
+  // Aborted once the answer no longer matters (timeout, cancel, or answered), so the asker can withdraw the request.
+  const stopWaiting = new AbortController();
   try {
     return await new Promise((settle) => {
       timer = setT(() => settle("timeout"), deps.approvalTimeoutMs ?? DEFAULT_APPROVAL_TIMEOUT_MS);
       onAbort = () => settle("aborted");
       signal.addEventListener("abort", onAbort, { once: true });
       Promise.resolve()
-        .then(() => deps.requestApproval!(req))
+        .then(() => deps.requestApproval!({ ...req, signal: AbortSignal.any([signal, stopWaiting.signal]) }))
         .then(
           (ok) => settle(ok === true ? "approved" : "denied"),
           () => settle("denied"),
@@ -302,6 +306,7 @@ async function askApproval(
   } finally {
     clearT(timer);
     if (onAbort) signal.removeEventListener("abort", onAbort);
+    stopWaiting.abort();
   }
 }
 

@@ -395,6 +395,43 @@ describe("policy", () => {
     await done;
     expect(h.result()).toMatchObject({ status: "failed", reason: "approval_timeout" });
   });
+
+  it("aborts the approval request's signal when the wait times out or the job is cancelled", async () => {
+    const timers: [() => void, number][] = [];
+    const signals: AbortSignal[] = [];
+    const h = harness({
+      loadPolicy: () => RESTRICTED_ASK,
+      requestApproval: (req) => {
+        signals.push(req.signal!);
+        return new Promise<boolean>(() => {});
+      },
+      setTimeout: (fn, ms) => timers.push([fn, ms]),
+      clearTimeout: () => {},
+    });
+    const done = execute(sign(), h.deps);
+    await waitFor(() => signals.length === 1, "approval request");
+    expect(signals[0]!.aborted).toBe(false);
+    timers[0]![0]();
+    await done;
+    expect(signals[0]!.aborted).toBe(true);
+
+    const controller = new AbortController();
+    const cancelled = harness({
+      loadPolicy: () => RESTRICTED_ASK,
+      signal: controller.signal,
+      requestApproval: (req) => {
+        signals.push(req.signal!);
+        return new Promise<boolean>(() => {});
+      },
+    });
+    const running = execute(sign(), cancelled.deps);
+    await waitFor(() => signals.length === 2, "second approval request");
+    expect(signals[1]!.aborted).toBe(false);
+    controller.abort();
+    expect(signals[1]!.aborted).toBe(true);
+    await running;
+    expect(cancelled.result()).toMatchObject({ status: "cancelled" });
+  });
 });
 
 describe("running a job", () => {
