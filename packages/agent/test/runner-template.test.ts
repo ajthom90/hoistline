@@ -1,8 +1,9 @@
 import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import type { JobSpec } from "@hoistline/protocol";
-import { describe, expect, it } from "vitest";
+import { beforeEach, describe, expect, it } from "vitest";
 import { buildCommand, registerRunner } from "../src/index.js";
+import { _resetRunnersForTests } from "../src/runners/template.js";
 
 const FAKE = fileURLToPath(new URL("./fixtures/fake-runner.mjs", import.meta.url));
 const HOSTILE = 'a b "c" $(touch /tmp/pwned); -y';
@@ -28,9 +29,13 @@ function run(file: string, args: string[], stdin?: string): Promise<{ argv: stri
   });
 }
 
-// One runner passes the prompt as a positional after `--`, another via stdin.
-registerRunner("muse", { file: process.execPath, args: (s) => [FAKE, "--", s.prompt] });
-registerRunner("codex", { file: process.execPath, args: () => [FAKE], stdin: (s) => s.prompt });
+// Every test starts from an empty registry with the same two runners: one passes the prompt as a positional after
+// `--`, the other via stdin.
+beforeEach(() => {
+  _resetRunnersForTests();
+  registerRunner("muse", { file: process.execPath, args: (s) => [FAKE, "--", s.prompt] });
+  registerRunner("codex", { file: process.execPath, args: () => [FAKE], stdin: (s) => s.prompt });
+});
 
 const PROMPTS = [
   HOSTILE,
@@ -119,7 +124,14 @@ describe("buildCommand", () => {
   });
 
   it("throws runner_not_implemented for an unregistered runner", () => {
-    expect(() => buildCommand(spec({ runner: "grok" }))).toThrow(/runner_not_implemented/);
+    for (const runner of ["grok", "cursor", "build-test"] as const) {
+      expect(() => buildCommand(spec({ runner }))).toThrow(/runner_not_implemented/);
+    }
+  });
+
+  it("reset clears every registration", () => {
+    _resetRunnersForTests();
+    expect(() => buildCommand(spec())).toThrow(/runner_not_implemented/);
   });
 
   it("rejects a template that returns a non-string argument", () => {

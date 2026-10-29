@@ -39,9 +39,39 @@ runner does:
 6. **No guessed flags.** Each row in the table below records the exact non-interactive invocation, taken from that
    CLI's own `--help` or documentation at the time the adapter was written.
 
-The runner then runs inside the job's worktree (`<cacheDir>/work/<jobId>`, on branch `hoistline/<jobId>`). Restricted
-mode checks the repo, runner and model before the job starts; it does not sandbox the runner. Once started, a runner
-can do whatever that CLI can do.
+## Workspace and push
+
+The runner runs inside the job's worktree (`<cacheDir>/work/<jobId>`, on branch `hoistline/<jobId>`), created by
+`prepareWorktree(repo, baseBranch, jobId, cacheDir)` from a persistent bare mirror at
+`<cacheDir>/repos/<owner>__<name>.git`. The result is pushed with `pushBranch(repo, jobId, cacheDir)`, and the worktree
+is removed with `removeWorktree(repo, jobId, cacheDir)`.
+
+The worktree shares the mirror's git directory, so a runner can write the mirror's config, `info/attributes` and
+hooks, and it owns the worktree's `.git` file. The agent defends against that as follows:
+
+- It never runs git through the worktree. Every git call uses `--git-dir=<mirror>`, and the push goes from the
+  mirror, never from the worktree's `.git` file or with the worktree as the working directory.
+- Before every fetch, every `worktree add` and every push, the mirror is reset. Its `config` is rewritten from a
+  fixed template (`[core]`, `repositoryformatversion = 0`, `bare = true`, nothing else), and `info/attributes`,
+  `config.worktree`, every `worktrees/*/config.worktree` and every hook are deleted.
+- No remote is stored. The URL `https://github.com/<owner>/<name>.git`, derived only from the canonical repo, is
+  passed explicitly to every fetch and push.
+- Every git call also gets `-c` overrides: hooks pointed at an empty directory, fsmonitor off, submodule recursion
+  off, fsck on transfer, and every transport except https disabled. Each git call runs with a scrubbed environment.
+  The push never forces and never pushes tags.
+- Network calls also abort a transfer that stays below 1 byte/s for 60 s. They have an overall timeout (5 minutes
+  by default) that kills git's whole process tree: the process group on macOS and Linux, `taskkill /T` on Windows.
+
+**Residual risk, stated plainly.** Restricted mode checks the repo, runner and model before the job starts. It does
+not sandbox the runner. Once started, a runner can do whatever that CLI can do as the owner's user. In particular:
+
+- It can modify `~/.gitconfig` and any other file the owner can write. That includes `include.path` and
+  `includeIf` entries in the owner's global git config, which the agent reads (it needs the owner's credential
+  helpers) and cannot control.
+- It can push or otherwise use the owner's credentials directly.
+
+The resets above stop a runner from steering the agent's own git calls through the shared repository. They do not
+contain the runner.
 
 ## Invocations
 

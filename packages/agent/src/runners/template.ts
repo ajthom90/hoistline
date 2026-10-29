@@ -23,6 +23,11 @@ export function registerRunner(name: RunnerName, template: RunnerTemplate): void
   registry.set(name, template);
 }
 
+/** @internal Test hook: empties the registry. */
+export function _resetRunnersForTests(): void {
+  registry.clear();
+}
+
 /** Builds the argument array (and optional stdin) for a job. Never builds a shell string. */
 export function buildCommand(spec: JobSpec): RunnerCommand {
   const template = registry.get(spec.runner);
