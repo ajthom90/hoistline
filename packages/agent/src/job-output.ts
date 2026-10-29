@@ -48,7 +48,7 @@ export class EventStreamer {
   private pendingBytes = 0;
   private sentBytes = 0;
   private timer: unknown = undefined;
-  private capped = false;
+  private isCapped = false;
   private closed = false;
   private readonly capBytes: number;
 
@@ -61,7 +61,7 @@ export class EventStreamer {
   }
 
   push(chunk: string, stream: OutputStream): void {
-    if (this.closed || this.capped || chunk.length === 0) return;
+    if (this.closed || this.isCapped || chunk.length === 0) return;
     const last = this.pending.at(-1);
     if (last?.stream === stream) last.data += chunk;
     else this.pending.push({ stream, data: chunk });
@@ -81,15 +81,15 @@ export class EventStreamer {
     this.pendingBytes = 0;
     for (const { stream, data } of pending) {
       let buf = Buffer.from(data, "utf8");
-      while (buf.length > 0 && !this.capped) {
+      while (buf.length > 0 && !this.isCapped) {
         const room = this.capBytes - this.sentBytes;
         if (room <= 0) {
-          this.capped = true;
+          this.isCapped = true;
           break;
         }
         const end = headEnd(buf, Math.min(MAX_EVENT_BYTES, room));
         if (end === 0) {
-          this.capped = true;
+          this.isCapped = true;
           break;
         }
         this.sentBytes += end;
@@ -104,6 +104,11 @@ export class EventStreamer {
     }
   }
 
+  /** True once output was held back because the cap was reached. */
+  get capped(): boolean {
+    return this.isCapped;
+  }
+
   /** Flushes and stops; later pushes are ignored. */
   close(): void {
     this.flush();
@@ -116,12 +121,19 @@ export class OutputTail {
   private chunks: string[] = [];
   private bytes: number[] = [];
   private total = 0;
+  private seen = 0;
 
   constructor(private readonly maxBytes: number) {}
+
+  /** True once more than `maxBytes` were pushed, so text() is not the whole output. */
+  get truncated(): boolean {
+    return this.seen > this.maxBytes;
+  }
 
   push(chunk: string): void {
     if (chunk.length === 0) return;
     const n = Buffer.byteLength(chunk);
+    this.seen += n;
     this.chunks.push(chunk);
     this.bytes.push(n);
     this.total += n;
@@ -209,5 +221,46 @@ function pruneLogs(dir: string, cutoff: number): void {
     } catch {
       // Gone already or not ours to remove.
     }
+  }
+}
+
+/**
+ * Keeps `<dir>/*.log` within bounds: logs older than seven days go first, then the oldest logs until the total size
+ * is at most `maxTotalBytes`. Logs of the jobs in `keep` (by job id) are never removed, though they count toward the
+ * total. Only regular files directly in a real directory are considered. Never throws.
+ */
+export function enforceLogBudget(
+  dir: string,
+  opts: { maxTotalBytes: number; now: number; keep: ReadonlySet<string>; retentionMs?: number },
+): void {
+  try {
+    const st = lstatSync(dir);
+    if (st.isSymbolicLink() || !st.isDirectory()) return;
+    const cutoff = opts.now - (opts.retentionMs ?? LOG_RETENTION_MS);
+    const logs: { path: string; size: number; mtimeMs: number; kept: boolean }[] = [];
+    for (const entry of readdirSync(dir, { withFileTypes: true })) {
+      if (!entry.isFile() || !entry.name.endsWith(".log")) continue;
+      try {
+        const path = join(dir, entry.name);
+        const fst = lstatSync(path);
+        if (!fst.isFile()) continue;
+        logs.push({ path, size: fst.size, mtimeMs: fst.mtimeMs, kept: opts.keep.has(entry.name.slice(0, -4)) });
+      } catch {
+        // Gone already.
+      }
+    }
+    logs.sort((a, b) => a.mtimeMs - b.mtimeMs);
+    let total = logs.reduce((n, l) => n + l.size, 0);
+    for (const log of logs) {
+      if (log.kept || (log.mtimeMs >= cutoff && total <= opts.maxTotalBytes)) continue;
+      try {
+        unlinkSync(log.path);
+        total -= log.size;
+      } catch {
+        // Not ours to remove, or gone already.
+      }
+    }
+  } catch {
+    // Missing or unreadable: nothing to enforce.
   }
 }

@@ -1,4 +1,4 @@
-import { chmod, lstat, mkdir, readdir, unlink, writeFile } from "node:fs/promises";
+import { chmodSync, lstatSync, mkdirSync, readdirSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { validateJobId } from "./git.js";
 
@@ -12,18 +12,20 @@ export const SEEN_JOB_RETENTION_MS = 24 * 3600_000;
  * Claims `jobId` durably: an exclusively created marker `<cacheDir>/seen-jobs/<jobId>` (mode 0600, directory 0700).
  * Returns true the first time, false for a job id already claimed, also by an earlier process. Markers older than
  * 24 hours are pruned. Throws for an unsafe job id or a seen-jobs path that is not a real directory.
+ *
+ * Synchronous, so a job can be claimed in the same tick it is admitted.
  */
-export async function claimJob(cacheDir: string, jobId: string, now: number = Date.now()): Promise<boolean> {
+export function claimJobSync(cacheDir: string, jobId: string, now: number = Date.now()): boolean {
   const id = validateJobId(jobId);
   const dir = join(cacheDir, "seen-jobs");
-  await mkdir(dir, { recursive: true, mode: 0o700 });
-  const st = await lstat(dir);
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  const st = lstatSync(dir);
   if (st.isSymbolicLink() || !st.isDirectory()) throw new Error(`refusing to use ${dir}: not a plain directory`);
-  if (process.platform !== "win32") await chmod(dir, 0o700);
-  await prune(dir, now - SEEN_JOB_RETENTION_MS);
+  if (process.platform !== "win32") chmodSync(dir, 0o700);
+  prune(dir, now - SEEN_JOB_RETENTION_MS);
   try {
     // "wx" is O_CREAT | O_EXCL, which also refuses to follow a symlink planted at the marker path.
-    await writeFile(join(dir, id), "", { flag: "wx", mode: 0o600 });
+    writeFileSync(join(dir, id), "", { flag: "wx", mode: 0o600 });
     return true;
   } catch (err) {
     if ((err as NodeJS.ErrnoException).code === "EEXIST") return false;
@@ -31,12 +33,17 @@ export async function claimJob(cacheDir: string, jobId: string, now: number = Da
   }
 }
 
-async function prune(dir: string, cutoff: number): Promise<void> {
-  for (const name of await readdir(dir)) {
+/** claimJobSync as a promise. */
+export async function claimJob(cacheDir: string, jobId: string, now: number = Date.now()): Promise<boolean> {
+  return claimJobSync(cacheDir, jobId, now);
+}
+
+function prune(dir: string, cutoff: number): void {
+  for (const name of readdirSync(dir)) {
     const path = join(dir, name);
     try {
-      const st = await lstat(path);
-      if (!st.isDirectory() && st.mtimeMs < cutoff) await unlink(path);
+      const st = lstatSync(path);
+      if (!st.isDirectory() && st.mtimeMs < cutoff) unlinkSync(path);
     } catch {
       // Removed concurrently.
     }

@@ -15,8 +15,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import type { AgentToHub } from "@hoistline/protocol";
-import { EventStreamer, OutputTail, openJobLog } from "../src/job-output.js";
-import { claimJob } from "../src/seen-jobs.js";
+import { EventStreamer, OutputTail, enforceLogBudget, openJobLog } from "../src/job-output.js";
+import { claimJob, claimJobSync } from "../src/seen-jobs.js";
 
 const temps: string[] = [];
 function temp(): string {
@@ -221,5 +221,76 @@ describe("claimJob", () => {
   it("refuses an unsafe job id", async () => {
     const cache = temp();
     await expect(claimJob(cache, "../x")).rejects.toThrow(/invalid job id/);
+  });
+
+  it("has a synchronous form that shares the same markers", async () => {
+    const cache = temp();
+    expect(claimJobSync(cache, "job-1", Date.now())).toBe(true);
+    expect(await claimJob(cache, "job-1")).toBe(false);
+    expect(claimJobSync(cache, "job-1", Date.now())).toBe(false);
+    expect(() => claimJobSync(cache, "../x", Date.now())).toThrow(/invalid job id/);
+  });
+});
+
+describe("truncation flags", () => {
+  it("OutputTail.truncated is true only once output was dropped", () => {
+    const tail = new OutputTail(10);
+    tail.push("12345");
+    tail.push("67890");
+    expect(tail.truncated).toBe(false);
+    tail.push("x");
+    expect(tail.truncated).toBe(true);
+    expect(tail.text()).toBe("234567890x");
+  });
+
+  it("EventStreamer.capped is true only once output was held back by the cap", () => {
+    const { s } = streamer({ capBytes: 10 });
+    s.push("1234567890", "stdout");
+    s.flush();
+    expect(s.capped).toBe(false);
+    s.push("x", "stdout");
+    s.flush();
+    expect(s.capped).toBe(true);
+  });
+});
+
+describe("enforceLogBudget", () => {
+  const DAY = 24 * 3600_000;
+  function logAt(dir: string, name: string, bytes: number, mtimeMs: number) {
+    writeFileSync(join(dir, name), "x".repeat(bytes));
+    utimesSync(join(dir, name), mtimeMs / 1000, mtimeMs / 1000);
+  }
+
+  it("removes logs past retention, then the oldest finished logs until the total fits", () => {
+    const dir = temp();
+    const now = Date.now();
+    logAt(dir, "ancient.log", 10, now - 8 * DAY);
+    logAt(dir, "a.log", 1000, now - 4000);
+    logAt(dir, "b.log", 1000, now - 3000);
+    logAt(dir, "c.log", 1000, now - 2000);
+    logAt(dir, "d.log", 1000, now - 1000);
+    logAt(dir, "other.txt", 5000, now - 9 * DAY);
+    enforceLogBudget(dir, { maxTotalBytes: 2500, now, keep: new Set() });
+    expect(readdirSync(dir).sort()).toEqual(["c.log", "d.log", "other.txt"]);
+  });
+
+  it("never removes the log of an active job, even when it alone is over budget", () => {
+    const dir = temp();
+    const now = Date.now();
+    logAt(dir, "job-live.log", 5000, now - 9000);
+    logAt(dir, "job-done.log", 100, now - 1000);
+    enforceLogBudget(dir, { maxTotalBytes: 1000, now, keep: new Set(["job-live"]) });
+    expect(readdirSync(dir)).toEqual(["job-live.log"]);
+  });
+
+  it.runIf(posix)("never follows a symlinked directory, and never throws", () => {
+    const base = temp();
+    const target = join(base, "elsewhere");
+    mkdirSync(target);
+    writeFileSync(join(target, "precious.log"), "x".repeat(5000));
+    symlinkSync(target, join(base, "logs"));
+    expect(() => enforceLogBudget(join(base, "logs"), { maxTotalBytes: 1, now: Date.now(), keep: new Set() })).not.toThrow();
+    expect(readdirSync(target)).toEqual(["precious.log"]);
+    expect(() => enforceLogBudget(join(base, "missing"), { maxTotalBytes: 1, now: Date.now(), keep: new Set() })).not.toThrow();
   });
 });

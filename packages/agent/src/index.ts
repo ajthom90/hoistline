@@ -58,10 +58,13 @@ export {
   execute,
   specHash,
   type ApprovalRequest,
+  type CreateExecutorOptions,
   type Executor,
   type ExecutorDeps,
+  type GitOps,
 } from "./executor.js";
-export { claimJob } from "./seen-jobs.js";
+export { Outbox, type JobResult, type OutboxOptions } from "./outbox.js";
+export { claimJob, claimJobSync } from "./seen-jobs.js";
 export {
   agentSocketUrl,
   connect,
