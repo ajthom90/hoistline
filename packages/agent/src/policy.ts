@@ -57,14 +57,24 @@ export function effectivePolicy(loaded: PolicyConfig | null): PolicyConfig {
   return parsed.success ? (parsed.data as PolicyConfig) : DENY_ALL;
 }
 
-// Control chars, C1, soft hyphen, invisible/zero-width/bidi marks, line/paragraph separators, BOM, interlinear
-// annotation marks and tag characters. Built from escaped text on purpose.
+// Only used to sanitize untrusted text echoed inside hard-deny reasons (see show()); it does NOT decide whether a
+// value may be offered for approval (that is the printable-ASCII allowlist below). Control chars, C1, soft hyphen,
+// invisible/zero-width/bidi marks, line/paragraph separators, BOM, interlinear annotation marks and tag characters.
+// Built from escaped text on purpose.
 const UNSAFE_SOURCE =
   "[\\u0000-\\u001f\\u007f-\\u009f\\u00ad\\u034f\\u061c\\u180e\\u200b-\\u200f\\u2028-\\u202e\\u2060-\\u2064" +
   "\\u2066-\\u206f\\ufeff\\ufff9-\\ufffb\\u{e0000}-\\u{e007f}]";
 const UNSAFE_CHARS = new RegExp(UNSAFE_SOURCE, "gu");
-const UNSAFE_ONE = new RegExp(UNSAFE_SOURCE, "u");
-const hasUnsafe = (text: string): boolean => UNSAFE_ONE.test(text);
+
+/**
+ * A value may be offered to the owner for approval only if it is printable ASCII (U+0020-U+007E). A denylist of
+ * invisible characters is always incomplete (variation selectors, fillers, Unicode spaces, combining marks, homoglyphs),
+ * so anything else is a hard deny. `u` flag so a lone surrogate is a non-match, not a skipped code unit.
+ */
+const PRINTABLE_ASCII = /^[\x20-\x7e]*$/u;
+const isReviewable = (text: string): boolean => PRINTABLE_ASCII.test(text);
+/** 8+ consecutive spaces can push the tail of a command out of view. */
+const LONG_SPACE_RUN = / {8}/;
 
 /** Longest build-test command that is shown to the owner for approval; longer is a hard deny. */
 const MAX_REVIEW_COMMAND = 500;
@@ -129,15 +139,18 @@ export function evaluateJob(policy: PolicyConfig, spec: JobSpec): Decision {
         if (command === undefined) failures.push("runs arbitrary command: (none)");
         else if (command.length > MAX_REVIEW_COMMAND) {
           unreviewable.push(`command too long to review safely (${command.length} chars)`);
-        } else if (hasUnsafe(command)) unreviewable.push("command contains invisible or control characters");
+        } else if (!isReviewable(command)) unreviewable.push("command contains non-ASCII or control characters");
+        else if (LONG_SPACE_RUN.test(command)) unreviewable.push("command contains a long run of spaces");
         else failures.push(`runs arbitrary command: ${JSON.stringify(command)}`);
       }
     }
     if (p.models !== undefined) {
       if (spec.model === undefined) failures.push("model rule failed: a model is required but none was given");
       else if (!p.models.includes(spec.model)) {
-        if (spec.model.length > MAX_MODEL_LENGTH || hasUnsafe(spec.model)) {
-          unreviewable.push(`model rule failed: ${show(spec.model)} is not in the allowed models and cannot be shown safely`);
+        if (!isReviewable(spec.model)) {
+          unreviewable.push("model contains non-ASCII or control characters");
+        } else if (spec.model.length > MAX_MODEL_LENGTH) {
+          unreviewable.push(`model rule failed: ${show(spec.model)} is not in the allowed models and is too long to show`);
         } else failures.push(`model rule failed: ${JSON.stringify(spec.model)} is not in the allowed models`);
       }
     }
@@ -166,8 +179,11 @@ export function evaluateToolCall(policy: PolicyConfig, server: string, tool: str
       return { result: "allow", reason: "tool is in the allowed tools" };
     }
     // Not allowed. A name that cannot be shown in full and safely is never offered for approval.
-    if (server.length > MAX_REVIEW_NAME || tool.length > MAX_REVIEW_NAME || hasUnsafe(name)) {
-      return { result: "deny", reason: `tool rule failed: ${show(name)} cannot be shown safely (too long or contains control or invisible characters)` };
+    if (!isReviewable(name)) {
+      return { result: "deny", reason: "tool or server name contains non-ASCII or control characters" };
+    }
+    if (server.length > MAX_REVIEW_NAME || tool.length > MAX_REVIEW_NAME) {
+      return { result: "deny", reason: `tool rule failed: ${show(name)} is too long to show` };
     }
     if (p.tools === undefined) return violation(p, `tool rule failed: ${JSON.stringify(name)} denied because no tools are allowed`);
     return violation(p, `tool rule failed: ${JSON.stringify(name)} is not in the allowed tools`);

@@ -381,7 +381,7 @@ describe("fix round 1", () => {
 
   it("strips additional invisible and bidi characters from reasons", () => {
     const junk = "؜᠎⁠⁡⁢⁣⁤⁪⁫⁬⁭⁮⁯";
-    const d = evaluateJob(restricted({ models: ["a"] }), job({ model: `x${junk}y` }));
+    const d = evaluateJob(restricted(), job({ repo: `x${junk}y` }));
     expect(d.reason).toContain("xy");
     for (const ch of junk) expect(d.reason).not.toContain(ch);
   });
@@ -461,7 +461,7 @@ describe("fix round 2: never truncate what the owner approves", () => {
   ])("a command with %s is a hard deny under ask", (_n, cmd) => {
     const d = evaluateJob(ask(), bt(cmd));
     expect(d.result).toBe("deny");
-    expect(d.reason).toContain("command contains invisible or control characters");
+    expect(d.reason).toContain("command contains non-ASCII or control characters");
     expect(d.reason).not.toMatch(NOT_SHOWN);
     expect(d.repo).toBe("owner/name");
   });
@@ -507,8 +507,125 @@ describe("fix round 2: never truncate what the owner approves", () => {
 
   it("strips U+00AD, U+034F, U+FFF9-U+FFFB and tag characters from reasons", () => {
     const junk = "­͏￹￺￻\u{e0000}\u{e0041}\u{e007f}";
-    const d = evaluateJob(restricted({ models: ["a"] }), job({ model: `x${junk}y` }));
+    const d = evaluateJob(restricted(), job({ repo: `x${junk}y` }));
     expect(d.reason).toContain("xy");
     expect(d.reason).not.toMatch(NOT_SHOWN);
+  });
+});
+
+describe("fix round 3: printable-ASCII allowlist for anything the owner may approve", () => {
+  const ask = (over: Record<string, unknown> = {}) => restricted({ onViolation: "ask", ...over });
+  const bt = (command: string) => job({ runner: "build-test", command });
+  const SPOOFS: [string, string][] = [
+    ["variation selector U+FE0F", "️"],
+    ["variation selector supplement U+E0100", "\u{e0100}"],
+    ["mongolian variation selector U+180B", "᠋"],
+    ["hangul filler U+3164", "ㅤ"],
+    ["hangul choseong filler U+115F", "ᅟ"],
+    ["halfwidth hangul filler U+FFA0", "ﾠ"],
+    ["braille blank U+2800", "⠀"],
+    ["no-break space U+00A0", " "],
+    ["en quad U+2000", " "],
+    ["ideographic space U+3000", "　"],
+    ["narrow no-break space U+202F", " "],
+    ["combining mark", "é"],
+    ["precomposed e-acute", "é"],
+    ["Cyrillic homoglyph", "а"],
+    ["emoji", "\u{1f600}"],
+    ["lone surrogate", "\ud800"],
+    ["DEL", "\x7f"],
+    ["newline", "\n"],
+  ];
+
+  it.each(SPOOFS)("a command with %s is a hard deny under ask and deny, without echoing it", (_n, ch) => {
+    for (const onViolation of ["ask", "deny"]) {
+      const d = evaluateJob(restricted({ onViolation }), bt(`make${ch}test`));
+      expect(d.result).toBe("deny");
+      expect(d.reason).toContain("command contains non-ASCII or control characters");
+      expect(d.reason).not.toContain(ch);
+      expect(d.reason).not.toContain("make");
+      expect(d.repo).toBe("owner/name");
+    }
+  });
+
+  it.each(SPOOFS)("a model with %s is a hard deny under ask and deny, without echoing it", (_n, ch) => {
+    for (const onViolation of ["ask", "deny"]) {
+      const d = evaluateJob(restricted({ onViolation, models: ["m1"] }), job({ model: `m${ch}2` }));
+      expect(d.result).toBe("deny");
+      expect(d.reason).toContain("model contains non-ASCII or control characters");
+      expect(d.reason).not.toContain(ch);
+    }
+  });
+
+  it.each(SPOOFS)("an unlisted tool or server name with %s is a hard deny, without echoing it", (_n, ch) => {
+    for (const onViolation of ["ask", "deny"]) {
+      const p = restricted({ onViolation, tools: ["a.b"] });
+      for (const [server, tool] of [
+        ["s", `t${ch}x`],
+        [`s${ch}x`, "t"],
+      ] as const) {
+        const d = evaluateToolCall(p, server, tool);
+        expect(d.result).toBe("deny");
+        expect(d.reason).toContain("tool or server name contains non-ASCII or control characters");
+        expect(d.reason).not.toContain(ch);
+      }
+    }
+  });
+
+  it("a run of 8 spaces in a command is a hard deny; 7 spaces is still asked about in full", () => {
+    const d8 = evaluateJob(ask(), bt(`echo ok${" ".repeat(8)}; rm -rf /`));
+    expect(d8.result).toBe("deny");
+    expect(d8.reason).toContain("command contains a long run of spaces");
+    expect(d8.reason).not.toContain("rm -rf");
+    expect(evaluateJob(restricted(), bt(`a${" ".repeat(20)}b`)).result).toBe("deny");
+    const cmd = `echo ok${" ".repeat(7)}; rm -rf /`;
+    const d7 = evaluateJob(ask(), bt(cmd));
+    expect(d7.result).toBe("ask");
+    expect(d7.reason).toContain(JSON.stringify(cmd));
+    // Runs separated by other characters do not add up.
+    expect(evaluateJob(ask(), bt(`a${" ".repeat(7)}b${" ".repeat(7)}c`)).result).toBe("ask");
+  });
+
+  it("a printable-ASCII command with quotes, backslashes, pipes, semicolons and $() is asked about, JSON-quoted", () => {
+    const cmd = `echo "a" 'b' \\ | cat; $(id) \`x\` && ls`;
+    const d = evaluateJob(ask(), bt(cmd));
+    expect(d.result).toBe("ask");
+    expect(d.reason).toContain(`runs arbitrary command: ${JSON.stringify(cmd)}`);
+    const all = Array.from({ length: 95 }, (_, i) => String.fromCharCode(32 + i)).join("");
+    expect(evaluateJob(ask(), bt(all)).reason).toContain(JSON.stringify(all));
+  });
+
+  it("an empty command and printable-ASCII model and tool names are still asked about", () => {
+    expect(evaluateJob(ask(), bt("")).result).toBe("ask");
+    expect(evaluateJob(ask({ models: ["m1"] }), job({ model: "gpt 5/x~" })).result).toBe("ask");
+    expect(evaluateToolCall(ask({ tools: ["a.b"] }), "srv-1", "do_it!").result).toBe("ask");
+  });
+
+  it("a listed build-test still allows a non-ASCII command; trusted mode is unchanged", () => {
+    const p = ask({ runners: ["build-test"] });
+    expect(evaluateJob(p, bt("makeㅤé\u{1f600}")).result).toBe("allow");
+    expect(evaluateJob(p, bt(`a${" ".repeat(20)}b`)).result).toBe("allow");
+    expect(evaluateJob({ mode: "trusted" }, bt("makeㅤ")).result).toBe("allow");
+    expect(evaluateToolCall({ mode: "trusted" }, "sㅤ", "t").result).toBe("allow");
+  });
+
+  it("a listed model or tool entry still allows (owner chose it); entries still reject whitespace and a missing dot", () => {
+    // The schema forbids whitespace (incl. Unicode spaces) and requires server.tool, but does not forbid other
+    // non-ASCII, so an owner can list such a name on purpose. Only unlisted values are subject to the allowlist.
+    const p = ask({ models: ["mé"], tools: ["sé.t", "xㅤ.*"] });
+    expect(evaluateJob(p, job({ model: "mé" })).result).toBe("allow");
+    expect(evaluateToolCall(p, "sé", "t").result).toBe("allow");
+    expect(evaluateToolCall(p, "xㅤ", "anything").result).toBe("allow");
+    expect(evaluateToolCall(p, "sé", "other").result).toBe("deny");
+    for (const tools of [["a b.c"], ["a　b.c"], ["a b.c"], ["nodot"]]) {
+      expect(PolicySchema.safeParse({ ...ask(), tools }).success, JSON.stringify(tools)).toBe(false);
+    }
+  });
+
+  it("the 500-char command and 100-char model/tool limits are unchanged", () => {
+    expect(evaluateJob(ask(), bt("a".repeat(500))).result).toBe("ask");
+    expect(evaluateJob(ask(), bt("a".repeat(501))).result).toBe("deny");
+    expect(evaluateJob(ask({ models: ["m1"] }), job({ model: "m".repeat(100) })).result).toBe("ask");
+    expect(evaluateJob(ask({ models: ["m1"] }), job({ model: "m".repeat(101) })).result).toBe("deny");
   });
 });
