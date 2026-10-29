@@ -1,5 +1,5 @@
 import { RunnerName } from "@hoistline/protocol";
-import { PolicySchema, type PolicyConfig } from "./policy.js";
+import { MAX_LIST_ENTRIES, MAX_MODEL_LENGTH, MAX_TOOL_ENTRY_LENGTH, PolicySchema, TOOL_ENTRY, type PolicyConfig } from "./policy.js";
 import { canonicalRepo } from "./repo.js";
 
 export interface SetupIO {
@@ -12,7 +12,8 @@ const MAX_ATTEMPTS = 5;
 export const TRUSTED_CONSEQUENCE =
   "Trusted mode: every job the hub sends for any user signed in to this hub with access to this machine " +
   "(including users the machine is shared with) can run arbitrary code with your privileges on this computer. " +
-  "Nothing will be checked and you will not be asked again. Your choice is honored from now on.";
+  "Also, every direct-mode tool call is allowed. Job signatures from the hub are still verified, but no repo, " +
+  "runner, model or tool allowlist is applied, and you will not be asked again. Your choice is honored from now on.";
 
 export const RESTRICTED_NOTICE =
   "Restricted mode: this checks which repo, runner, model and tool a job uses; it does not sandbox what the " +
@@ -22,7 +23,6 @@ export const BUILD_TEST_WARNING =
   "Warning: the build-test runner executes arbitrary shell commands supplied in the job. Anyone who can send " +
   "jobs to this machine can run any command as you while build-test is allowed.";
 
-const SERVER_TOOL = /^[^.\s]+\.\S+$/;
 
 type Parsed<T> = { value: T } | { error: string };
 
@@ -64,6 +64,7 @@ export async function runSetup(io: SetupIO): Promise<PolicyConfig> {
     "Allowed repositories (comma-separated, owner/name or https://github.com/owner/name)?",
     (a) => {
       const items = splitList(a);
+      if (items.length > MAX_LIST_ENTRIES) return { error: `at most ${MAX_LIST_ENTRIES} entries are allowed` };
       if (items.length === 0) return { error: "at least one repository is required" };
       const out: string[] = [];
       for (const item of items) {
@@ -94,10 +95,11 @@ export async function runSetup(io: SetupIO): Promise<PolicyConfig> {
     "Allowed models (comma-separated; leave blank to allow any model)?",
     (a) => {
       const items = splitList(a);
+      if (items.length > MAX_LIST_ENTRIES) return { error: `at most ${MAX_LIST_ENTRIES} entries are allowed` };
       if (items.length === 0) return { value: undefined };
-      return items.every((i) => i.length <= 100)
+      return items.every((i) => i.length <= MAX_MODEL_LENGTH)
         ? { value: items }
-        : { error: "model names must be 100 characters or fewer" };
+        : { error: `model names must be ${MAX_MODEL_LENGTH} characters or fewer` };
     },
   );
 
@@ -106,8 +108,9 @@ export async function runSetup(io: SetupIO): Promise<PolicyConfig> {
     "Allowed direct-mode tools (comma-separated server.tool or server.*; leave blank to deny all tool calls)?",
     (a) => {
       const items = splitList(a);
+      if (items.length > MAX_LIST_ENTRIES) return { error: `at most ${MAX_LIST_ENTRIES} entries are allowed` };
       if (items.length === 0) return { value: undefined };
-      const bad = items.find((i) => i.length > 300 || !SERVER_TOOL.test(i));
+      const bad = items.find((i) => i.length > MAX_TOOL_ENTRY_LENGTH || !TOOL_ENTRY.test(i));
       return bad === undefined
         ? { value: items }
         : { error: `use server.tool or server.*: ${JSON.stringify(bad.slice(0, 100))}` };

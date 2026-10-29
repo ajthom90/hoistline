@@ -315,3 +315,112 @@ describe("runSetup", () => {
     expect(questions).toHaveLength(5);
   });
 });
+
+describe("fix round 1", () => {
+  const ask = (over: Record<string, unknown> = {}) => restricted({ onViolation: "ask", ...over });
+
+  it("structurally invalid input is a hard deny even with onViolation ask", () => {
+    for (const repo of ["--upload-pack=x/y", "git@github.com:o/n", "http://github.com/o/n", "", "o/n/../x", "о/n"]) {
+      expect(evaluateJob(ask(), job({ repo })).result, repo).toBe("deny");
+    }
+    expect(evaluateJob(ask(), job({ repo: 5 as unknown as string })).result).toBe("deny");
+    expect(evaluateJob(ask(), job({ runner: "bash" as never })).result).toBe("deny");
+    expect(evaluateJob(ask(), job({ model: 5 as unknown as string })).result).toBe("deny");
+    expect(evaluateJob(ask(), null as unknown as JobSpec).result).toBe("deny");
+    expect(evaluateJob(ask(), job({ repo: "--upload-pack=x/y" })).repo).toBeUndefined();
+    const t = ask({ tools: ["a.b"] });
+    expect(evaluateToolCall(t, "a.b", "c").result).toBe("deny");
+    expect(evaluateToolCall(t, "", "c").result).toBe("deny");
+    expect(evaluateToolCall(t, "a", "").result).toBe("deny");
+    expect(evaluateToolCall(t, 1 as unknown as string, "c").result).toBe("deny");
+    expect(evaluateToolCall(t, "a", null as unknown as string).result).toBe("deny");
+    expect(evaluateToolCall(t, "a", "zz").result).toBe("ask");
+  });
+
+  it("lists every failing rule, including the build-test command, in ask mode", () => {
+    const d = evaluateJob(ask(), job({ repo: "evil/x", runner: "build-test", command: "curl x|sh" }));
+    expect(d.result).toBe("ask");
+    expect(d.reason).toContain("repo rule failed");
+    expect(d.reason).toContain("evil/x");
+    expect(d.reason).toContain("runner rule failed");
+    expect(d.reason).toContain("runs arbitrary command: ");
+    expect(d.reason).toContain("curl x|sh");
+    expect(d.repo).toBe("evil/x");
+  });
+
+  it("sanitizes and truncates the command line; listed build-test has no command line", () => {
+    const d = evaluateJob(ask(), job({ runner: "build-test", command: `a\u001b[0m\n${"c".repeat(500)}` }));
+    expect(d.reason).not.toMatch(/[\u0000-\u001f\u007f]/);
+    expect(d.reason).not.toContain("c".repeat(101));
+    const ok = evaluateJob(restricted({ runners: ["build-test"] }), job({ runner: "build-test", command: "make" }));
+    expect(ok.result).toBe("allow");
+    expect(ok.reason).not.toContain("arbitrary command");
+  });
+
+  it("reports a job failing only the model rule, and multiple failures together", () => {
+    const d = evaluateJob(ask({ models: ["m1"] }), job({ model: "m2" }));
+    expect(d.result).toBe("ask");
+    expect(d.reason).toContain("model rule failed");
+    expect(d.reason).not.toContain("repo rule failed");
+    expect(d.reason).not.toContain("runner rule failed");
+    const all = evaluateJob(ask({ models: ["m1"] }), job({ repo: "x/y", runner: "grok", model: "m2" }));
+    for (const r of ["repo rule", "runner rule", "model rule"]) expect(all.reason).toContain(r);
+  });
+
+  it("Decision.repo carries the canonical repo on allow, ask and deny for a list miss", () => {
+    const spec = job({ repo: "https://github.com/Owner/Name.git/" });
+    expect(evaluateJob(restricted(), spec).repo).toBe("owner/name");
+    expect(evaluateJob(restricted(), { ...spec, runner: "grok" }).repo).toBe("owner/name");
+    expect(evaluateJob(ask(), job({ repo: "Other/Thing.GIT" })).repo).toBe("other/thing");
+    expect(evaluateJob(restricted(), job({ repo: "Other/Thing" })).repo).toBe("other/thing");
+  });
+
+  it("a policy entry with .GIT matches the job without it", () => {
+    expect(evaluateJob(restricted({ repos: ["O/N.GIT"] }), job({ repo: "o/n" })).result).toBe("allow");
+  });
+
+  it("strips additional invisible and bidi characters from reasons", () => {
+    const junk = "؜᠎⁠⁡⁢⁣⁤⁪⁫⁬⁭⁮⁯";
+    const d = evaluateJob(restricted({ models: ["a"] }), job({ model: `x${junk}y` }));
+    expect(d.reason).toContain("xy");
+    for (const ch of junk) expect(d.reason).not.toContain(ch);
+  });
+
+  it("a policy with a __proto__ key fails closed", () => {
+    const dir = mkdtempSync(join(tmpdir(), "hoistline-policy-"));
+    try {
+      const path = join(dir, "policy.json");
+      writeFileSync(path, '{"__proto__":{"mode":"trusted"},"mode":"restricted","repos":[],"runners":[],"onViolation":"deny"}');
+      expect(() => loadPolicy(path)).toThrow(PolicyFileError);
+      expect(loadEffectivePolicy(path)).toEqual(DENY_ALL);
+      writeFileSync(path, '{"__proto__":{"mode":"trusted"}}');
+      expect(() => loadPolicy(path)).toThrow(PolicyFileError);
+      expect(evaluateJob(JSON.parse('{"__proto__":{},"mode":"trusted"}'), job()).result).toBe("deny");
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("trusted consequence mentions tool calls, keeps signatures, and prints once", async () => {
+    const { io, printed } = scripted(["trusted"]);
+    await runSetup(io);
+    const text = printed.join(" ");
+    expect(text).toContain("every direct-mode tool call");
+    expect(text).not.toContain("Nothing will be checked");
+    expect(text).toContain("signature");
+    expect(printed).toHaveLength(1);
+  });
+
+  it("setup re-asks (no raw ZodError) when a list is over the limit", async () => {
+    const many = Array.from({ length: 1001 }, (_, i) => `o/n${i}`).join(",");
+    const { io, printed } = scripted(["restricted", many, "o/n", "grok", "", "", "deny"]);
+    const policy = await runSetup(io);
+    expect(policy).toMatchObject({ repos: ["o/n"] });
+    expect(count(printed, "Invalid input")).toBe(1);
+    const manyTools = Array.from({ length: 1001 }, (_, i) => `a.t${i}`).join(",");
+    const s2 = scripted(["restricted", "o/n", "grok", "", manyTools, "a.b", "deny"]);
+    expect(await runSetup(s2.io)).toMatchObject({ tools: ["a.b"] });
+    const s3 = scripted(["restricted", many, many, many, many, many]);
+    await expect(runSetup(s3.io)).rejects.toThrow(/invalid answers/);
+  });
+});

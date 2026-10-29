@@ -5,17 +5,21 @@ import { z } from "zod";
 import { agentHome, writePrivateFile } from "./identity.js";
 import { canonicalRepo } from "./repo.js";
 
-const TOOL_ENTRY = /^[^.\s]+\.\S+$/; // `server.tool` or `server.*`; the server part has no dot
+/** `server.tool` or `server.*`; the server part has no dot. */
+export const TOOL_ENTRY = /^[^.\s]+\.\S+$/;
+export const MAX_LIST_ENTRIES = 1000;
+export const MAX_MODEL_LENGTH = 100;
+export const MAX_TOOL_ENTRY_LENGTH = 300;
 
 const RestrictedSchema = z
   .object({
     mode: z.literal("restricted"),
     repos: z
       .array(z.string().refine((r) => canonicalRepo(r) !== null, "invalid repository"))
-      .max(1000),
+      .max(MAX_LIST_ENTRIES),
     runners: z.array(RunnerName).max(20),
-    models: z.array(z.string().min(1).max(100)).max(1000).optional(),
-    tools: z.array(z.string().max(300).regex(TOOL_ENTRY)).max(1000).optional(),
+    models: z.array(z.string().min(1).max(MAX_MODEL_LENGTH)).max(MAX_LIST_ENTRIES).optional(),
+    tools: z.array(z.string().max(MAX_TOOL_ENTRY_LENGTH).regex(TOOL_ENTRY)).max(MAX_LIST_ENTRIES).optional(),
     onViolation: z.enum(["deny", "ask"]),
   })
   .strict();
@@ -37,6 +41,11 @@ export type PolicyConfig =
 export interface Decision {
   result: "allow" | "deny" | "ask";
   reason: string;
+  /**
+   * The canonical `owner/name` of the job's repo, set whenever the repo was well-formed (allow, ask, and deny for
+   * a list miss). Callers must clone this value and never the raw `spec.repo`. Absent when the repo is malformed.
+   */
+  repo?: string;
 }
 
 /** What an absent, unreadable or invalid policy means: nothing is allowed. */
@@ -48,9 +57,9 @@ export function effectivePolicy(loaded: PolicyConfig | null): PolicyConfig {
   return parsed.success ? (parsed.data as PolicyConfig) : DENY_ALL;
 }
 
-// Control chars, C1, zero-width/bidi marks, line/paragraph separators, BOM. Built from escaped text on purpose.
+// Control chars, C1, invisible/zero-width/bidi marks, line/paragraph separators, BOM. Built from escaped text on purpose.
 const UNSAFE_CHARS = new RegExp(
-  "[\\u0000-\\u001f\\u007f-\\u009f\\u200b-\\u200f\\u2028-\\u202e\\u2066-\\u2069\\ufeff]",
+  "[\\u0000-\\u001f\\u007f-\\u009f\\u061c\\u180e\\u200b-\\u200f\\u2028-\\u202e\\u2060-\\u2064\\u2066-\\u206f\\ufeff]",
   "g",
 );
 
@@ -82,25 +91,34 @@ export function evaluateJob(policy: PolicyConfig, spec: JobSpec): Decision {
     const p = parsed.data as PolicyConfig;
     if (p.mode === "trusted") return ALLOW_TRUSTED;
 
+    // Structurally invalid input (malformed repo, unknown runner, non-string model) is a hard deny regardless of
+    // onViolation: an argument-injection-shaped value cannot be approved safely, so it is never offered for approval.
     const repo = typeof spec?.repo === "string" ? canonicalRepo(spec.repo) : null;
-    if (repo === null) return violation(p, `repo rule failed: ${show(spec?.repo)} is not a valid GitHub repository`);
-    const allowedRepos = new Set(p.repos.map((r) => canonicalRepo(r)));
-    if (!allowedRepos.has(repo)) return violation(p, `repo rule failed: ${show(spec.repo)} is not in the allowed repos`);
+    if (repo === null) return { result: "deny", reason: `repo rule failed: ${show(spec?.repo)} is not a valid GitHub repository` };
+    if (!RunnerName.safeParse(spec.runner).success) {
+      return { result: "deny", reason: `runner rule failed: ${show(spec.runner)} is not a known runner`, repo };
+    }
+    if (spec.model !== undefined && typeof spec.model !== "string") {
+      return { result: "deny", reason: `model rule failed: ${show(spec.model)} is not a string`, repo };
+    }
 
+    // Evaluate every rule so an owner asked to approve sees all of the reasons, not only the first.
+    const failures: string[] = [];
+    if (!p.repos.some((r) => canonicalRepo(r) === repo)) {
+      failures.push(`repo rule failed: ${show(spec.repo)} is not in the allowed repos`);
+    }
     if (!(p.runners as unknown[]).includes(spec.runner)) {
-      return violation(
-        p,
-        spec.runner === "build-test"
-          ? `runner rule failed: ${show(spec.runner)} runs arbitrary commands and is not listed in runners`
-          : `runner rule failed: ${show(spec.runner)} is not in the allowed runners`,
-      );
+      failures.push(`runner rule failed: ${show(spec.runner)} is not in the allowed runners`);
+      if (spec.runner === "build-test") {
+        failures.push(`runs arbitrary command: ${show(spec.command ?? "(none)")}`);
+      }
     }
-
     if (p.models !== undefined) {
-      if (typeof spec.model !== "string") return violation(p, "model rule failed: a model is required but none was given");
-      if (!p.models.includes(spec.model)) return violation(p, `model rule failed: ${show(spec.model)} is not in the allowed models`);
+      if (spec.model === undefined) failures.push("model rule failed: a model is required but none was given");
+      else if (!p.models.includes(spec.model)) failures.push(`model rule failed: ${show(spec.model)} is not in the allowed models`);
     }
-    return { result: "allow", reason: "job matches the allowed repos, runners and models" };
+    if (failures.length > 0) return { result: p.onViolation, reason: failures.join("; "), repo };
+    return { result: "allow", reason: "job matches the allowed repos, runners and models", repo };
   } catch {
     return DENIED_INVALID;
   }
@@ -115,7 +133,8 @@ export function evaluateToolCall(policy: PolicyConfig, server: string, tool: str
     if (p.mode === "trusted") return ALLOW_TRUSTED;
 
     if (typeof server !== "string" || typeof tool !== "string" || server === "" || tool === "" || server.includes(".")) {
-      return violation(p, `tool rule failed: ${show(`${server}.${tool}`)} is not a valid server and tool name`);
+      // Hard deny, never `ask`: malformed or ambiguous names cannot be approved safely.
+      return { result: "deny", reason: `tool rule failed: ${show(`${server}.${tool}`)} is not a valid server and tool name` };
     }
     const name = `${server}.${tool}`;
     if (p.tools === undefined) return violation(p, `tool rule failed: ${show(name)} denied because no tools are allowed`);

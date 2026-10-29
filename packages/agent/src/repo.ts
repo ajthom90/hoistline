@@ -13,11 +13,15 @@ const MAX_NAME = 100;
  */
 export function canonicalRepo(repo: string): string | null {
   if (typeof repo !== "string" || repo.length === 0 || repo.length > 200) return null;
+  // ASCII only, checked before lowercasing (some non-ASCII characters, e.g. the Kelvin sign, lowercase into ASCII).
+  if (!/^[\x21-\x7e]+$/.test(repo)) return null;
   let rest = repo;
   if (rest.startsWith(URL_PREFIX)) {
     rest = rest.slice(URL_PREFIX.length);
     if (rest.endsWith("/")) rest = rest.slice(0, -1);
   }
+  // Lowercase before stripping `.git` so the result is idempotent: canonicalRepo(canonicalRepo(x)) === canonicalRepo(x).
+  rest = rest.toLowerCase();
   if (rest.endsWith(".git")) rest = rest.slice(0, -4);
   const parts = rest.split("/");
   if (parts.length !== 2) return null;

@@ -73,3 +73,39 @@ describe("canonicalRepo", () => {
     expect(canonicalRepo(5 as unknown as string)).toBeNull();
   });
 });
+
+describe("canonicalRepo case and idempotence", () => {
+  it.each([
+    ["o/n.GIT", "o/n"],
+    ["o/n.Git", "o/n"],
+    ["O/N.gIt", "o/n"],
+    ["https://github.com/O/N.GIT/", "o/n"],
+  ])("strips .git in any case: %s", (input, expected) => {
+    expect(canonicalRepo(input)).toBe(expected);
+  });
+
+  it.each(["o/n.git.GIT", "o/n.GIT.git", "o/n.Git.Git", "https://github.com/o/n.git.git"])(
+    "rejects a name still ending in .git after stripping: %s",
+    (input) => {
+      expect(canonicalRepo(input)).toBeNull();
+    },
+  );
+
+  it("rejects a non-ASCII character that lowercases into ASCII (Kelvin sign)", () => {
+    expect(canonicalRepo("K/n")).toBeNull();
+  });
+
+  it("is idempotent for every accepted input", () => {
+    const accepted = [
+      "owner/name", "Owner/Name", "owner/name.git", "https://github.com/Owner/Name",
+      "https://github.com/Owner/Name.git", "https://github.com/owner/name/", "https://github.com/owner/name.git/",
+      "o/n.js", "a-b/c_d.e", "o/n.GIT", "o/n.Git", "https://github.com/O/N.GIT/", "O/N.JS",
+      `${"A".repeat(39)}/${"B".repeat(100)}`,
+    ];
+    for (const input of accepted) {
+      const once = canonicalRepo(input);
+      expect(once, input).not.toBeNull();
+      expect(canonicalRepo(once as string), input).toBe(once);
+    }
+  });
+});
