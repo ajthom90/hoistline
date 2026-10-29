@@ -23,6 +23,7 @@ import type { Gateway } from "./gateway.js";
 import type { Jobs } from "./jobs.js";
 import { pairRouter } from "./pairing.js";
 import type { Store, User } from "./store.js";
+import { registerJobTools } from "./tools/jobs.js";
 import { registerMachineTools } from "./tools/machines.js";
 
 export type { FetchFn, GithubOAuthConfig, OidcConfig } from "./auth/identity.js";
@@ -58,6 +59,8 @@ export interface AppDeps {
 interface ToolContext {
   store: Store;
   gateway: Gateway;
+  /** When set, the job tools are registered too. */
+  jobs?: Jobs;
   /** The hub user the bearer token belongs to. */
   user: User;
 }
@@ -74,7 +77,10 @@ function buildMcpServer(ctx?: ToolContext): McpServer {
   server.registerTool("ping", { description: "Check that the Hoistline hub is reachable." }, async () => ({
     content: [{ type: "text", text: "pong" }],
   }));
-  if (ctx) registerMachineTools(server, ctx.store, ctx.gateway, ctx.user);
+  if (ctx) {
+    registerMachineTools(server, ctx.store, ctx.gateway, ctx.user);
+    if (ctx.jobs) registerJobTools(server, ctx.jobs, ctx.user);
+  }
   return server;
 }
 
@@ -148,7 +154,7 @@ export function createApp(deps: AppDeps): express.Express {
   app.post("/mcp", bearer, express.json(), async (req, res, next) => {
     // Tools act as the hub user the token was issued to (resolved by provider and subject, never by login).
     const hubUser = req.auth?.extra?.hubUser as User | undefined;
-    const ctx: ToolContext | undefined = machines && hubUser ? { ...machines, user: hubUser } : undefined;
+    const ctx: ToolContext | undefined = machines && hubUser ? { ...machines, jobs: deps.jobs, user: hubUser } : undefined;
     const server = buildMcpServer(ctx);
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
     res.on("close", () => {
