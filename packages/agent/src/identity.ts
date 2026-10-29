@@ -42,8 +42,12 @@ export function encodePublicKey(key: KeyObject): string {
 
 /** `$HOISTLINE_AGENT_HOME/identity.json`, defaulting to `~/.hoistline/identity.json`. */
 export function defaultIdentityPath(env: Record<string, string | undefined> = process.env): string {
-  const home = env.HOISTLINE_AGENT_HOME?.trim() || join(homedir(), ".hoistline");
-  return join(home, "identity.json");
+  return join(agentHome(env), "identity.json");
+}
+
+/** `$HOISTLINE_AGENT_HOME`, defaulting to `~/.hoistline`. */
+export function agentHome(env: Record<string, string | undefined> = process.env): string {
+  return env.HOISTLINE_AGENT_HOME?.trim() || join(homedir(), ".hoistline");
 }
 
 /** Writes the identity as JSON, file mode 0600, creating its directory with mode 0700. */
@@ -55,13 +59,18 @@ export function saveIdentity(path: string, identity: AgentIdentity): void {
     privateKey: identity.privateKey.export({ format: "pem", type: "pkcs8" }).toString(),
     hubPublicKey: encodePublicKey(identity.hubPublicKey),
   };
+  writePrivateFile(path, `${JSON.stringify(file, null, 2)}\n`);
+}
+
+/** Writes `content` to `path` with file mode 0600, creating its directory with mode 0700 (temp file plus rename). */
+export function writePrivateFile(path: string, content: string): void {
   const dir = dirname(path);
   mkdirSync(dir, { recursive: true, mode: 0o700 });
   chmodSync(dir, 0o700); // also when the directory already existed
   // Write a private temp file and rename it over the target, so an existing file's looser mode never applies.
   const tmp = `${path}.${randomBytes(8).toString("hex")}.tmp`;
   try {
-    writeFileSync(tmp, `${JSON.stringify(file, null, 2)}\n`, { mode: 0o600, flag: "wx" });
+    writeFileSync(tmp, content, { mode: 0o600, flag: "wx" });
     chmodSync(tmp, 0o600);
     renameSync(tmp, path);
   } catch (err) {

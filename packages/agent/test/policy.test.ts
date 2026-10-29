@@ -1,0 +1,317 @@
+import { mkdtempSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import type { JobSpec } from "@hoistline/protocol";
+import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import {
+  DENY_ALL,
+  PolicyFileError,
+  PolicySchema,
+  defaultPolicyPath,
+  effectivePolicy,
+  evaluateJob,
+  evaluateToolCall,
+  loadEffectivePolicy,
+  loadPolicy,
+  runSetup,
+  savePolicy,
+  type PolicyConfig,
+  type SetupIO,
+} from "../src/index.js";
+
+const job = (over: Partial<JobSpec> = {}): JobSpec => ({
+  jobId: "j1",
+  runner: "codex",
+  repo: "owner/name",
+  baseBranch: "main",
+  prompt: "do it",
+  ...over,
+});
+
+const restricted = (over: Record<string, unknown> = {}): PolicyConfig =>
+  ({ mode: "restricted", repos: ["owner/name"], runners: ["codex"], onViolation: "deny", ...over }) as PolicyConfig;
+
+function scripted(answers: string[]) {
+  const printed: string[] = [];
+  const questions: string[] = [];
+  const io: SetupIO = {
+    async ask(q) {
+      questions.push(q);
+      const a = answers.shift();
+      if (a === undefined) throw new Error("out of answers");
+      return a;
+    },
+    print: (t) => printed.push(t),
+  };
+  return { io, printed, questions };
+}
+
+const count = (texts: string[], needle: string) => texts.join("\n").split(needle).length - 1;
+
+describe("trusted mode", () => {
+  const p: PolicyConfig = { mode: "trusted" };
+  it("allows any job and any tool, never asking", () => {
+    for (const spec of [job(), job({ repo: "evil/x", runner: "build-test", command: "rm -rf /", model: "zzz" })]) {
+      expect(evaluateJob(p, spec).result).toBe("allow");
+    }
+    expect(evaluateToolCall(p, "any", "thing").result).toBe("allow");
+  });
+});
+
+describe("restricted jobs", () => {
+  it("allows a matching job", () => {
+    expect(evaluateJob(restricted(), job()).result).toBe("allow");
+  });
+
+  it("denies a repo not in repos and names it", () => {
+    const d = evaluateJob(restricted(), job({ repo: "other/thing" }));
+    expect(d.result).toBe("deny");
+    expect(d.reason).toContain("other/thing");
+  });
+
+  it("returns ask instead of deny with onViolation ask", () => {
+    expect(evaluateJob(restricted({ onViolation: "ask" }), job({ repo: "other/thing" })).result).toBe("ask");
+    expect(evaluateToolCall(restricted({ onViolation: "ask" }), "a", "b").result).toBe("ask");
+  });
+
+  it("matches repos exactly on owner/name, case-insensitively, across URL forms", () => {
+    const p = restricted({ repos: ["Owner/Name"] });
+    expect(evaluateJob(p, job({ repo: "OWNER/name" })).result).toBe("allow");
+    expect(evaluateJob(p, job({ repo: "https://github.com/Owner/Name.git" })).result).toBe("allow");
+    expect(evaluateJob(restricted(), job({ repo: "https://github.com/Owner/Name.git" })).result).toBe("allow");
+    expect(evaluateJob(p, job({ repo: "owner/name2" })).result).toBe("deny");
+    expect(evaluateJob(p, job({ repo: "owner2/name" })).result).toBe("deny");
+    expect(evaluateJob(p, job({ repo: "xowner/name" })).result).toBe("deny");
+    expect(evaluateJob(p, job({ repo: "https://evil.com/owner/name" })).result).toBe("deny");
+    expect(evaluateJob(p, job({ repo: "--upload-pack=x/y" })).result).toBe("deny");
+  });
+
+  it("denies a runner not listed", () => {
+    const d = evaluateJob(restricted(), job({ runner: "grok" }));
+    expect(d.result).toBe("deny");
+    expect(d.reason).toContain("grok");
+  });
+
+  it("denies build-test unless explicitly listed", () => {
+    const spec = job({ runner: "build-test", command: "make" });
+    expect(evaluateJob(restricted(), spec).result).toBe("deny");
+    expect(evaluateJob(restricted({ runners: ["build-test"] }), spec).result).toBe("allow");
+  });
+
+  it("models: unset allows any (or none); set requires a listed model", () => {
+    expect(evaluateJob(restricted(), job({ model: "anything" })).result).toBe("allow");
+    expect(evaluateJob(restricted(), job()).result).toBe("allow");
+    const p = restricted({ models: ["m1"] });
+    expect(evaluateJob(p, job({ model: "m1" })).result).toBe("allow");
+    expect(evaluateJob(p, job()).result).toBe("deny");
+    expect(evaluateJob(p, job({ model: "M1" })).result).toBe("deny");
+    expect(evaluateJob(p, job({ model: "m2" })).reason).toContain("m2");
+    expect(evaluateJob(restricted({ models: [] }), job({ model: "m1" })).result).toBe("deny");
+  });
+
+  it("does not throw on a malformed spec", () => {
+    expect(evaluateJob(restricted(), {} as JobSpec).result).toBe("deny");
+    expect(evaluateJob(restricted(), null as unknown as JobSpec).result).toBe("deny");
+    expect(evaluateJob(restricted(), job({ repo: 5 as unknown as string })).result).toBe("deny");
+  });
+
+  it("strips control characters and truncates values in reasons", () => {
+    const d = evaluateJob(restricted(), job({ runner: "grok", repo: "owner/name" }));
+    expect(d.reason).toContain("grok");
+    const d2 = evaluateJob(restricted({ models: ["a"] }), job({ model: `x\u001b[31m\n\r\u0000${"y".repeat(500)}` }));
+    expect(d2.result).toBe("deny");
+    expect(d2.reason).not.toMatch(/[\u0000-\u001f\u007f]/);
+    expect(d2.reason.length).toBeLessThan(220);
+    expect(d2.reason).not.toContain("y".repeat(101));
+    const d3 = evaluateJob(restricted(), job({ repo: `bad\nrepo\u0007${"z".repeat(300)}` }));
+    expect(d3.reason).not.toMatch(/[\u0000-\u001f\u007f]/);
+    expect(d3.reason).not.toContain("z".repeat(101));
+  });
+});
+
+describe("restricted tool calls", () => {
+  it("unset tools denies every call", () => {
+    const d = evaluateToolCall(restricted(), "a", "b");
+    expect(d.result).toBe("deny");
+    expect(d.reason).toContain("a.b");
+  });
+
+  it("server.tool and server.* work; matching is exact and case-sensitive", () => {
+    const p = restricted({ tools: ["a.b", "srv.*"] });
+    expect(evaluateToolCall(p, "a", "b").result).toBe("allow");
+    expect(evaluateToolCall(p, "srv", "anything").result).toBe("allow");
+    expect(evaluateToolCall(p, "a", "bc").result).toBe("deny");
+    expect(evaluateToolCall(p, "ab", "c").result).toBe("deny");
+    expect(evaluateToolCall(p, "A", "b").result).toBe("deny");
+    expect(evaluateToolCall(p, "a", "B").result).toBe("deny");
+    expect(evaluateToolCall(p, "SRV", "x").result).toBe("deny");
+    expect(evaluateToolCall(p, "a", "*").result).toBe("deny");
+    expect(evaluateToolCall(restricted({ tools: [] }), "a", "b").result).toBe("deny");
+  });
+
+  it("rejects ambiguous dotted server names and non-strings", () => {
+    const p = restricted({ tools: ["a.b.c"] });
+    expect(evaluateToolCall(p, "a.b", "c").result).toBe("deny");
+    expect(evaluateToolCall(p, undefined as unknown as string, "c").result).toBe("deny");
+  });
+});
+
+describe("invalid policies", () => {
+  const bad: unknown[] = [
+    { mode: "trusted", extra: 1 },
+    { mode: "root" },
+    { mode: "restricted" },
+    { mode: "restricted", repos: ["owner/name"], runners: ["codex"], onViolation: "allow" },
+    { mode: "restricted", repos: ["--upload-pack=x/y"], runners: ["codex"], onViolation: "deny" },
+    { mode: "restricted", repos: [], runners: ["bash"], onViolation: "deny" },
+    { mode: "restricted", repos: [], runners: [], onViolation: "deny", extra: true },
+    null,
+    undefined,
+    "trusted",
+    42,
+    [],
+  ];
+  it.each(bad.map((b) => [JSON.stringify(b) ?? "undefined", b]))("denies %s without throwing", (_n, p) => {
+    expect(PolicySchema.safeParse(p).success).toBe(false);
+    expect(evaluateJob(p as PolicyConfig, job()).result).toBe("deny");
+    expect(evaluateToolCall(p as PolicyConfig, "a", "b").result).toBe("deny");
+    expect(effectivePolicy(p as PolicyConfig)).toEqual(DENY_ALL);
+  });
+
+  it("DENY_ALL denies everything", () => {
+    expect(evaluateJob(DENY_ALL, job()).result).toBe("deny");
+    expect(evaluateToolCall(DENY_ALL, "a", "b").result).toBe("deny");
+  });
+
+  it("effectivePolicy(null) is DENY_ALL and valid policies pass through", () => {
+    expect(effectivePolicy(null)).toEqual(DENY_ALL);
+    expect(effectivePolicy({ mode: "trusted" })).toEqual({ mode: "trusted" });
+    expect(effectivePolicy(restricted())).toEqual(restricted());
+  });
+});
+
+describe("persistence", () => {
+  let dir: string;
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "hoistline-policy-"));
+  });
+  afterEach(() => rmSync(dir, { recursive: true, force: true }));
+
+  it("defaults under HOISTLINE_AGENT_HOME", () => {
+    expect(defaultPolicyPath({ HOISTLINE_AGENT_HOME: "/x/y" })).toBe("/x/y/policy.json");
+  });
+
+  it("round-trips, with file mode 0600, directory 0700 and no temp files left", () => {
+    const path = join(dir, "home", "policy.json");
+    savePolicy(path, restricted({ tools: ["a.*"], models: ["m"] }));
+    expect(loadPolicy(path)).toEqual(restricted({ tools: ["a.*"], models: ["m"] }));
+    expect(statSync(path).mode & 0o777).toBe(0o600);
+    expect(statSync(join(dir, "home")).mode & 0o777).toBe(0o700);
+    expect(readdirSync(join(dir, "home"))).toEqual(["policy.json"]);
+    savePolicy(path, { mode: "trusted" });
+    expect(loadPolicy(path)).toEqual({ mode: "trusted" });
+    expect(statSync(path).mode & 0o777).toBe(0o600);
+  });
+
+  it("refuses to save an invalid policy", () => {
+    expect(() => savePolicy(join(dir, "p.json"), { mode: "root" } as unknown as PolicyConfig)).toThrow();
+  });
+
+  it("missing file is null (and denies via effectivePolicy)", () => {
+    const path = join(dir, "nope.json");
+    expect(loadPolicy(path)).toBeNull();
+    expect(loadEffectivePolicy(path)).toEqual(DENY_ALL);
+  });
+
+  it.each(["{not json", '{"mode":"trusted","extra":1}', '{"mode":"root"}', "null", ""])(
+    "corrupt or invalid file %j throws PolicyFileError and yields DENY_ALL",
+    (content) => {
+      const path = join(dir, "policy.json");
+      writeFileSync(path, content);
+      expect(() => loadPolicy(path)).toThrow(PolicyFileError);
+      expect(loadEffectivePolicy(path)).toEqual(DENY_ALL);
+    },
+  );
+
+  it("an unreadable path (a directory) is a PolicyFileError, not null", () => {
+    expect(() => loadPolicy(dir)).toThrow(PolicyFileError);
+    expect(loadEffectivePolicy(dir)).toEqual(DENY_ALL);
+  });
+});
+
+describe("runSetup", () => {
+  it("trusted: prints the consequence exactly once, asks nothing more, never in evaluateJob", async () => {
+    const { io, printed, questions } = scripted(["trusted"]);
+    const policy = await runSetup(io);
+    expect(policy).toEqual({ mode: "trusted" });
+    expect(questions).toHaveLength(1);
+    expect(count(printed, "arbitrary code with your privileges")).toBe(1);
+    expect(printed.join(" ")).toContain("users the machine is shared with");
+    expect(printed.join(" ")).toContain("any user signed in to this hub");
+
+    // Evaluating never prints or asks anything.
+    const before = printed.length;
+    expect(evaluateJob(policy, job()).result).toBe("allow");
+    expect(evaluateJob(policy, job()).reason).not.toContain("privileges");
+    expect(printed).toHaveLength(before);
+  });
+
+  it("restricted: says there is no sandbox, warns about build-test, returns a validated policy", async () => {
+    const { io, printed } = scripted([
+      "Restricted",
+      "https://github.com/Owner/Name.git, other/repo",
+      "codex, build-test",
+      "m1, m2",
+      "srv.*, a.b",
+      "ask",
+    ]);
+    const policy = await runSetup(io);
+    expect(policy).toEqual({
+      mode: "restricted",
+      repos: ["owner/name", "other/repo"],
+      runners: ["codex", "build-test"],
+      models: ["m1", "m2"],
+      tools: ["srv.*", "a.b"],
+      onViolation: "ask",
+    });
+    const text = printed.join("\n");
+    expect(text).toContain("does not sandbox what the runner does once started");
+    expect(count(printed, "does not sandbox")).toBe(1);
+    expect(count(printed, "build-test runner executes arbitrary")).toBe(1);
+    expect(text).not.toContain("arbitrary code with your privileges");
+  });
+
+  it("restricted: blank models and tools stay unset, and no build-test warning without build-test", async () => {
+    const { io, printed } = scripted(["restricted", "o/n", "grok", "", "", "deny"]);
+    const policy = await runSetup(io);
+    expect(policy).toEqual({ mode: "restricted", repos: ["o/n"], runners: ["grok"], onViolation: "deny" });
+    expect("models" in policy).toBe(false);
+    expect("tools" in policy).toBe(false);
+    expect(printed.join("\n")).not.toContain("build-test runner");
+  });
+
+  it("re-asks on invalid repo, runner, tools and mode", async () => {
+    const { io, printed } = scripted([
+      "maybe",
+      "restricted",
+      "git@github.com:o/n",
+      "o/n",
+      "rm",
+      "muse",
+      "",
+      "badtool",
+      "a.b",
+      "sometimes",
+      "deny",
+    ]);
+    const policy = await runSetup(io);
+    expect(policy).toEqual({ mode: "restricted", repos: ["o/n"], runners: ["muse"], tools: ["a.b"], onViolation: "deny" });
+    expect(count(printed, "Invalid input")).toBe(5);
+  });
+
+  it("throws after 5 invalid answers", async () => {
+    const { io, questions } = scripted(["x", "x", "x", "x", "x", "trusted"]);
+    await expect(runSetup(io)).rejects.toThrow(/5 invalid answers/);
+    expect(questions).toHaveLength(5);
+  });
+});
