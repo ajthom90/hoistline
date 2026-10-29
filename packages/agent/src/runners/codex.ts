@@ -11,6 +11,8 @@ export const codexTemplate: RunnerTemplate = {
     "exec",
     "--json",
     "--ignore-user-config",
+    // User and project execpolicy .rules files are repo/owner content that could loosen what Codex runs.
+    "--ignore-rules",
     "--sandbox",
     "workspace-write",
     "-C",

@@ -4,16 +4,19 @@ import { z } from "zod";
 export const RunnerName = z.enum(["muse", "codex", "cursor", "grok", "build-test"]);
 export type RunnerName = z.infer<typeof RunnerName>;
 
+// No job string may contain NUL: it cannot be passed to a process (argv, env) and C-based tools truncate at it.
+const noNul = (s: z.ZodString) => s.refine((v) => !v.includes("\0"), { message: "must not contain NUL" });
+
 // Field validation only; git-specific validation (ref names, repo format) lives elsewhere.
 export const JobSpecSchema = z
   .object({
-    jobId: z.string().min(1).max(100),
+    jobId: noNul(z.string().min(1).max(100)),
     runner: RunnerName,
-    repo: z.string().min(1).max(200),
-    baseBranch: z.string().min(1).max(255),
-    prompt: z.string().min(1).max(100_000),
-    model: z.string().min(1).max(100).optional(),
-    command: z.string().min(1).max(10_000).optional(),
+    repo: noNul(z.string().min(1).max(200)),
+    baseBranch: noNul(z.string().min(1).max(255)),
+    prompt: noNul(z.string().min(1).max(100_000)),
+    model: noNul(z.string().min(1).max(100)).optional(),
+    command: noNul(z.string().min(1).max(10_000)).optional(),
   })
   .strict();
 export type JobSpec = z.infer<typeof JobSpecSchema>;

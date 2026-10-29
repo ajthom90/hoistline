@@ -19,6 +19,32 @@ export function wrapPrompt(prompt: string): string {
   return RUNNER_PREAMBLE + PROMPT_DELIMITER + prompt;
 }
 
+/**
+ * Linux caps a single argv element at 128 KiB (MAX_ARG_STRLEN). A CLI that takes the prompt as an argument refuses
+ * a wrapped prompt above this, with headroom, before anything is spawned.
+ */
+export const MAX_ARGV_PROMPT_BYTES = 120 * 1024;
+
+/** The wrapped prompt is too large to pass to this runner as one argument. */
+export class PromptTooLargeError extends Error {
+  constructor(
+    readonly bytes: number,
+    readonly limit: number,
+    readonly runner: string,
+  ) {
+    super(`prompt_too_large: ${bytes} bytes exceeds the ${limit} byte limit for ${runner}`);
+    this.name = "PromptTooLargeError";
+  }
+}
+
+/** wrapPrompt for a CLI that receives the prompt as one argv element; enforces MAX_ARGV_PROMPT_BYTES. */
+export function wrapPromptForArgv(runner: string, prompt: string): string {
+  const wrapped = wrapPrompt(prompt);
+  const bytes = Buffer.byteLength(wrapped, "utf8");
+  if (bytes > MAX_ARGV_PROMPT_BYTES) throw new PromptTooLargeError(bytes, MAX_ARGV_PROMPT_BYTES, runner);
+  return wrapped;
+}
+
 /** The worktree a CLI is scoped to; required because it goes into the CLI's own workspace flag. */
 export function requireWorktree(runner: string, ctx: RunnerContext): string {
   if (typeof ctx.cwd !== "string" || !isAbsolute(ctx.cwd)) {

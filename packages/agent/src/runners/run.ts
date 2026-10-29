@@ -1,5 +1,5 @@
-import { execFile, spawn } from "node:child_process";
-import { stat } from "node:fs/promises";
+import { execFile, spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { realpath, stat } from "node:fs/promises";
 import { constants } from "node:os";
 import { StringDecoder } from "node:string_decoder";
 import type { JobSpec } from "@hoistline/protocol";
@@ -13,12 +13,25 @@ export class RunnerNotInstalledError extends Error {
   }
 }
 
+/** The OS refused to start the runner for a reason other than a missing executable (EACCES, E2BIG, a NUL, ...). */
+export class RunnerSpawnError extends Error {
+  constructor(reason: string, cause: unknown) {
+    super(`runner_spawn_failed: ${reason}`, { cause });
+    this.name = "RunnerSpawnError";
+  }
+}
+
 export type RunJobOptions = {
   /** Maximum runtime before the runner is killed and the result is exit code 124. Default 60 minutes. */
   timeoutMs?: number;
-  /** On abort or timeout: time between SIGTERM and SIGKILL to the process group. Default 2 s. */
+  /** On abort or timeout: time between SIGTERM and SIGKILL to the process group. Default 1.5 s. */
   termGraceMs?: number;
-  /** After the runner exits, how long to wait for its output pipes to close before closing them. Default 5 s. */
+  /**
+   * After the runner exits: time between SIGTERM and SIGKILL to whatever is left in its process group. Default
+   * min(termGraceMs, 1 s).
+   */
+  postExitGraceMs?: number;
+  /** After the process group is gone, how long to wait for the output pipes to close before closing them. Default 5 s. */
   killGraceMs?: number;
 };
 
@@ -37,10 +50,14 @@ export type OutputStream = "stdout" | "stderr";
 
 const MAX_CHUNK_BYTES = 16 * 1024;
 const DEFAULT_TIMEOUT_MS = 60 * 60 * 1000;
-const DEFAULT_TERM_GRACE_MS = 2000;
+const DEFAULT_TERM_GRACE_MS = 1500;
 const DEFAULT_KILL_GRACE_MS = 5000;
+/** After the post-exit SIGKILL, how long to wait for the group to disappear before giving up on it. */
+const REAP_WAIT_MS = 1000;
+const REAP_POLL_MS = 25;
 const TIMEOUT_EXIT_CODE = 124;
 const ABORTED_BEFORE_START_EXIT_CODE = 130;
+const windows = process.platform === "win32";
 
 /**
  * The runner's environment: the owner's own (the CLIs need their logins), minus every GIT_* variable (the agent's
@@ -72,23 +89,19 @@ function emitChunks(text: string, deliver: (chunk: string) => void): void {
   }
 }
 
-/** SIGTERM to the runner's whole process group, then SIGKILL after the grace. Windows: taskkill /T /F. */
-function terminate(pid: number | undefined, termGraceMs: number): void {
-  if (pid === undefined) return;
-  if (process.platform === "win32") {
-    execFile("taskkill", ["/pid", String(pid), "/T", "/F"], { windowsHide: true }, () => undefined);
-    return;
+/** Sends a signal to the whole process group led by pid. Returns false once the group no longer exists. */
+function signalGroup(pid: number, sig: NodeJS.Signals | 0): boolean {
+  try {
+    process.kill(-pid, sig);
+    return true;
+  } catch (err) {
+    return (err as NodeJS.ErrnoException).code !== "ESRCH";
   }
-  const signalGroup = (sig: NodeJS.Signals) => {
-    try {
-      process.kill(-pid, sig);
-    } catch {
-      // The group is gone.
-    }
-  };
-  signalGroup("SIGTERM");
-  // Runs even if the leader exits first: a descendant in the group may ignore SIGTERM.
-  setTimeout(() => signalGroup("SIGKILL"), termGraceMs).unref();
+}
+
+/** Windows has no process groups: taskkill /T walks the tree (best effort once the root has exited). */
+function taskkillTree(pid: number): void {
+  execFile("taskkill", ["/pid", String(pid), "/T", "/F"], { windowsHide: true }, () => undefined);
 }
 
 function exitCodeOf(code: number | null, sig: NodeJS.Signals | null): number {
@@ -98,9 +111,15 @@ function exitCodeOf(code: number | null, sig: NodeJS.Signals | null): number {
 }
 
 /**
- * Runs one job's runner in `dir` and streams its output. Resolves with the exit code; a nonzero exit, a signal, an
- * abort or a timeout is a value, never an exception. Throws RunnerNotInstalledError when the CLI is not on PATH,
- * and a plain Error for any other failure to start (a missing `dir`, an argument list the OS refuses).
+ * Runs one job's runner in the real path of `dir` and streams its output. Resolves with the exit code; a nonzero
+ * exit, a signal, an abort or a timeout is a value, never an exception. When the runner exits, everything left in
+ * its process group is stopped (SIGTERM, then SIGKILL) before the promise resolves. Throws
+ * RunnerNotInstalledError when the CLI is not on PATH, PromptTooLargeError (from the adapter) for a prompt the CLI
+ * cannot take, RunnerSpawnError for any other failure to start, and a plain Error for a `dir` that is not a
+ * directory.
+ *
+ * runJob keeps no output: every chunk goes to onOutput and nowhere else, so the caller must enforce any size cap
+ * (such as the task_result cap) on what it keeps.
  */
 export async function runJob(
   spec: JobSpec,
@@ -110,32 +129,48 @@ export async function runJob(
   opts: RunJobOptions = {},
 ): Promise<RunJobResult> {
   if (signal.aborted) return { exitCode: ABORTED_BEFORE_START_EXIT_CODE, aborted: true };
-  const cmd = buildCommand(spec, { cwd: dir });
-  // Node reports a missing cwd as ENOENT too; check it first so it is not mistaken for a missing runner.
-  const info = await stat(dir).catch(() => null);
-  if (!info?.isDirectory()) throw new Error(`working directory ${dir} is not a directory`);
+  // Resolve symlinks once, so the runner's cwd and its workspace flag name the same real directory. Node reports a
+  // missing cwd as ENOENT too; checking here keeps that from being mistaken for a missing runner.
+  const real = await realpath(dir).catch(() => null);
+  const info = real === null ? null : await stat(real).catch(() => null);
+  if (real === null || !info?.isDirectory()) throw new Error(`working directory ${dir} is not a directory`);
+  const cmd = buildCommand(spec, { cwd: real });
   if (signal.aborted) return { exitCode: ABORTED_BEFORE_START_EXIT_CODE, aborted: true };
 
   const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
   const termGraceMs = opts.termGraceMs ?? DEFAULT_TERM_GRACE_MS;
+  const postExitGraceMs = opts.postExitGraceMs ?? Math.min(termGraceMs, 1000);
   const killGraceMs = opts.killGraceMs ?? DEFAULT_KILL_GRACE_MS;
 
-  return new Promise<RunJobResult>((resolve, reject) => {
-    const child = spawn(cmd.file, cmd.args, {
-      cwd: dir,
+  let child: ChildProcessWithoutNullStreams;
+  try {
+    child = spawn(cmd.file, cmd.args, {
+      cwd: real,
       env: runnerEnv(),
       shell: false,
       windowsHide: true,
-      // Its own process group on POSIX, so an abort or timeout reaches everything the runner started.
-      detached: process.platform !== "win32",
+      windowsVerbatimArguments: cmd.verbatimArgs === true,
+      // Its own process group on POSIX, so a kill reaches everything the runner started (unless it left the group).
+      detached: !windows,
       stdio: ["pipe", "pipe", "pipe"],
     });
+  } catch (err) {
+    // spawn throws synchronously for arguments it cannot pass at all (for example a NUL character).
+    throw new RunnerSpawnError((err as NodeJS.ErrnoException).code ?? (err as Error).message, err);
+  }
 
+  return new Promise<RunJobResult>((resolve, reject) => {
     let settled = false;
     let stopped: "aborted" | "timedOut" | null = null;
     let exited: { code: number | null; sig: NodeJS.Signals | null } | null = null;
+    let closed = false;
+    let pipesDestroyed = false;
+    let groupDone = false;
     let outputErrors = 0;
     let pipeGrace: NodeJS.Timeout | undefined;
+    let reapTimer: NodeJS.Timeout | undefined;
+    let reapKilledAt: number | null = null;
+    let reapDeadline = 0;
 
     const sink = (stream: OutputStream) => {
       const decoder = new StringDecoder("utf8");
@@ -160,25 +195,84 @@ export async function runJob(
       settled = true;
       clearTimeout(timer);
       clearTimeout(pipeGrace);
+      clearTimeout(reapTimer);
       signal.removeEventListener("abort", onAbort);
     };
     const finish = () => {
-      if (settled) return;
+      if (settled || exited === null || !groupDone || !(closed || pipesDestroyed)) return;
       cleanup();
       out.end();
       err.end();
       const result: RunJobResult = {
-        exitCode: stopped === "timedOut" ? TIMEOUT_EXIT_CODE : exitCodeOf(exited?.code ?? null, exited?.sig ?? null),
+        exitCode: stopped === "timedOut" ? TIMEOUT_EXIT_CODE : exitCodeOf(exited.code, exited.sig),
       };
       if (stopped === "timedOut") result.timedOut = true;
       if (stopped === "aborted") result.aborted = true;
       if (outputErrors > 0) result.outputErrors = outputErrors;
       resolve(result);
     };
+    const destroyPipes = () => {
+      clearTimeout(pipeGrace);
+      child.stdout.destroy();
+      child.stderr.destroy();
+      pipesDestroyed = true;
+      finish();
+    };
+    const groupGone = () => {
+      if (settled) return;
+      groupDone = true;
+      clearTimeout(reapTimer);
+      // Something outside the group (a descendant in a new session) can still hold the pipes, and then "close" never
+      // comes. Stop waiting for it after a bounded grace; an abort or timeout stops waiting at once.
+      if (stopped !== null) return destroyPipes();
+      pipeGrace = setTimeout(destroyPipes, killGraceMs);
+      finish();
+    };
+    // After the leader exits: SIGTERM what is left of the group, SIGKILL it after postExitGraceMs (at once after an
+    // abort or timeout), and wait until the group is gone, at most REAP_WAIT_MS after the SIGKILL.
+    const reapStep = () => {
+      if (settled || groupDone || child.pid === undefined) return;
+      if (!signalGroup(child.pid, 0)) return groupGone();
+      const now = Date.now();
+      if (reapKilledAt === null && (now >= reapDeadline || stopped !== null)) {
+        signalGroup(child.pid, "SIGKILL");
+        reapKilledAt = now;
+      } else if (reapKilledAt !== null && now - reapKilledAt >= REAP_WAIT_MS) {
+        return groupGone();
+      }
+      reapTimer = setTimeout(reapStep, REAP_POLL_MS);
+    };
+    const onExit = (code: number | null, sig: NodeJS.Signals | null) => {
+      if (exited !== null) return;
+      exited = { code, sig };
+      if (child.pid === undefined) return groupGone();
+      if (windows) {
+        taskkillTree(child.pid);
+        return groupGone();
+      }
+      if (!signalGroup(child.pid, "SIGTERM")) return groupGone();
+      reapDeadline = Date.now() + postExitGraceMs;
+      reapStep();
+    };
+
     const stop = (why: "aborted" | "timedOut") => {
-      if (settled || stopped !== null || exited !== null) return;
+      if (settled || stopped !== null) return;
       stopped = why;
-      terminate(child.pid, termGraceMs);
+      if (exited === null) {
+        if (child.pid === undefined) return;
+        if (windows) return taskkillTree(child.pid);
+        signalGroup(child.pid, "SIGTERM");
+        const pid = child.pid;
+        // Runs even if the leader exits first: a descendant in the group may ignore SIGTERM.
+        setTimeout(() => signalGroup(pid, "SIGKILL"), termGraceMs).unref();
+      } else if (!groupDone) {
+        // Leader gone, group still being stopped: escalate to SIGKILL now.
+        clearTimeout(reapTimer);
+        reapStep();
+      } else {
+        // Only the pipes are left, held by something outside the group: stop waiting for them.
+        destroyPipes();
+      }
     };
     const onAbort = () => stop("aborted");
     signal.addEventListener("abort", onAbort, { once: true });
@@ -188,21 +282,12 @@ export async function runJob(
       // Only a failure to start rejects; anything after that is reported through exit/close.
       if (settled || child.pid !== undefined) return;
       cleanup();
-      reject(e.code === "ENOENT" ? new RunnerNotInstalledError(cmd.file) : e);
+      reject(e.code === "ENOENT" ? new RunnerNotInstalledError(cmd.file) : new RunnerSpawnError(e.code ?? e.message, e));
     });
-    child.on("exit", (code, sig) => {
-      exited = { code, sig };
-      clearTimeout(timer);
-      // A descendant that left the process group can hold the pipes open, and then "close" never comes. Stop
-      // waiting for it after a bounded grace.
-      pipeGrace = setTimeout(() => {
-        child.stdout.destroy();
-        child.stderr.destroy();
-        finish();
-      }, killGraceMs);
-    });
+    child.on("exit", onExit);
     child.on("close", (code, sig) => {
-      exited ??= { code, sig };
+      closed = true;
+      onExit(code, sig);
       finish();
     });
 

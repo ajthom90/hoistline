@@ -1,4 +1,4 @@
-import { requireWorktree, wrapPrompt } from "./prompt.js";
+import { requireWorktree, wrapPromptForArgv } from "./prompt.js";
 import type { RunnerTemplate } from "./template.js";
 
 /**
@@ -18,6 +18,7 @@ export const museTemplate: RunnerTemplate = {
     requireWorktree("muse", ctx),
     ...(spec.model !== undefined ? ["--model", spec.model] : []),
     "--",
-    wrapPrompt(spec.prompt),
+    // Throws PromptTooLargeError above 120 KiB: Linux refuses a larger single argument (E2BIG).
+    wrapPromptForArgv("muse", spec.prompt),
   ],
 };

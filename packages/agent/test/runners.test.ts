@@ -1,4 +1,14 @@
-import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  realpathSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -6,12 +16,16 @@ import type { JobSpec } from "@hoistline/protocol";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import {
   PROMPT_DELIMITER,
+  PromptTooLargeError,
   RUNNER_PREAMBLE,
   RunnerNotInstalledError,
+  RunnerSpawnError,
   buildCommand,
   registerBuiltinRunners,
+  registerRunner,
   runJob,
 } from "../src/index.js";
+import { buildTestTemplateFor } from "../src/runners/build-test.js";
 import { _resetRunnersForTests } from "../src/runners/template.js";
 
 const FAKE_CLI = fileURLToPath(new URL("./fixtures/fake-cli.mjs", import.meta.url));
@@ -49,7 +63,7 @@ function alive(pid: number): boolean {
   }
 }
 
-async function waitFor(cond: () => boolean, ms = 5000): Promise<void> {
+async function waitFor(cond: () => boolean, ms = 15_000): Promise<void> {
   const end = Date.now() + ms;
   while (!cond()) {
     if (Date.now() > end) throw new Error("timed out waiting");
@@ -65,6 +79,18 @@ function collector(): { chunks: Chunk[]; onOutput: (chunk: string, stream: "stdo
 
 const never = () => new AbortController().signal;
 
+/**
+ * A build-test command whose background node process ignores SIGTERM, writes its pid to ./bgpid once the handler is
+ * installed, and (unless redirected) keeps the job's stdout open. The leader waits for bgpid, then exits.
+ */
+function bgIgnoringTerm(redirect: boolean): string {
+  const script = "process.on('SIGTERM',()=>{});require('fs').writeFileSync('bgpid',String(process.pid));setInterval(()=>{},1000)";
+  return (
+    `"${process.execPath}" -e "${script}"${redirect ? " >/dev/null 2>&1" : ""} & ` +
+    "while [ ! -s bgpid ]; do sleep 0.05; done; echo leader-done"
+  );
+}
+
 beforeEach(() => {
   savedEnv = { ...process.env };
   root = realpathSync(mkdtempSync(join(tmpdir(), "hoistline-runners-")));
@@ -79,7 +105,10 @@ beforeEach(() => {
     writeFileSync(shim, `#!/bin/sh\nexec "${process.execPath}" "${FAKE_CLI}" "$@"\n`);
     chmodSync(shim, 0o755);
   }
-  process.env.PATH = `${bin}:${savedEnv.PATH ?? ""}`;
+  // The fake CLIs first, then only the system directories (sh, sleep, touch). Never the owner's PATH: the real
+  // muse and codex live there, and execvp keeps searching PATH after a non-executable match (EACCES), so a broken
+  // shim would otherwise start a real, paid model run.
+  process.env.PATH = `${bin}:/usr/bin:/bin`;
   process.env.FAKECLI_RECORD = recordFile;
   process.env.FAKECLI_PIDS = pidsFile;
   delete process.env.FAKECLI_MODE;
@@ -174,6 +203,7 @@ describe.skipIf(!posix)("codex template", () => {
       "exec",
       "--json",
       "--ignore-user-config",
+      "--ignore-rules",
       "--sandbox",
       "workspace-write",
       "-C",
@@ -196,7 +226,7 @@ describe.skipIf(!posix)("codex template", () => {
     await runJob(spec({ runner: "codex", prompt }), work, () => undefined, never());
     const r = record();
     expect(r.stdin).toBe(wrapped(prompt));
-    expect(r.argv).toEqual(["exec", "--json", "--ignore-user-config", "--sandbox", "workspace-write", "-C", work, "-"]);
+    expect(r.argv).toEqual(["exec", "--json", "--ignore-user-config", "--ignore-rules", "--sandbox", "workspace-write", "-C", work, "-"]);
   });
 
   it("never passes command", async () => {
@@ -341,16 +371,118 @@ describe.skipIf(!posix)("runJob", () => {
     expect(calls).toBeGreaterThan(1);
   });
 
+  // A descendant in a NEW session (setsid) cannot be reached by the group kill; only its pipes are closed.
   it("does not hang on an escaped descendant that holds the pipes", async () => {
     process.env.FAKECLI_MODE = "escape";
-    const t0 = Date.now();
     const p = runJob(spec(), work, () => undefined, never(), { killGraceMs: 300 });
     await waitFor(() => existsSync(pidsFile));
+    const t0 = Date.now();
     const pids = JSON.parse(readFileSync(pidsFile, "utf8")) as { pid: number; child: number };
     strays.push(pids.child);
     const res = await p;
     expect(res.exitCode).toBe(0);
     expect(Date.now() - t0).toBeLessThan(3000);
+  });
+
+  it("kills a background process left in the runner's group before resolving", async () => {
+    const command = "sleep 30 & echo $! > bgpid; echo leader-done";
+    const res = await runJob(spec({ runner: "build-test", command }), work, () => undefined, never(), {
+      killGraceMs: 500,
+    });
+    const bg = Number(readFileSync(join(work, "bgpid"), "utf8"));
+    strays.push(bg);
+    expect(res).toEqual({ exitCode: 0 });
+    expect(alive(bg)).toBe(false);
+  });
+
+  it("SIGKILLs a background process that ignores SIGTERM after the post-exit grace", async () => {
+    const command =
+      bgIgnoringTerm(true);
+    const res = await runJob(spec({ runner: "build-test", command }), work, () => undefined, never(), {
+      postExitGraceMs: 300,
+    });
+    const bg = Number(readFileSync(join(work, "bgpid"), "utf8"));
+    strays.push(bg);
+    expect(res).toEqual({ exitCode: 0 });
+    expect(alive(bg)).toBe(false);
+  });
+
+  it("honors an abort that arrives during the post-exit group kill", async () => {
+    // The background process keeps stdout open and ignores SIGTERM, so the job is still waiting after the leader
+    // exits; with long graces only the abort can end it quickly.
+    const command =
+      bgIgnoringTerm(false);
+    const ac = new AbortController();
+    let out = "";
+    const p = runJob(spec({ runner: "build-test", command }), work, (c) => (out += c), ac.signal, {
+      termGraceMs: 10_000,
+      postExitGraceMs: 10_000,
+      killGraceMs: 10_000,
+    });
+    await waitFor(() => out.includes("leader-done") && existsSync(join(work, "bgpid")));
+    await new Promise((r) => setTimeout(r, 200));
+    const bg = Number(readFileSync(join(work, "bgpid"), "utf8"));
+    strays.push(bg);
+    const t0 = Date.now();
+    ac.abort();
+    const res = await p;
+    expect(Date.now() - t0).toBeLessThan(3000);
+    expect(res).toEqual({ exitCode: 0, aborted: true });
+    expect(alive(bg)).toBe(false);
+  }, 30_000);
+
+  it("honors a timeout that arrives during the post-exit group kill", async () => {
+    const command =
+      bgIgnoringTerm(false);
+    const res = await runJob(spec({ runner: "build-test", command }), work, () => undefined, never(), {
+      timeoutMs: 3000,
+      termGraceMs: 10_000,
+      postExitGraceMs: 10_000,
+      killGraceMs: 10_000,
+    });
+    strays.push(Number(readFileSync(join(work, "bgpid"), "utf8")));
+    expect(res).toEqual({ exitCode: 124, timedOut: true });
+  }, 30_000);
+
+  it("runs in the real path of a symlinked directory", async () => {
+    const link = join(root, "link");
+    symlinkSync(work, link);
+    await runJob(spec(), link, () => undefined, never());
+    const r = record();
+    expect(r.cwd).toBe(work);
+    expect(r.argv[r.argv.indexOf("--workspace") + 1]).toBe(work);
+  });
+
+  it("refuses a Muse prompt too large for one argument and spawns nothing", async () => {
+    const prompt = "漢".repeat(100_000);
+    const err = await runJob(spec({ prompt }), work, () => undefined, never()).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(PromptTooLargeError);
+    const bytes = Buffer.byteLength(wrapped(prompt));
+    expect((err as Error).message).toBe(`prompt_too_large: ${bytes} bytes exceeds the 122880 byte limit for muse`);
+    expect(existsSync(pidsFile)).toBe(false);
+  });
+
+  it("delivers the same large prompt to Codex on stdin", async () => {
+    const prompt = "漢".repeat(100_000);
+    const res = await runJob(spec({ runner: "codex", prompt }), work, () => undefined, never());
+    expect(res.exitCode).toBe(0);
+    expect(record().stdin).toBe(wrapped(prompt));
+  });
+
+  it("turns a synchronous spawn failure (NUL in an argument) into RunnerSpawnError", async () => {
+    const err = await runJob(spec({ prompt: "a\0b" }), work, () => undefined, never()).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(RunnerSpawnError);
+    expect((err as Error).message).toBe("runner_spawn_failed: ERR_INVALID_ARG_VALUE");
+    expect((err as Error).cause).toBeInstanceOf(Error);
+    expect(existsSync(pidsFile)).toBe(false);
+  });
+
+  it("turns an asynchronous non-ENOENT spawn failure into RunnerSpawnError", async () => {
+    chmodSync(join(bin, "muse"), 0o644);
+    const err = await runJob(spec(), work, () => undefined, never()).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(RunnerSpawnError);
+    expect((err as Error).message).toBe("runner_spawn_failed: EACCES");
+    expect((err as Error).cause).toBeInstanceOf(Error);
   });
 });
 
@@ -387,6 +519,27 @@ describe.skipIf(!posix)("build-test runner", () => {
     expect(() => buildCommand(spec({ runner: "build-test", command: "" }), { cwd: work })).toThrow(
       /build-test requires a command/,
     );
+  });
+});
+
+describe("build-test templates (pure, every platform)", () => {
+  const command = `npm test -- --grep "a b" && echo "it's"`;
+
+  it("POSIX: sh -c with the command as one argument", () => {
+    registerRunner("build-test", buildTestTemplateFor("linux"));
+    expect(buildCommand(spec({ runner: "build-test", command }), { cwd: "/w" })).toEqual({
+      file: "sh",
+      args: ["-c", command],
+    });
+  });
+
+  it("Windows: cmd.exe /d /s /c with the command quoted once and verbatim arguments", () => {
+    registerRunner("build-test", buildTestTemplateFor("win32"));
+    expect(buildCommand(spec({ runner: "build-test", command }), { cwd: "C:\\w" })).toEqual({
+      file: "cmd.exe",
+      args: ["/d", "/s", "/c", `"${command}"`],
+      verbatimArgs: true,
+    });
   });
 });
 

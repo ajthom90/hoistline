@@ -1,6 +1,6 @@
 import { generateKeyPairSync, sign } from "node:crypto";
 import { describe, expect, it } from "vitest";
-import { canonicalJson, signJob, verifyJob, type JobSpec, type SignedJob } from "../src";
+import { JobSpecSchema, canonicalJson, signJob, verifyJob, type JobSpec, type SignedJob } from "../src";
 
 const spec: JobSpec = {
   jobId: "job-1",
@@ -150,5 +150,49 @@ describe("signJob/verifyJob", () => {
   it("rejects garbage input", () => {
     expect(() => verifyJob(null as unknown as SignedJob, keys.publicKey, M, NOW)).toThrow();
     expect(() => verifyJob({} as SignedJob, keys.publicKey, M, NOW)).toThrow();
+  });
+});
+
+describe("NUL characters in a job spec", () => {
+  const fields = ["jobId", "repo", "baseBranch", "prompt", "model", "command"] as const;
+
+  it.each(fields)("JobSpecSchema rejects a NUL in %s", (field) => {
+    expect(JobSpecSchema.safeParse(spec).success).toBe(true);
+    expect(JobSpecSchema.safeParse({ ...spec, [field]: `a\0b` }).success).toBe(false);
+  });
+
+  it.each(fields)("signJob refuses a NUL in %s", (field) => {
+    expect(() => signJob({ ...spec, [field]: `a\0b` }, "user-1", M, keys.privateKey, NOW)).toThrow();
+  });
+
+  it.each(fields)("verifyJob refuses a correctly signed job with a NUL in %s", (field) => {
+    const bad = { ...spec, [field]: `a\0b` };
+    const bytes = Buffer.from(
+      canonicalJson({ v: "hoistline-job-v1", machineId: M, spec: bad, userId: "user-1", issuedAt: NOW }),
+      "utf8",
+    );
+    const job: SignedJob = {
+      spec: bad,
+      machineId: M,
+      userId: "user-1",
+      issuedAt: NOW,
+      signature: sign(null, bytes, keys.privateKey).toString("base64url"),
+    };
+    expect(() => verifyJob(job, keys.publicKey, M, NOW)).toThrow(/invalid signed job/);
+  });
+
+  it("verifyJob accepts the same forged-bytes construction without a NUL (the test signs correctly)", () => {
+    const bytes = Buffer.from(
+      canonicalJson({ v: "hoistline-job-v1", machineId: M, spec, userId: "user-1", issuedAt: NOW }),
+      "utf8",
+    );
+    const job: SignedJob = {
+      spec,
+      machineId: M,
+      userId: "user-1",
+      issuedAt: NOW,
+      signature: sign(null, bytes, keys.privateKey).toString("base64url"),
+    };
+    expect(verifyJob(job, keys.publicKey, M, NOW).spec).toEqual(spec);
   });
 });

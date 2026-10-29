@@ -179,11 +179,13 @@ shared mirror carrying over from one job into the next. It does not protect agai
 
 ## Running a job: `runJob`
 
-`runJob(spec, dir, onOutput, signal, opts?)` in `packages/agent/src/runners/run.ts` builds the command with
-`buildCommand(spec, { cwd: dir })` and runs it:
+`runJob(spec, dir, onOutput, signal, opts?)` in `packages/agent/src/runners/run.ts` resolves `dir` to its real path
+once (`realpath`), builds the command with `buildCommand(spec, { cwd: <real path> })` and runs it:
 
-- `spawn` with `shell: false` and `cwd = dir`. On macOS and Linux the runner is `detached`, so it leads its own
-  process group.
+- `spawn` with `shell: false` and `cwd` = the real path, so the runner's cwd and its workspace flag name the same
+  directory even when `dir` is a symlink. On macOS and Linux the runner is `detached`, so it leads its own process
+  group. A command whose template sets `verbatimArgs` is spawned with `windowsVerbatimArguments: true` (only
+  build-test on Windows).
 - Stdin gets the template's `stdin` text (if any) and is then closed, so no CLI waits on a terminal.
 - Environment: the owner's own (the CLIs need their logins and credentials) minus every variable whose name starts
   with `GIT_` or `HOISTLINE_` (compared case-insensitively). The agent's git pinning or an inherited `GIT_DIR` never
@@ -191,18 +193,35 @@ shared mirror carrying over from one job into the next. It does not protect agai
 - Output goes to `onOutput(chunk, "stdout" | "stderr")` as it arrives, in pieces of at most 16 KiB of UTF-8, never
   splitting a character. If `onOutput` throws, the exception is caught and counted (`outputErrors` in the result)
   and the job carries on, so a bad callback cannot crash or hang a job.
+- runJob keeps no output. Every chunk goes to `onOutput` and nowhere else, so the caller must enforce any size cap
+  (such as the `task_result` cap) on what it keeps.
 - Abort (`signal`) and the maximum runtime (`opts.timeoutMs`, default 60 minutes) take the same path: SIGTERM to
-  the whole process group, then SIGKILL to the group after `opts.termGraceMs` (default 2 s), even if the leader has
-  already exited. On Windows: `taskkill /T /F`.
-- After the runner exits, the agent waits at most `opts.killGraceMs` (default 5 s) for the output pipes to close,
-  then closes them itself, so a descendant that left the process group and holds the pipes cannot hang the job.
+  the whole process group, then SIGKILL to the group after `opts.termGraceMs` (default 1.5 s), even if the leader
+  has already exited. On Windows: `taskkill /T /F`.
+- When the runner (the group leader) exits for any reason, nothing it backgrounded may outlive the job: before the
+  promise resolves, the agent sends SIGTERM to what is left of the process group, SIGKILL after
+  `opts.postExitGraceMs` (default min(termGraceMs, 1 s)), and waits for the group to disappear (at most 1 s after
+  the SIGKILL). On Windows it runs `taskkill /T /F` on the runner's pid, which is best effort only: once the root
+  process has exited, Windows no longer links its children to it.
+- An abort or timeout that arrives after the leader exited is still honored and shows in the result
+  (`aborted: true` / `timedOut: true`): it escalates the group kill to SIGKILL at once, or, if the group is already
+  gone, stops waiting for the pipes.
+- Once the group is gone, the agent waits at most `opts.killGraceMs` (default 5 s) for the output pipes to close,
+  then closes them itself. A descendant that started a NEW session (`setsid`, Node's `detached`) is outside the
+  process group and cannot be reached by the group kill; only its hold on the pipes is cut, and it keeps running.
+  That is the accepted residual risk stated above.
 - Result: `{ exitCode, timedOut?, aborted?, outputErrors? }`. `exitCode` is the exit code, or 128 + the signal
   number when the runner was killed by a signal (143 for SIGTERM, 137 for SIGKILL). A timeout gives exit code 124
   and `timedOut: true`; an abort gives `aborted: true`. A nonzero exit is a value, never an exception. A signal that
   is already aborted when `runJob` is called spawns nothing and gives `{ exitCode: 130, aborted: true }`.
-- Errors: a CLI that is not on `PATH` throws `RunnerNotInstalledError` (`runner_not_installed: <file>`). A `dir`
-  that is not a directory, or any other failure to start (for example `E2BIG`, see Muse below), throws a plain
-  `Error`.
+- Errors:
+  - A CLI that is not on `PATH` throws `RunnerNotInstalledError` (`runner_not_installed: <file>`).
+  - Any other failure to start throws `RunnerSpawnError` (`runner_spawn_failed: <code or message>`, with the
+    original error as `cause`). That covers `EACCES`, `E2BIG`, and the synchronous throw from `spawn` for an
+    argument it cannot pass, such as one containing NUL. `JobSpecSchema` already refuses NUL in every string field.
+  - A prompt too large for a CLI that takes it as an argument throws `PromptTooLargeError` from `buildCommand`
+    before anything is spawned (see Muse below).
+  - A `dir` that is not a directory throws a plain `Error`.
 
 ## Prompt preamble
 
@@ -219,10 +238,10 @@ model, not a control: the sandbox notes below and the hardening above are what a
 | Runner | Added by | Executable | Exact non-interactive invocation | Prompt via | Model flag |
 | --- | --- | --- | --- | --- | --- |
 | Muse | Task 8 | `muse` (Muse Code 1.4.14) | `muse exec --json --approval-mode never --disable-request-user-input --workspace <worktree> [--model <model>] -- <preamble + prompt>` | one positional after `--` (no stdin form) | `--model <model>` |
-| Codex | Task 8 | `codex` (codex-cli 0.161.0) | `codex exec --json --ignore-user-config --sandbox workspace-write -C <worktree> [--model <model>] -` | stdin (`-`) | `--model <model>` |
+| Codex | Task 8 | `codex` (codex-cli 0.161.0) | `codex exec --json --ignore-user-config --ignore-rules --sandbox workspace-write -C <worktree> [--model <model>] -` | stdin (`-`) | `--model <model>` |
 | Cursor | Task 13 | _to be filled in by Task 13_ | _to be filled in by Task 13_ | | |
 | Grok | Task 13 | _to be filled in by Task 13_ | _to be filled in by Task 13_ | | |
-| build-test | Task 8 | `sh` (Windows: `cmd.exe`) | `sh -c <command>` (Windows: `cmd.exe /d /s /c <command>`) | none; `command` is the one argument after `-c` | n/a |
+| build-test | Task 8 | `sh` (Windows: `cmd.exe`) | `sh -c <command>` (Windows: `cmd.exe /d /s /c "<command>"`, verbatim arguments) | none; `command` is the one argument after `-c` | n/a |
 
 Sources: `muse --help`, `muse exec --help`, `codex --help` and `codex exec --help` on the owner's machine
 (2026-10-29), and the owner's `muse-build` and `codex-build` skills. No model call was made to check them.
@@ -245,9 +264,12 @@ belongs inside the workspace, where the runner can rewrite it and it would be co
   (the agent already made the worktree).
 - `--` is assumed to end option parsing as in every clap-based CLI; the help does not mention it and it was not
   run.
-- Limit: Linux caps one argument at 128 KiB (`MAX_ARG_STRLEN`). A 100,000-character prompt of multi-byte text
-  plus the preamble can exceed that; the spawn then fails with `E2BIG` and `runJob` throws a plain error (not
-  `runner_not_installed`). macOS has no per-argument cap below its total limit.
+- Limit: Linux caps one argument at 128 KiB (`MAX_ARG_STRLEN`), and a 100,000-character prompt of multi-byte text
+  plus the preamble can exceed that. The Muse adapter therefore refuses a wrapped prompt (preamble + delimiter +
+  prompt) over 120 KiB (`MAX_ARGV_PROMPT_BYTES`, UTF-8 bytes) with `PromptTooLargeError`
+  (`prompt_too_large: <bytes> bytes exceeds the 122880 byte limit for muse`). The check runs in `buildCommand`,
+  so nothing is spawned. The limit applies on every platform, so a job behaves the same everywhere. Codex reads
+  the prompt from stdin and has no such limit.
 
 **Codex.** `codex exec` reads the prompt from stdin when the prompt argument is `-` (documented in its help), so
 the wrapped prompt goes on stdin and nothing from the job reaches the argument list except the validated model.
@@ -261,12 +283,28 @@ the wrapped prompt goes on stdin and nothing from the job reaches the argument l
 - Network: not enabled. Workspace-write has network access off unless configured, and nothing here turns it on.
 - `--ignore-user-config`: does not load `~/.codex/config.toml` (auth still uses `CODEX_HOME`), so the owner's
   interactive settings (extra writable roots, network access, MCP servers with auto-approval, a different default
-  sandbox or model) cannot widen a job's sandbox. Consequence: without `--model` the job uses Codex's built-in
-  default model, not the owner's configured one.
+  sandbox or model) cannot widen a job's sandbox. Consequences: without `--model` the job uses Codex's built-in
+  default model, not the owner's configured one. The flag also drops `model_provider`, custom provider base URLs,
+  profiles and reasoning settings, so an owner who uses Codex through a custom provider cannot use this runner.
+- `--ignore-rules`: does not load user or project execpolicy `.rules` files (documented in `codex exec --help`).
+  Project rules are repository content, untrusted in the same way as Muse's `--trust-workspace`, and user rules are
+  the owner's interactive settings; neither should change what a job may run.
 - Not used: `--skip-git-repo-check` (the worktree is a git checkout; not verified against a worktree whose `.git`
   is a file, so a later task should confirm with a real run), `--approve-for-me`, `--worktree`, `--add-dir`.
 
-**build-test.** `command` reaches the shell as exactly one argument (`["sh", ["-c", command]]`, Windows
-`["cmd.exe", ["/d", "/s", "/c", command]]`) in the worktree, with the same environment, output, abort and timeout
-handling as every runner. On Windows, Node quotes that argument for `CreateProcess` and `cmd.exe` has its own
-quoting rules, so a command with embedded quotes needs checking there (not tested on Windows).
+**Muse and Codex are not configured the same way.** Muse keeps its web tools, its sandbox network mode is
+`proxy-only` (network through Muse's proxy), and it still loads the owner's user config. Codex has network off
+and ignores the owner's user config and execpolicy rules. A job's reach therefore depends on the runner it names.
+
+**build-test.** `command` reaches the shell as exactly one argument, in the worktree, with the same environment,
+output, abort and timeout handling as every runner:
+
+- POSIX: `["sh", ["-c", command]]`.
+- Windows: `["cmd.exe", ["/d", "/s", "/c", "\"" + command + "\""]]` with `verbatimArgs: true`, so `spawn` gets
+  `windowsVerbatimArguments: true`. Without that, Node escapes inner double quotes MSVC-style (`\"`), which
+  `cmd.exe /s /c` does not understand. With it, the command is wrapped in one pair of quotes that `/s` strips,
+  the same as Node's own `shell: true`.
+
+The template output is unit-tested on every platform. The `runJob` behavior on Windows (verbatim arguments,
+`taskkill`) is **not tested on Windows**. Also still open on Windows: a CLI installed as a `.cmd` shim (as npm
+installs `codex`) cannot be started with `shell: false`, so Muse or Codex installed that way fails to start there.

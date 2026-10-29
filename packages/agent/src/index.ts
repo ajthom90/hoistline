@@ -33,9 +33,12 @@ export {
   type PrepareOptions,
 } from "./git.js";
 export {
+  MAX_ARGV_PROMPT_BYTES,
   PROMPT_DELIMITER,
+  PromptTooLargeError,
   RUNNER_PREAMBLE,
   RunnerNotInstalledError,
+  RunnerSpawnError,
   buildCommand,
   buildTestTemplate,
   codexTemplate,

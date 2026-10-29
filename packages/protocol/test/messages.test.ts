@@ -121,3 +121,12 @@ describe("AgentToHub", () => {
     expect(AgentToHub.safeParse(hubToAgent[0]).success).toBe(false);
   });
 });
+
+describe("job.assign with a NUL in the spec", () => {
+  it.each(["jobId", "repo", "baseBranch", "prompt", "model", "command"])("is rejected for %s", (field) => {
+    const clean = { ...signedJob.spec, model: "m", command: "c" };
+    expect(HubToAgent.safeParse({ type: "job.assign", job: { ...signedJob, spec: clean } }).success).toBe(true);
+    const spec = { ...clean, [field]: "a\0b" };
+    expect(HubToAgent.safeParse({ type: "job.assign", job: { ...signedJob, spec } }).success).toBe(false);
+  });
+});

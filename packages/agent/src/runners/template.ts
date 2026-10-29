@@ -13,9 +13,11 @@ export type RunnerTemplate = {
   file: string;
   args: (spec: JobSpec, ctx: RunnerContext) => string[];
   stdin?: (spec: JobSpec, ctx: RunnerContext) => string;
+  /** Windows only: pass the arguments to CreateProcess unescaped (spawn's windowsVerbatimArguments). */
+  verbatimArgs?: boolean;
 };
 
-export type RunnerCommand = { file: string; args: string[]; stdin?: string };
+export type RunnerCommand = { file: string; args: string[]; stdin?: string; verbatimArgs?: true };
 
 // Starts with an alphanumeric so a model can never look like a flag; no spaces, quotes or shell metacharacters.
 const MODEL = /^[A-Za-z0-9][A-Za-z0-9._:/-]{0,99}$/;
@@ -55,5 +57,6 @@ export function buildCommand(spec: JobSpec, ctx: RunnerContext = {}): RunnerComm
   }
   const command: RunnerCommand = { file: template.file, args: [...args] };
   if (template.stdin) command.stdin = template.stdin(safe, context);
+  if (template.verbatimArgs === true) command.verbatimArgs = true;
   return command;
 }
