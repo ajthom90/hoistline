@@ -354,12 +354,53 @@ export class Store {
     return rows.map(toJob);
   }
 
-  countActiveJobs(filter: { userId: string } | { machineId: string }): number {
-    const [column, value] = "userId" in filter ? ["user_id", filter.userId] : ["machine_id", filter.machineId];
-    const row = this.db.prepare(`SELECT count(*) AS n FROM jobs WHERE ${column} = ? AND ${ACTIVE_SQL}`).get(value) as {
-      n: number;
-    };
+  /** Active jobs of a user, or of a machine (optionally leaving out one user's, such as the owner's). */
+  countActiveJobs(filter: { userId: string } | { machineId: string; excludeUserId?: string }): number {
+    if ("userId" in filter) {
+      return (this.db.prepare(`SELECT count(*) AS n FROM jobs WHERE user_id = ? AND ${ACTIVE_SQL}`).get(filter.userId) as {
+        n: number;
+      }).n;
+    }
+    const row = this.db
+      .prepare(`SELECT count(*) AS n FROM jobs WHERE machine_id = ? AND user_id IS NOT ? AND ${ACTIVE_SQL}`)
+      .get(filter.machineId, filter.excludeUserId ?? null) as { n: number };
     return row.n;
+  }
+
+  /**
+   * A late result from the job's agent for a job the hub gave up on (failed with agent_disconnected or
+   * lost_on_agent): replaces that state with the agent's terminal state, atomically. Fields the patch leaves out are
+   * cleared, except the output (kept unless the patch has one) and the truncation flag (only ever set). Returns
+   * whether it applied. Every other terminal state stays immutable.
+   */
+  replaceLostResult(
+    jobId: string,
+    patch: Pick<JobRow, "status"> & Partial<Pick<JobRow, "reason" | "branch" | "exitCode" | "output" | "outputTruncated">>,
+  ): boolean {
+    const result = this.db
+      .prepare(
+        `UPDATE jobs SET status = @status, reason = @reason, branch = @branch, exit_code = @exitCode,
+           output = COALESCE(@output, output), output_truncated = MAX(output_truncated, @truncated), updated_at = @now
+         WHERE id = @id AND status = 'failed' AND reason IN ('agent_disconnected', 'lost_on_agent')`,
+      )
+      .run({
+        id: jobId,
+        status: patch.status,
+        reason: patch.reason ?? null,
+        branch: patch.branch ?? null,
+        exitCode: patch.exitCode ?? null,
+        output: patch.output ?? null,
+        truncated: patch.outputTruncated ? 1 : 0,
+        now: this.now(),
+      });
+    return result.changes > 0;
+  }
+
+  /** Deletes terminal jobs last updated more than `olderThanMs` before `now`. Returns how many. */
+  pruneJobs(olderThanMs: number, now: number = this.now()): number {
+    return this.db
+      .prepare(`DELETE FROM jobs WHERE NOT ${ACTIVE_SQL} AND updated_at < ?`)
+      .run(now - olderThanMs).changes;
   }
 
   /** Ids of machines that have at least one active job. */

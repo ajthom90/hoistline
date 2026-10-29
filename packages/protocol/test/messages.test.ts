@@ -122,6 +122,25 @@ describe("AgentToHub", () => {
   });
 });
 
+describe("job lifecycle additions", () => {
+  it("has a strict job.ack from the hub", () => {
+    expect(HubToAgent.parse({ type: "job.ack", jobId: "j" })).toEqual({ type: "job.ack", jobId: "j" });
+    expect(HubToAgent.safeParse({ type: "job.ack", jobId: "j", x: 1 }).success).toBe(false);
+    expect(HubToAgent.safeParse({ type: "job.ack" }).success).toBe(false);
+  });
+  it("lets job.result carry a truncated flag", () => {
+    const msg = { type: "job.result", jobId: "j", status: "succeeded", truncated: true };
+    expect(AgentToHub.parse(msg)).toEqual(msg);
+    expect(AgentToHub.safeParse({ ...msg, truncated: "yes" }).success).toBe(false);
+  });
+  it("caps hello.runningJobs at 1000", () => {
+    const hello = agentToHub[0] as Record<string, unknown>;
+    const ids = (n: number) => Array.from({ length: n }, (_, i) => `j${i}`);
+    expect(AgentToHub.safeParse({ ...hello, runningJobs: ids(1000) }).success).toBe(true);
+    expect(AgentToHub.safeParse({ ...hello, runningJobs: ids(1001) }).success).toBe(false);
+  });
+});
+
 describe("job.assign with a NUL in the spec", () => {
   it.each(["jobId", "repo", "baseBranch", "prompt", "model", "command"])("is rejected for %s", (field) => {
     const clean = { ...signedJob.spec, model: "m", command: "c" };

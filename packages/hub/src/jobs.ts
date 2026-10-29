@@ -37,12 +37,19 @@ export interface JobsOptions {
   maxJobAgeMs?: number;
   /** Default 20. */
   maxActivePerUser?: number;
-  /** Default 20. */
-  maxActivePerMachine?: number;
+  /**
+   * Active jobs of all the machine's sharees combined (everyone but its owner). Default 10. The owner's own jobs
+   * are limited only by maxActivePerUser, so sharees can never starve the owner.
+   */
+  maxSharedActivePerMachine?: number;
   /** How often attach() runs sweep. Default 60 s. */
   sweepIntervalMs?: number;
+  /** Finished jobs last updated longer ago than this are deleted by sweep. Default 30 days. */
+  jobRetentionMs?: number;
   setTimeout?: (fn: () => void, ms: number) => unknown;
   clearTimeout?: (handle: unknown) => void;
+  setInterval?: (fn: () => void, ms: number) => unknown;
+  clearInterval?: (handle: unknown) => void;
   /** Called for every agent message that was dropped because it is not about one of that machine's jobs. */
   onDroppedMessage?: (machineId: string, msg: AgentToHub) => void;
 }
@@ -113,12 +120,15 @@ export class Jobs {
   private readonly graceMs: number;
   private readonly maxAgeMs: number;
   private readonly maxPerUser: number;
-  private readonly maxPerMachine: number;
+  private readonly maxSharedPerMachine: number;
   private readonly sweepIntervalMs: number;
+  private readonly retentionMs: number;
   private readonly setTimer: (fn: () => void, ms: number) => unknown;
   private readonly clearTimer: (handle: unknown) => void;
+  private readonly setRepeat: (fn: () => void, ms: number) => unknown;
+  private readonly clearRepeat: (handle: unknown) => void;
   private readonly graceTimers = new Map<string, unknown>();
-  private sweepTimer?: NodeJS.Timeout;
+  private sweepTimer?: unknown;
   private attached = false;
   private closed = false;
 
@@ -131,8 +141,11 @@ export class Jobs {
     this.graceMs = opts.disconnectGraceMs ?? 60_000;
     this.maxAgeMs = opts.maxJobAgeMs ?? 3 * 60 * 60 * 1000;
     this.maxPerUser = opts.maxActivePerUser ?? 20;
-    this.maxPerMachine = opts.maxActivePerMachine ?? 20;
+    this.maxSharedPerMachine = opts.maxSharedActivePerMachine ?? 10;
     this.sweepIntervalMs = opts.sweepIntervalMs ?? 60_000;
+    this.retentionMs = opts.jobRetentionMs ?? 30 * 24 * 60 * 60 * 1000;
+    this.setRepeat = opts.setInterval ?? ((fn, ms) => setInterval(fn, ms).unref());
+    this.clearRepeat = opts.clearInterval ?? ((h) => clearInterval(h as NodeJS.Timeout));
     this.setTimer = opts.setTimeout ?? ((fn, ms) => setTimeout(fn, ms).unref());
     this.clearTimer = opts.clearTimeout ?? ((h) => clearTimeout(h as NodeJS.Timeout));
   }
@@ -152,8 +165,9 @@ export class Jobs {
     this.gateway.onDisconnect((machineId) => {
       if (!this.closed) this.armGrace(machineId);
     });
-    this.sweepTimer = setInterval(() => this.sweep(), this.sweepIntervalMs);
-    this.sweepTimer.unref();
+    this.sweepTimer = this.setRepeat(() => {
+      if (!this.closed) this.sweep();
+    }, this.sweepIntervalMs);
   }
 
   /**
@@ -170,7 +184,7 @@ export class Jobs {
     this.closed = true;
     for (const handle of this.graceTimers.values()) this.clearTimer(handle);
     this.graceTimers.clear();
-    if (this.sweepTimer) clearInterval(this.sweepTimer);
+    if (this.sweepTimer !== undefined) this.clearRepeat(this.sweepTimer);
     this.sweepTimer = undefined;
   }
 
@@ -193,8 +207,11 @@ export class Jobs {
     if (this.store.countActiveJobs({ userId }) >= this.maxPerUser) {
       throw new TooManyJobsError(`you already have ${this.maxPerUser} active jobs`);
     }
-    if (this.store.countActiveJobs({ machineId: machine.id }) >= this.maxPerMachine) {
-      throw new TooManyJobsError(`this machine already has ${this.maxPerMachine} active jobs`);
+    if (
+      userId !== machine.ownerId &&
+      this.store.countActiveJobs({ machineId: machine.id, excludeUserId: machine.ownerId }) >= this.maxSharedPerMachine
+    ) {
+      throw new TooManyJobsError(`this machine already has ${this.maxSharedPerMachine} active jobs from shared users`);
     }
     const now = this.now();
     const row: JobRow = {
@@ -244,41 +261,104 @@ export class Jobs {
   /**
    * Queued: cancelled at once (the agent is told, best effort). Awaiting approval or running: the agent is asked
    * to cancel and its job.result sets the final state; if the agent is offline the job fails with
-   * agent_disconnected. Returns false for finished, unknown and other users' jobs.
+   * agent_disconnected (and is cancelled on the agent when it reconnects, see reconcile). Returns false for
+   * finished, unknown and other users' jobs.
    */
   cancel(userId: string, jobId: string): boolean {
     const job = this.store.getJob(userId, jobId);
-    if (!job) return false;
+    return job ? this.cancelJob(job) : false;
+  }
+
+  /**
+   * Cancels any active job on a machine the caller owns, whoever delegated it. Unknown jobs and jobs on machines
+   * the caller does not own both return false.
+   */
+  cancelAsOwner(ownerId: string, jobId: string): boolean {
+    const job = this.store.getJobById(jobId);
+    if (!job || this.store.getMachineById(job.machineId)?.ownerId !== ownerId) return false;
+    return this.cancelJob(job);
+  }
+
+  /** Every active job on a machine the caller owns. Throws the same NotFoundError for unknown and foreign machines. */
+  activeJobsForMachine(ownerId: string, machineId: string): JobRow[] {
+    if (this.store.getMachineById(machineId)?.ownerId !== ownerId) throw new NotFoundError();
+    return this.store.activeJobs(machineId);
+  }
+
+  /** A share was revoked: that user's active jobs on that machine are cancelled. */
+  onShareRevoked(machineId: string, userId: string): void {
+    for (const job of this.store.activeJobs(machineId)) {
+      if (job.userId === userId) this.cancelJob(job);
+    }
+  }
+
+  /**
+   * The machine's agent (re)connected and reported the jobs it still has (queued, running, or finished but not yet
+   * acknowledged): every active job of that machine it does not list fails with lost_on_agent, and every listed id
+   * the hub does not consider active on this machine (finished, unknown, another machine's) is cancelled on the
+   * agent, without explanation.
+   *
+   * Known race (accepted): a reconnect that replaces a still-open connection can run this with the new agent's list
+   * while results from the old socket are still arriving; a result that lands just after its job was marked
+   * lost_on_agent still replaces that state (see handleMessage), so nothing is lost.
+   */
+  reconcile(machineId: string, running: string[]): void {
+    const listed = new Set(running);
+    const active = new Set<string>();
+    for (const job of this.store.activeJobs(machineId)) {
+      active.add(job.id);
+      if (!listed.has(job.id)) this.failActive(job, "lost_on_agent");
+    }
+    for (const jobId of listed) {
+      if (!active.has(jobId)) this.requestAgentCancel(machineId, jobId);
+    }
+  }
+
+  /** Fails every active job older than maxJobAgeMs with `timeout`, and deletes finished jobs past retention. */
+  sweep(now: number = this.now()): void {
+    for (const job of this.store.activeJobs()) {
+      if (now - job.createdAt > this.maxAgeMs) this.failActive(job, "timeout");
+    }
+    this.store.pruneJobs(this.retentionMs, now);
+  }
+
+  private cancelJob(job: JobRow): boolean {
     if (job.status === "queued") {
       this.store.transitionJob(job.id, ["queued"], { status: "cancelled" });
       // The assignment was already sent; tell the agent so it does not run it.
-      this.trySend(job.machineId, job.id);
+      this.requestAgentCancel(job.machineId, job.id);
       return true;
     }
     if (job.status !== "running" && job.status !== "awaiting_approval") return false;
-    if (!this.trySend(job.machineId, job.id)) {
+    if (!this.requestAgentCancel(job.machineId, job.id)) {
       this.store.transitionJob(job.id, ACTIVE, { status: "failed", reason: "agent_disconnected" });
     }
     return true;
   }
 
-  /**
-   * The machine's agent (re)connected and reported the jobs it still has: every active job of that machine it
-   * does not list fails with lost_on_agent; listed ones stay as they are.
-   */
-  reconcile(machineId: string, running: string[]): void {
-    const listed = new Set(running);
-    for (const job of this.store.activeJobs(machineId)) {
-      if (!listed.has(job.id)) this.store.transitionJob(job.id, ACTIVE, { status: "failed", reason: "lost_on_agent" });
+  /** Fails an active job for a hub-side reason and asks its agent to stop it. */
+  private failActive(job: JobRow, reason: string): void {
+    if (this.store.transitionJob(job.id, ACTIVE, { status: "failed", reason })) {
+      this.requestAgentCancel(job.machineId, job.id);
     }
   }
 
-  /** Fails every active job older than maxJobAgeMs with `timeout`. */
-  sweep(now: number = this.now()): void {
-    for (const job of this.store.activeJobs()) {
-      if (now - job.createdAt > this.maxAgeMs) {
-        this.store.transitionJob(job.id, ACTIVE, { status: "failed", reason: "timeout" });
-      }
+  /** Best-effort job.cancel to the machine's agent. Returns whether it was sent; never throws. */
+  private requestAgentCancel(machineId: string, jobId: string): boolean {
+    try {
+      if (!this.gateway.isOnline(machineId)) return false;
+      this.gateway.send(machineId, { type: "job.cancel", jobId });
+      return true;
+    } catch {
+      return false;
+    }
+  }
+
+  private ack(machineId: string, jobId: string): void {
+    try {
+      if (this.gateway.isOnline(machineId)) this.gateway.send(machineId, { type: "job.ack", jobId });
+    } catch {
+      // The agent replays the result on its next connection and is acked then.
     }
   }
 
@@ -291,24 +371,12 @@ export class Jobs {
     throw new NotFoundError();
   }
 
-  private trySend(machineId: string, jobId: string): boolean {
-    if (!this.gateway.isOnline(machineId)) return false;
-    try {
-      this.gateway.send(machineId, { type: "job.cancel", jobId });
-      return true;
-    } catch {
-      return false;
-    }
-  }
-
   private armGrace(machineId: string): void {
     if (this.graceTimers.has(machineId)) return;
     const handle = this.setTimer(() => {
       this.graceTimers.delete(machineId);
       if (this.closed || this.gateway.isOnline(machineId)) return;
-      for (const job of this.store.activeJobs(machineId)) {
-        this.store.transitionJob(job.id, ACTIVE, { status: "failed", reason: "agent_disconnected" });
-      }
+      for (const job of this.store.activeJobs(machineId)) this.failActive(job, "agent_disconnected");
     }, this.graceMs);
     this.graceTimers.set(machineId, handle);
   }
@@ -340,7 +408,7 @@ export class Jobs {
       return;
     }
     if (!TERMINAL_FROM_AGENT.has(msg.status)) return;
-    const patch: Partial<JobRow> = { status: msg.status };
+    const patch: Partial<JobRow> & Pick<JobRow, "status"> = { status: msg.status };
     if (msg.exitCode !== undefined) patch.exitCode = msg.exitCode;
     if (msg.reason !== undefined) patch.reason = cleanReason(msg.reason);
     if (msg.branch !== undefined && msg.branch === `hoistline/${job.id}` && RESULT_BRANCH.test(msg.branch)) {
@@ -351,6 +419,12 @@ export class Jobs {
       patch.output = tail.text;
       if (tail.truncated) patch.outputTruncated = true;
     }
-    this.store.transitionJob(job.id, ACTIVE, patch);
+    if (msg.truncated === true) patch.outputTruncated = true;
+    if (!this.store.transitionJob(job.id, ACTIVE, patch)) {
+      // Already terminal. Only a hub-side give-up (the agent was gone) yields to what the agent really did.
+      this.store.replaceLostResult(job.id, patch);
+    }
+    // Persisted, or a duplicate of a result for a job that is already final: either way the agent may forget it.
+    this.ack(machineId, job.id);
   }
 }

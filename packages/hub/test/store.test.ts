@@ -1,5 +1,6 @@
 import { createHash, sign, verify, type KeyObject } from "node:crypto";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import Database from "better-sqlite3";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -349,6 +350,88 @@ describe("jobs", () => {
     expect(store.countActiveJobs({ userId: alice.id })).toBe(2);
     expect(store.countActiveJobs({ machineId: other.id })).toBe(1);
     expect(store.machinesWithActiveJobs().sort()).toEqual([machine.id, other.id].sort());
+  });
+
+  it("counts a machine's active jobs of everyone but its owner", () => {
+    const { store, alice, bob, machine } = setup();
+    const carol = store.upsertUser({ provider: "github", subject: "3", login: "carol" });
+    store.insertJob(job(alice.id, machine.id, "a"));
+    store.insertJob(job(bob.id, machine.id, "b"));
+    store.insertJob({ ...job(carol.id, machine.id, "c"), status: "running" });
+    store.insertJob({ ...job(carol.id, machine.id, "d"), status: "failed" });
+    expect(store.countActiveJobs({ machineId: machine.id, excludeUserId: alice.id })).toBe(2);
+  });
+
+  it("replaceLostResult only replaces a failed agent_disconnected or lost_on_agent job", () => {
+    const { store, alice, machine } = setup();
+    for (const [id, status, reason] of [
+      ["x", "failed", "agent_disconnected"],
+      ["y", "failed", "lost_on_agent"],
+      ["z", "failed", "runner_exit_1"],
+      ["w", "running", undefined],
+    ] as const) {
+      store.insertJob({ ...job(alice.id, machine.id, id), status, reason, output: "events" });
+    }
+    const patch = { status: "succeeded", exitCode: 0, branch: "hoistline/x" };
+    expect(store.replaceLostResult("x", patch)).toBe(true);
+    expect(store.getJobById("x")).toMatchObject({ status: "succeeded", exitCode: 0, branch: "hoistline/x", output: "events" });
+    expect(store.getJobById("x")!.reason).toBeUndefined();
+    expect(store.replaceLostResult("y", { status: "cancelled", output: "tail", outputTruncated: true })).toBe(true);
+    expect(store.getJobById("y")).toMatchObject({ status: "cancelled", output: "tail", outputTruncated: true });
+    expect(store.replaceLostResult("z", patch)).toBe(false);
+    expect(store.replaceLostResult("w", patch)).toBe(false);
+    // Once replaced it is an ordinary terminal state.
+    expect(store.replaceLostResult("x", { status: "failed", reason: "agent_disconnected" })).toBe(false);
+  });
+
+  it("pruneJobs deletes only terminal jobs last updated before the cutoff", () => {
+    const { store, alice, machine } = setup();
+    store.insertJob({ ...job(alice.id, machine.id, "old-done"), status: "succeeded" });
+    store.insertJob({ ...job(alice.id, machine.id, "old-active"), status: "running" });
+    clock += 10_000;
+    store.insertJob({ ...job(alice.id, machine.id, "new-done"), status: "failed" });
+    expect(store.pruneJobs(5_000, clock)).toBe(1);
+    expect(store.getJobById("old-done")).toBeNull();
+    expect(store.getJobById("old-active")).not.toBeNull();
+    expect(store.getJobById("new-done")).not.toBeNull();
+  });
+});
+
+describe("migrations", () => {
+  const fixture = new URL("./fixtures/001_init_bb92082.sql", import.meta.url);
+
+  it("keeps 001_init.sql exactly as released", () => {
+    const current = readFileSync(new URL("../src/migrations/001_init.sql", import.meta.url), "utf8");
+    expect(current).toBe(readFileSync(fixture, "utf8"));
+  });
+
+  it("upgrades a database created by the released schema", () => {
+    const path = join(dir, "old.db");
+    const db = new Database(path);
+    db.exec(readFileSync(fixture, "utf8"));
+    db.exec("CREATE TABLE schema_migrations (name TEXT PRIMARY KEY, applied_at INTEGER NOT NULL)");
+    db.prepare("INSERT INTO schema_migrations VALUES ('001_init.sql', 1)").run();
+    db.prepare("INSERT INTO users VALUES ('u1', 'github', '1', 'alice', 1)").run();
+    db.prepare("INSERT INTO machines VALUES ('m1', 'u1', 'laptop', 'pk', 1, NULL)").run();
+    db.prepare(
+      `INSERT INTO jobs (id, user_id, machine_id, runner, repo, base_branch, prompt, status, output, created_at, updated_at)
+       VALUES ('old', 'u1', 'm1', 'muse', 'o/r', 'main', 'p', 'running', 'out', 1, 1)`,
+    ).run();
+    db.close();
+
+    const store = open(path);
+    const names = store.db.prepare("SELECT name FROM schema_migrations ORDER BY name").all();
+    expect(names).toEqual([{ name: "001_init.sql" }, { name: "002_job_result_columns.sql" }]);
+    expect(store.getJobById("old")).toMatchObject({ status: "running", output: "out" });
+    expect(store.getJobById("old")!.outputTruncated).toBeUndefined();
+    expect(store.transitionJob("old", ["running"], { status: "failed", exitCode: 3, outputTruncated: true })).toBe(true);
+    expect(store.getJobById("old")).toMatchObject({ status: "failed", exitCode: 3, outputTruncated: true });
+    store.insertJob({ ...job("u1", "m1", "new"), exitCode: 0 });
+    expect(store.getJobById("new")).toMatchObject({ exitCode: 0 });
+    const indexes = store.db.prepare("SELECT name FROM sqlite_master WHERE type = 'index' AND tbl_name = 'jobs'").all();
+    expect(indexes.map((r) => (r as { name: string }).name)).toEqual(
+      expect.arrayContaining(["jobs_machine_status", "jobs_status"]),
+    );
   });
 });
 

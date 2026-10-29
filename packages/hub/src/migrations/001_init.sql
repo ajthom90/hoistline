@@ -46,16 +46,11 @@ CREATE TABLE jobs (
   status TEXT NOT NULL,
   reason TEXT,
   branch TEXT,
-  exit_code INTEGER,
-  -- Last 64 KiB of the job's output; output_truncated is 1 once anything before it was dropped.
   output TEXT,
-  output_truncated INTEGER NOT NULL DEFAULT 0,
   created_at INTEGER NOT NULL,
   updated_at INTEGER NOT NULL
 );
 CREATE INDEX jobs_user ON jobs(user_id);
-CREATE INDEX jobs_machine_status ON jobs(machine_id, status);
-CREATE INDEX jobs_status ON jobs(status);
 
 CREATE TABLE secrets (
   name TEXT PRIMARY KEY,

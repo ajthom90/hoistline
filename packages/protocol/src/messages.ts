@@ -7,6 +7,7 @@ const id = z.string().min(1).max(200);
  * Messages sent from the hub to an agent.
  * - job.assign: run a signed job (the agent must verifyJob before acting)
  * - job.cancel: cancel a running job
+ * - job.ack: the hub has recorded the job.result for this job; the agent may forget it (see the agent outbox)
  * - tools.list: request the agent's MCP tool inventory (answered by AgentToHub tools.list)
  * - tools.call: invoke an MCP tool on the agent (answered by AgentToHub tools.result)
  * - challenge: first message on a new connection; the agent answers with a signed hello
@@ -19,6 +20,7 @@ const id = z.string().min(1).max(200);
 export const HubToAgent = z.discriminatedUnion("type", [
   z.object({ type: z.literal("job.assign"), job: SignedJobSchema }).strict(),
   z.object({ type: z.literal("job.cancel"), jobId: id }).strict(),
+  z.object({ type: z.literal("job.ack"), jobId: id }).strict(),
   z.object({ type: z.literal("tools.list"), callId: id }).strict(),
   z
     .object({
@@ -67,7 +69,7 @@ export const AgentToHub = z.discriminatedUnion("type", [
       machineId: id,
       agentVersion: z.string().min(1).max(100),
       runners: z.array(RunnerName),
-      runningJobs: z.array(id),
+      runningJobs: z.array(id).max(1000),
       servers: z.array(z.string().max(200)),
       signature: z.string().min(1).max(200),
     })
@@ -89,6 +91,8 @@ export const AgentToHub = z.discriminatedUnion("type", [
       reason: z.string().max(2000).optional(),
       branch: z.string().max(255).optional(),
       output: z.string().max(1_048_576).optional(),
+      /** True when `output` is not the job's whole output. */
+      truncated: z.boolean().optional(),
     })
     .strict(),
   z

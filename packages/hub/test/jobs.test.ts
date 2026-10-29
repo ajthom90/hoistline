@@ -224,19 +224,34 @@ describe("delegate", () => {
     expect(gateway.sent).toEqual([]);
   });
 
-  it("caps active jobs per user and per machine", () => {
-    const jobs = makeJobs({ maxActivePerUser: 2, maxActivePerMachine: 3 });
+  it("caps active jobs per user, and the jobs of a machine's sharees combined", () => {
+    const jobs = makeJobs({ maxActivePerUser: 2, maxSharedActivePerMachine: 3 });
     gateway.connect(laptop.id);
+    const carol = store.upsertUser({ provider: "github", subject: "3", login: "carol" });
+    store.shareMachine(alice.id, laptop.id, `user:${bob.id}`);
+    store.shareMachine(alice.id, laptop.id, `user:${carol.id}`);
     const first = jobs.delegate(alice.id, req(laptop.id));
     jobs.delegate(alice.id, req(laptop.id));
+    // The owner is limited only by the per-user cap.
     expect(() => jobs.delegate(alice.id, req(laptop.id))).toThrow(TooManyJobsError);
-    // Bob, sharing the machine, still has room for one more on it before the machine cap.
-    store.shareMachine(alice.id, laptop.id, `user:${bob.id}`);
+    // Sharees share the machine cap among themselves; the owner's jobs do not count against it.
     jobs.delegate(bob.id, req(laptop.id));
-    expect(() => jobs.delegate(bob.id, req(laptop.id))).toThrow(TooManyJobsError);
+    jobs.delegate(bob.id, req(laptop.id));
+    jobs.delegate(carol.id, req(laptop.id));
+    expect(() => jobs.delegate(carol.id, req(laptop.id))).toThrow(TooManyJobsError);
     // Finished jobs no longer count.
     gateway.agent(laptop.id, { type: "job.result", jobId: first.id, status: "succeeded" });
     expect(jobs.delegate(alice.id, req(laptop.id)).status).toBe("queued");
+  });
+
+  it("never lets sharees starve the owner", () => {
+    const jobs = makeJobs({ maxActivePerUser: 20, maxSharedActivePerMachine: 2 });
+    gateway.connect(laptop.id);
+    store.shareMachine(alice.id, laptop.id, `user:${bob.id}`);
+    jobs.delegate(bob.id, req(laptop.id));
+    jobs.delegate(bob.id, req(laptop.id));
+    expect(() => jobs.delegate(bob.id, req(laptop.id))).toThrow(TooManyJobsError);
+    for (let i = 0; i < 5; i++) expect(jobs.delegate(alice.id, req(laptop.id)).status).toBe("queued");
   });
 
   it("inserts the row before sending and fails it with dispatch_failed when sending throws", () => {
@@ -557,5 +572,273 @@ describe("disconnects and restarts", () => {
     gateway.connect(laptop.id, []);
     gateway.agent(laptop.id, { type: "job.result", jobId: job.id, status: "failed" });
     expect(store.getJob(alice.id, job.id)!.status).toBe("running");
+  });
+});
+
+describe("result acknowledgements", () => {
+  const acks = () =>
+    gateway.sent.filter(([, m]) => m.type === "job.ack").map(([machine, m]) => [machine, (m as { jobId: string }).jobId]);
+
+  it("acks a persisted result, a duplicate, and a result for a job that is already terminal", () => {
+    const jobs = makeJobs();
+    gateway.connect(laptop.id);
+    const done = jobs.delegate(alice.id, req(laptop.id));
+    const cancelled = jobs.delegate(alice.id, req(laptop.id));
+    gateway.agent(laptop.id, { type: "job.result", jobId: done.id, status: "succeeded" });
+    gateway.agent(laptop.id, { type: "job.result", jobId: done.id, status: "succeeded" });
+    jobs.cancel(alice.id, cancelled.id);
+    gateway.agent(laptop.id, { type: "job.result", jobId: cancelled.id, status: "failed", reason: "late" });
+    expect(acks()).toEqual([
+      [laptop.id, done.id],
+      [laptop.id, done.id],
+      [laptop.id, cancelled.id],
+    ]);
+    expect(jobs.status(alice.id, cancelled.id)).toBe("cancelled");
+  });
+
+  it("never acks a result dropped for belonging to another machine or to no job", () => {
+    const jobs = makeJobs();
+    gateway.connect(laptop.id);
+    gateway.connect(desktop.id);
+    const job = jobs.delegate(alice.id, req(laptop.id));
+    gateway.agent(desktop.id, { type: "job.result", jobId: job.id, status: "succeeded" });
+    gateway.agent(desktop.id, { type: "job.result", jobId: randomUUID(), status: "succeeded" });
+    expect(acks()).toEqual([]);
+    expect(jobs.status(alice.id, job.id)).toBe("queued");
+  });
+
+  it("does not ack job events", () => {
+    const jobs = makeJobs();
+    gateway.connect(laptop.id);
+    const job = jobs.delegate(alice.id, req(laptop.id));
+    gateway.agent(laptop.id, { type: "job.event", jobId: job.id, stream: "status", data: "running" });
+    expect(acks()).toEqual([]);
+  });
+
+  it("records the agent's truncated flag even when the output fits", () => {
+    const jobs = makeJobs();
+    gateway.connect(laptop.id);
+    const job = jobs.delegate(alice.id, req(laptop.id));
+    gateway.agent(laptop.id, { type: "job.result", jobId: job.id, status: "succeeded", output: "tail", truncated: true });
+    expect(jobs.result(alice.id, job.id)).toMatchObject({ output: "tail", truncated: true });
+  });
+});
+
+describe("late results after the hub gave up", () => {
+  it("replaces agent_disconnected with the owning agent's real result", () => {
+    const jobs = makeJobs();
+    gateway.connect(laptop.id);
+    const job = jobs.delegate(alice.id, req(laptop.id));
+    gateway.drop(laptop.id);
+    timers.advance(60_000);
+    expect(jobs.result(alice.id, job.id)).toMatchObject({ status: "failed", reason: "agent_disconnected" });
+    gateway.connect(laptop.id, [job.id]);
+    gateway.agent(laptop.id, {
+      type: "job.result",
+      jobId: job.id,
+      status: "succeeded",
+      exitCode: 0,
+      branch: `hoistline/${job.id}`,
+      output: "done",
+    });
+    expect(jobs.result(alice.id, job.id)).toEqual({
+      jobId: job.id,
+      status: "succeeded",
+      exitCode: 0,
+      branch: `hoistline/${job.id}`,
+      output: "done",
+      truncated: false,
+    });
+    expect(gateway.sent.at(-1)).toEqual([laptop.id, { type: "job.ack", jobId: job.id }]);
+    // From here on it is immutable like any terminal state.
+    gateway.agent(laptop.id, { type: "job.result", jobId: job.id, status: "failed", reason: "again" });
+    expect(jobs.status(alice.id, job.id)).toBe("succeeded");
+  });
+
+  it("replaces lost_on_agent, validating the branch as usual", () => {
+    const jobs = makeJobs();
+    gateway.connect(laptop.id);
+    const job = jobs.delegate(alice.id, req(laptop.id));
+    gateway.drop(laptop.id);
+    gateway.connect(laptop.id, []);
+    expect(jobs.result(alice.id, job.id)).toMatchObject({ status: "failed", reason: "lost_on_agent" });
+    gateway.agent(laptop.id, { type: "job.result", jobId: job.id, status: "succeeded", branch: "main" });
+    expect(jobs.result(alice.id, job.id)).toMatchObject({ status: "succeeded" });
+    expect(jobs.result(alice.id, job.id)!.branch).toBeUndefined();
+  });
+
+  it("does not let another machine replace it", () => {
+    const jobs = makeJobs();
+    gateway.connect(laptop.id);
+    gateway.connect(desktop.id);
+    const job = jobs.delegate(alice.id, req(laptop.id));
+    gateway.drop(laptop.id);
+    timers.advance(60_000);
+    gateway.agent(desktop.id, { type: "job.result", jobId: job.id, status: "succeeded" });
+    expect(jobs.result(alice.id, job.id)).toMatchObject({ status: "failed", reason: "agent_disconnected" });
+  });
+});
+
+describe("owner controls", () => {
+  function shared() {
+    const jobs = makeJobs();
+    gateway.connect(laptop.id);
+    store.shareMachine(alice.id, laptop.id, `user:${bob.id}`);
+    return jobs;
+  }
+
+  it("lists every active job on an owned machine; others see NotFoundError", () => {
+    const jobs = shared();
+    const mine = jobs.delegate(alice.id, req(laptop.id));
+    const bobs = jobs.delegate(bob.id, req(laptop.id));
+    const finished = jobs.delegate(bob.id, req(laptop.id));
+    gateway.agent(laptop.id, { type: "job.result", jobId: finished.id, status: "succeeded" });
+    expect(jobs.activeJobsForMachine(alice.id, laptop.id).map((j) => j.id).sort()).toEqual([mine.id, bobs.id].sort());
+    for (const [user, machine] of [
+      [bob.id, laptop.id],
+      [alice.id, desktop.id],
+      [alice.id, randomUUID()],
+    ] as const) {
+      let error: unknown;
+      try {
+        jobs.activeJobsForMachine(user, machine);
+      } catch (err) {
+        error = err;
+      }
+      expect(error).toBeInstanceOf(NotFoundError);
+      expect((error as Error).message).toBe("machine not found");
+    }
+  });
+
+  it("cancelAsOwner cancels any active job on an owned machine and nothing else", () => {
+    const jobs = shared();
+    const bobs = jobs.delegate(bob.id, req(laptop.id));
+    gateway.agent(laptop.id, { type: "job.event", jobId: bobs.id, stream: "status", data: "running" });
+    expect(jobs.cancelAsOwner(alice.id, bobs.id)).toBe(true);
+    expect(gateway.sent.at(-1)).toEqual([laptop.id, { type: "job.cancel", jobId: bobs.id }]);
+    const before = gateway.sent.length;
+    // Bob does not own the machine; unknown ids and jobs on machines alice does not own look the same.
+    const mine = jobs.delegate(alice.id, req(laptop.id));
+    expect(jobs.cancelAsOwner(bob.id, mine.id)).toBe(false);
+    expect(jobs.cancelAsOwner(alice.id, randomUUID())).toBe(false);
+    gateway.connect(desktop.id);
+    const foreign = jobs.delegate(bob.id, req(desktop.id));
+    expect(jobs.cancelAsOwner(alice.id, foreign.id)).toBe(false);
+    expect(gateway.sent.slice(before).filter(([, m]) => m.type === "job.cancel")).toEqual([]);
+    gateway.agent(laptop.id, { type: "job.result", jobId: bobs.id, status: "cancelled" });
+    expect(jobs.cancelAsOwner(alice.id, bobs.id)).toBe(false);
+  });
+
+  it("onShareRevoked cancels that user's active jobs on that machine only", () => {
+    const jobs = shared();
+    const bobQueued = jobs.delegate(bob.id, req(laptop.id));
+    const bobRunning = jobs.delegate(bob.id, req(laptop.id));
+    gateway.agent(laptop.id, { type: "job.event", jobId: bobRunning.id, stream: "status", data: "running" });
+    const mine = jobs.delegate(alice.id, req(laptop.id));
+    gateway.connect(desktop.id);
+    const bobElsewhere = jobs.delegate(bob.id, req(desktop.id));
+    jobs.onShareRevoked(laptop.id, bob.id);
+    expect(jobs.status(bob.id, bobQueued.id)).toBe("cancelled");
+    const cancelled = gateway.sent.filter(([, m]) => m.type === "job.cancel").map(([, m]) => (m as { jobId: string }).jobId);
+    expect(cancelled.sort()).toEqual([bobQueued.id, bobRunning.id].sort());
+    expect(jobs.status(alice.id, mine.id)).toBe("queued");
+    expect(jobs.status(bob.id, bobElsewhere.id)).toBe("queued");
+  });
+});
+
+describe("keeping the agent in step", () => {
+  const cancels = () =>
+    gateway.sent.filter(([, m]) => m.type === "job.cancel").map(([machine, m]) => [machine, (m as { jobId: string }).jobId]);
+
+  it("on reconnect cancels every listed job the hub does not consider active on that machine", () => {
+    const jobs = makeJobs();
+    gateway.connect(laptop.id);
+    gateway.connect(desktop.id);
+    const active = jobs.delegate(alice.id, req(laptop.id));
+    const finished = jobs.delegate(alice.id, req(laptop.id));
+    gateway.agent(laptop.id, { type: "job.result", jobId: finished.id, status: "succeeded" });
+    const othersJob = jobs.delegate(bob.id, req(desktop.id));
+    const unknown = randomUUID();
+    gateway.drop(laptop.id);
+    gateway.sent.length = 0;
+    gateway.connect(laptop.id, [active.id, finished.id, othersJob.id, unknown]);
+    expect(cancels()).toEqual([
+      [laptop.id, finished.id],
+      [laptop.id, othersJob.id],
+      [laptop.id, unknown],
+    ]);
+    expect(jobs.status(alice.id, active.id)).toBe("queued");
+    expect(jobs.status(bob.id, othersJob.id)).toBe("queued");
+  });
+
+  it("asks the agent to cancel jobs it fails for timeout or lost_on_agent", () => {
+    const jobs = makeJobs({ maxJobAgeMs: 1000 });
+    gateway.connect(laptop.id);
+    const old = jobs.delegate(alice.id, req(laptop.id));
+    gateway.sent.length = 0;
+    jobs.sweep(clock + 1001);
+    expect(cancels()).toEqual([[laptop.id, old.id]]);
+    const lost = jobs.delegate(alice.id, req(laptop.id));
+    gateway.sent.length = 0;
+    gateway.connect(laptop.id, []);
+    expect(jobs.result(alice.id, lost.id)).toMatchObject({ reason: "lost_on_agent" });
+    expect(cancels()).toEqual([[laptop.id, lost.id]]);
+  });
+
+  it("cancels a job cancelled while its agent was offline (awaiting approval) on the next reconnect", () => {
+    const jobs = makeJobs();
+    gateway.connect(laptop.id);
+    const job = jobs.delegate(alice.id, req(laptop.id));
+    gateway.agent(laptop.id, { type: "job.event", jobId: job.id, stream: "status", data: "awaiting_approval" });
+    gateway.drop(laptop.id);
+    expect(jobs.cancel(alice.id, job.id)).toBe(true);
+    expect(cancels()).toEqual([]);
+    gateway.connect(laptop.id, [job.id]);
+    expect(cancels()).toEqual([[laptop.id, job.id]]);
+  });
+
+  it("a second disconnect while the grace is armed neither re-arms nor leaks a timer", () => {
+    const jobs = makeJobs();
+    gateway.connect(laptop.id);
+    const job = jobs.delegate(alice.id, req(laptop.id));
+    gateway.drop(laptop.id);
+    timers.advance(30_000);
+    gateway.drop(laptop.id);
+    expect(timers.size).toBe(1);
+    timers.advance(30_000);
+    expect(jobs.result(alice.id, job.id)).toMatchObject({ status: "failed", reason: "agent_disconnected" });
+    expect(timers.size).toBe(0);
+  });
+});
+
+describe("periodic sweep", () => {
+  it("runs on an injectable interval, prunes old finished jobs, and stops on close", () => {
+    const intervals: { fn: () => void; ms: number; cleared: boolean }[] = [];
+    const jobs = makeJobs({
+      maxJobAgeMs: 1000,
+      jobRetentionMs: 10_000,
+      sweepIntervalMs: 5000,
+      setInterval: (fn, ms) => {
+        intervals.push({ fn, ms, cleared: false });
+        return intervals.length - 1;
+      },
+      clearInterval: (h) => {
+        intervals[h as number]!.cleared = true;
+      },
+    });
+    expect(intervals.map((i) => i.ms)).toEqual([5000]);
+    gateway.connect(laptop.id);
+    const old = jobs.delegate(alice.id, req(laptop.id));
+    const finished = jobs.delegate(alice.id, req(laptop.id));
+    gateway.agent(laptop.id, { type: "job.result", jobId: finished.id, status: "succeeded" });
+    clock += 2000;
+    intervals[0]!.fn();
+    expect(jobs.result(alice.id, old.id)).toMatchObject({ reason: "timeout" });
+    expect(jobs.status(alice.id, finished.id)).toBe("succeeded");
+    clock += 10_001;
+    intervals[0]!.fn();
+    expect(jobs.status(alice.id, finished.id)).toBeNull();
+    jobs.close();
+    expect(intervals[0]!.cleared).toBe(true);
   });
 });
