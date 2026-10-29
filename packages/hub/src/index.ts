@@ -11,4 +11,16 @@ export {
   type IdentityProvider,
   type UserIdentity,
 } from "./auth/identity.js";
-export { Gateway, type AgentInfo, type GatewayOptions } from "./gateway.js";
+export { Gateway, type AgentInfo, type ConnectInfo, type GatewayOptions } from "./gateway.js";
+export {
+  AmbiguousMachineError,
+  Jobs,
+  MachineOfflineError,
+  NotFoundError,
+  TooManyJobsError,
+  type DelegateRequest,
+  type JobResult,
+  type JobStatus,
+  type JobsGateway,
+  type JobsOptions,
+} from "./jobs.js";

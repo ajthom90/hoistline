@@ -371,6 +371,98 @@ describe("agent handshake", () => {
   });
 });
 
+describe("connection lifecycle hooks", () => {
+  function track(hub: Hub) {
+    const events: string[] = [];
+    const infos: unknown[] = [];
+    hub.gateway.onConnect((machineId, info) => {
+      events.push(`connect:${machineId}`);
+      infos.push(info);
+    });
+    hub.gateway.onDisconnect((machineId) => events.push(`disconnect:${machineId}`));
+    return { events, infos };
+  }
+
+  it("delivers the hello info on connect and fires on close", async () => {
+    const hub = await startHub();
+    const identity = await pairAs(hub, hub.alice);
+    const { events, infos } = track(hub);
+    const agent = new RawAgent(hub);
+    const nonce = await agent.nonce();
+    const signature = sign(null, agentAuthPayload(identity.machineId, nonce), identity.privateKey).toString("base64url");
+    agent.ws.send(
+      JSON.stringify({
+        type: "hello",
+        machineId: identity.machineId,
+        agentVersion: "0.0.0",
+        runners: ["muse"],
+        runningJobs: ["job-a", "job-b"],
+        servers: ["fs"],
+        signature,
+      } satisfies AgentToHub),
+    );
+    await agent.welcomed();
+    expect(events).toEqual([`connect:${identity.machineId}`]);
+    expect(infos).toEqual([{ runningJobs: ["job-a", "job-b"], runners: ["muse"], servers: ["fs"] }]);
+    agent.ws.close();
+    await waitFor(() => events.length === 2, "disconnect");
+    expect(events[1]).toBe(`disconnect:${identity.machineId}`);
+  });
+
+  it("does not fire on connect for a failed handshake", async () => {
+    const hub = await startHub();
+    const identity = await pairAs(hub, hub.alice);
+    const { events } = track(hub);
+    const agent = new RawAgent(hub);
+    await agent.hello(identity.machineId, identity.privateKey, "wrong-nonce");
+    await agent.closed();
+    expect(events).toEqual([]);
+  });
+
+  it("does not fire disconnect when a newer connection of the same machine replaces the old one", async () => {
+    const hub = await startHub();
+    const identity = await pairAs(hub, hub.alice);
+    const { events } = track(hub);
+    const first = await authenticated(hub, identity);
+    const second = await authenticated(hub, identity);
+    await first.closed();
+    await new Promise((r) => setTimeout(r, 50));
+    expect(events).toEqual([`connect:${identity.machineId}`, `connect:${identity.machineId}`]);
+    second.ws.close();
+    await waitFor(() => events.length === 3, "disconnect");
+    expect(events[2]).toBe(`disconnect:${identity.machineId}`);
+  });
+
+  it("fires disconnect once when liveness drops a silent agent", async () => {
+    const hub = await startHub({ pingIntervalMs: 20, pongTimeoutMs: 150 });
+    const identity = await pairAs(hub, hub.alice);
+    const { events } = track(hub);
+    const silent = await authenticated(hub, identity, { autoPong: false });
+    await silent.closed();
+    await new Promise((r) => setTimeout(r, 100));
+    expect(events).toEqual([`connect:${identity.machineId}`, `disconnect:${identity.machineId}`]);
+  });
+
+  it("does not fire disconnect when the hub itself closes", async () => {
+    const hub = await startHub();
+    const identity = await pairAs(hub, hub.alice);
+    const { events } = track(hub);
+    const agent = await authenticated(hub, identity);
+    hub.gateway.close();
+    await agent.closed();
+    await new Promise((r) => setTimeout(r, 50));
+    expect(events).toEqual([`connect:${identity.machineId}`]);
+  });
+
+  it("exposes the hub signing key so jobs can be signed with it", async () => {
+    const hub = await startHub();
+    const key = hub.store.getOrCreateSigningKey();
+    expect(hub.gateway.hubPrivateKey.export({ format: "pem", type: "pkcs8" })).toEqual(
+      key.privateKey.export({ format: "pem", type: "pkcs8" }),
+    );
+  });
+});
+
 describe("liveness", () => {
   it("marks an agent that stops answering pings offline", async () => {
     const hub = await startHub({ pingIntervalMs: 20, pongTimeoutMs: 150 });

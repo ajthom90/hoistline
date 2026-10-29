@@ -40,7 +40,16 @@ interface Connection {
   lastPong: number;
 }
 
+/** What onConnect listeners receive from the agent's hello. */
+export interface ConnectInfo {
+  runningJobs: string[];
+  runners: string[];
+  servers: string[];
+}
+
 type JobMessageListener = (machineId: string, msg: AgentToHub) => void;
+type ConnectListener = (machineId: string, info: ConnectInfo) => void;
+type DisconnectListener = (machineId: string) => void;
 
 /**
  * Agent connections. An agent dials `/agent`, receives a random nonce and must answer with a hello signed by
@@ -50,6 +59,8 @@ export class Gateway {
   private readonly wss: WebSocketServer;
   private readonly connections = new Map<string, Connection>();
   private readonly listeners: JobMessageListener[] = [];
+  private readonly connectListeners: ConnectListener[] = [];
+  private readonly disconnectListeners: DisconnectListener[] = [];
   private readonly handshakeTimeoutMs: number;
   private readonly pingIntervalMs: number;
   private readonly pongTimeoutMs: number;
@@ -74,6 +85,11 @@ export class Gateway {
   /** The hub's job-signing public key, as handed to agents at pairing. */
   get hubPublicKey(): KeyObject {
     return this.hubKey.publicKey;
+  }
+
+  /** The hub's job-signing private key, for Jobs, which signs every job it sends. */
+  get hubPrivateKey(): KeyObject {
+    return this.hubKey.privateKey;
   }
 
   attach(server: Server): void {
@@ -114,6 +130,23 @@ export class Gateway {
   /** Every validated message from an authenticated agent other than hello. */
   onJobMessage(cb: JobMessageListener): void {
     this.listeners.push(cb);
+  }
+
+  /**
+   * Called after a machine authenticated (after its welcome was sent), on every connect including one that replaces
+   * an older connection, with what its hello announced. A throwing listener is ignored.
+   */
+  onConnect(cb: ConnectListener): void {
+    this.connectListeners.push(cb);
+  }
+
+  /**
+   * Called when a machine's current authenticated connection ends: the socket closed, or liveness dropped it. NOT
+   * called when the connection is replaced by a newer connection of the same machine (the machine never went
+   * offline), nor when the gateway itself closes. A throwing listener is ignored.
+   */
+  onDisconnect(cb: DisconnectListener): void {
+    this.disconnectListeners.push(cb);
   }
 
   /** Drops a machine's connection (the agent reconnects unless the code tells it not to). */
@@ -211,17 +244,44 @@ export class Gateway {
       }
     });
     ws.on("close", () => {
-      if (this.connections.get(machineId) === conn) this.connections.delete(machineId);
+      // Not the current connection: replaced, already dropped by liveness, or the gateway closed.
+      if (this.connections.get(machineId) !== conn) return;
+      this.connections.delete(machineId);
+      this.emitDisconnect(machineId);
     });
     ws.send(JSON.stringify({ type: "welcome" } satisfies HubToAgent));
+    const connectInfo: ConnectInfo = {
+      runningJobs: [...info.runningJobs],
+      runners: [...info.runners],
+      servers: [...info.servers],
+    };
+    for (const listener of this.connectListeners) {
+      try {
+        listener(machineId, connectInfo);
+      } catch {
+        // A listener bug must not cost the agent its connection.
+      }
+    }
+  }
+
+  private emitDisconnect(machineId: string): void {
+    for (const listener of this.disconnectListeners) {
+      try {
+        listener(machineId);
+      } catch {
+        // Ignored, see onDisconnect.
+      }
+    }
   }
 
   private checkLiveness(): void {
     const now = this.now();
     for (const [machineId, conn] of this.connections) {
       if (now - conn.lastPong > this.pongTimeoutMs) {
+        // Deleted first, so the close event that follows does not report the machine a second time.
         this.connections.delete(machineId);
         conn.ws.terminate();
+        this.emitDisconnect(machineId);
       } else {
         conn.ws.ping();
       }

@@ -20,6 +20,7 @@ import {
 import { InMemoryOAuthProvider, type HubOAuthProvider } from "./auth/in-memory-provider.js";
 import { CONSENT_PATH, LOGIN_CALLBACK_PATH, LoginFlow } from "./auth/login-flow.js";
 import type { Gateway } from "./gateway.js";
+import type { Jobs } from "./jobs.js";
 import { pairRouter } from "./pairing.js";
 import type { Store, User } from "./store.js";
 import { registerMachineTools } from "./tools/machines.js";
@@ -50,6 +51,8 @@ export interface AppDeps {
   store?: Store;
   /** Agent connections; attach it to the http.Server separately. */
   gateway?: Gateway;
+  /** The job lifecycle (create it over the same store and gateway, and attach it, separately). */
+  jobs?: Jobs;
 }
 
 interface ToolContext {

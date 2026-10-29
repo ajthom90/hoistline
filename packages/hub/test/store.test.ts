@@ -311,6 +311,45 @@ describe("jobs", () => {
     });
     expect(store.getJob(bob.id, "job-1")).toBeNull();
   });
+
+  it("transitionJob only applies when the job is in one of the given states", () => {
+    const { store, alice, machine } = setup();
+    store.insertJob(job(alice.id, machine.id));
+    expect(store.transitionJob("job-1", ["running"], { status: "failed" })).toBe(false);
+    expect(store.transitionJob("job-1", ["queued"], { status: "running" })).toBe(true);
+    expect(store.transitionJob("job-1", ["queued", "running"], { status: "succeeded", exitCode: 0 })).toBe(true);
+    expect(store.transitionJob("job-1", ["queued", "running"], { status: "failed" })).toBe(false);
+    expect(store.transitionJob("nope", ["queued"], { status: "failed" })).toBe(false);
+    expect(store.getJobById("job-1")).toMatchObject({ status: "succeeded", exitCode: 0 });
+  });
+
+  it("appendJobOutput keeps a UTF-8-safe tail and records the truncation, only while the job is in a given state", () => {
+    const { store, alice, machine } = setup();
+    store.insertJob(job(alice.id, machine.id));
+    expect(store.appendJobOutput("job-1", "abc", 8, ["queued"])).toBe(true);
+    expect(store.getJobById("job-1")).toMatchObject({ output: "abc" });
+    expect(store.getJobById("job-1")!.outputTruncated).toBeUndefined();
+    // "abc€€€" is 12 bytes; the last 8 start inside the first "€", so the cut moves to the next character.
+    store.appendJobOutput("job-1", "€€€", 8, ["queued"]);
+    expect(store.getJobById("job-1")).toMatchObject({ output: "€€", outputTruncated: true });
+    store.updateJob("job-1", { status: "failed" });
+    expect(store.appendJobOutput("job-1", "late", 8, ["queued"])).toBe(false);
+    expect(store.getJobById("job-1")!.output).toBe("€€");
+  });
+
+  it("lists and counts active jobs per user and machine", () => {
+    const { store, alice, bob, machine } = setup();
+    const other = store.redeemPairingCode(store.createPairingCode(bob.id), "desk", "pk")!;
+    store.insertJob(job(alice.id, machine.id, "a"));
+    store.insertJob({ ...job(alice.id, machine.id, "b"), status: "running" });
+    store.insertJob({ ...job(alice.id, machine.id, "c"), status: "succeeded" });
+    store.insertJob({ ...job(bob.id, other.id, "d"), status: "awaiting_approval" });
+    expect(store.activeJobs(machine.id).map((j) => j.id).sort()).toEqual(["a", "b"]);
+    expect(store.activeJobs().map((j) => j.id).sort()).toEqual(["a", "b", "d"]);
+    expect(store.countActiveJobs({ userId: alice.id })).toBe(2);
+    expect(store.countActiveJobs({ machineId: other.id })).toBe(1);
+    expect(store.machinesWithActiveJobs().sort()).toEqual([machine.id, other.id].sort());
+  });
 });
 
 describe("persistence", () => {

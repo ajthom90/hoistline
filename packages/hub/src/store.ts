@@ -40,10 +40,17 @@ export interface JobRow {
   status: string;
   reason?: string;
   branch?: string;
+  exitCode?: number;
+  /** The last 64 KiB (or whatever cap the writer used) of the job's output. */
   output?: string;
+  /** True once output was cut to its tail. */
+  outputTruncated?: boolean;
   createdAt: number;
   updatedAt: number;
 }
+
+/** Job states in which a job can still change. */
+export const ACTIVE_JOB_STATUSES = ["queued", "awaiting_approval", "running"] as const;
 
 export interface StoreOptions {
   /** Clock in milliseconds; inject in tests. */
@@ -80,9 +87,25 @@ const JOB_COLUMNS = {
   status: "status",
   reason: "reason",
   branch: "branch",
+  exitCode: "exit_code",
   output: "output",
+  outputTruncated: "output_truncated",
   updatedAt: "updated_at",
 } as const;
+
+/** better-sqlite3 binds no booleans. */
+const sqlValue = (value: unknown) => (typeof value === "boolean" ? (value ? 1 : 0) : value);
+
+const ACTIVE_SQL = `status IN (${ACTIVE_JOB_STATUSES.map((s) => `'${s}'`).join(", ")})`;
+
+/** The last `maxBytes` bytes of `text`, starting at a character boundary. */
+export function utf8Tail(text: string, maxBytes: number): { text: string; truncated: boolean } {
+  const bytes = Buffer.from(text, "utf8");
+  if (bytes.length <= maxBytes) return { text, truncated: false };
+  let start = bytes.length - maxBytes;
+  while (start < bytes.length && ((bytes[start] as number) & 0xc0) === 0x80) start++;
+  return { text: bytes.toString("utf8", start), truncated: true };
+}
 
 /** SQLite persistence for users, machines, pairing, shares and jobs. OAuth state shares the connection via `db`. */
 export class Store {
@@ -294,11 +317,94 @@ export class Store {
     this.db
       .prepare(
         `INSERT INTO jobs (id, user_id, machine_id, runner, repo, base_branch, prompt, model, command, status,
-                           reason, branch, output, created_at, updated_at)
+                           reason, branch, exit_code, output, output_truncated, created_at, updated_at)
          VALUES (@id, @userId, @machineId, @runner, @repo, @baseBranch, @prompt, @model, @command, @status,
-                 @reason, @branch, @output, @createdAt, @updatedAt)`,
+                 @reason, @branch, @exitCode, @output, @outputTruncated, @createdAt, @updatedAt)`,
       )
-      .run({ model: null, command: null, reason: null, branch: null, output: null, ...definedOnly(job) });
+      .run({
+        model: null,
+        command: null,
+        reason: null,
+        branch: null,
+        exitCode: null,
+        output: null,
+        ...definedOnly(job),
+        outputTruncated: job.outputTruncated ? 1 : 0,
+      });
+  }
+
+  /**
+   * Unscoped lookup for messages from an authenticated agent only (the caller must compare machineId with the
+   * authenticated machine). Never use it to answer a user's request; use getJob, which is scoped to the caller.
+   */
+  getJobById(jobId: string): JobRow | null {
+    const row = this.db.prepare("SELECT * FROM jobs WHERE id = ?").get(jobId) as JobRecord | undefined;
+    return row ? toJob(row) : null;
+  }
+
+  /** Jobs that can still change (queued, awaiting_approval, running), optionally of one machine, oldest first. */
+  activeJobs(machineId?: string): JobRow[] {
+    const rows = (
+      machineId === undefined
+        ? this.db.prepare(`SELECT * FROM jobs WHERE ${ACTIVE_SQL} ORDER BY created_at, id`).all()
+        : this.db
+            .prepare(`SELECT * FROM jobs WHERE machine_id = ? AND ${ACTIVE_SQL} ORDER BY created_at, id`)
+            .all(machineId)
+    ) as JobRecord[];
+    return rows.map(toJob);
+  }
+
+  countActiveJobs(filter: { userId: string } | { machineId: string }): number {
+    const [column, value] = "userId" in filter ? ["user_id", filter.userId] : ["machine_id", filter.machineId];
+    const row = this.db.prepare(`SELECT count(*) AS n FROM jobs WHERE ${column} = ? AND ${ACTIVE_SQL}`).get(value) as {
+      n: number;
+    };
+    return row.n;
+  }
+
+  /** Ids of machines that have at least one active job. */
+  machinesWithActiveJobs(): string[] {
+    const rows = this.db.prepare(`SELECT DISTINCT machine_id FROM jobs WHERE ${ACTIVE_SQL}`).all() as {
+      machine_id: string;
+    }[];
+    return rows.map((r) => r.machine_id);
+  }
+
+  /**
+   * Applies the patch (like updateJob) only if the job's status is currently one of `from`, atomically. Returns
+   * whether it applied. This is how states only move forward and terminal states stay terminal.
+   */
+  transitionJob(jobId: string, from: readonly string[], patch: Partial<JobRow>): boolean {
+    if (from.length === 0) return false;
+    const { sets, params } = jobSets(patch, this.now());
+    const placeholders = from.map((status, i) => {
+      params[`from${i}`] = status;
+      return `@from${i}`;
+    });
+    params.id = jobId;
+    const result = this.db
+      .prepare(`UPDATE jobs SET ${sets.join(", ")} WHERE id = @id AND status IN (${placeholders.join(", ")})`)
+      .run(params);
+    return result.changes > 0;
+  }
+
+  /**
+   * Appends to the job's output keeping only the last `maxBytes` bytes (cut at a character boundary) and sets
+   * outputTruncated once anything was dropped. Only while the job's status is one of `whileIn`; returns whether
+   * it appended. One transaction.
+   */
+  appendJobOutput(jobId: string, chunk: string, maxBytes: number, whileIn: readonly string[]): boolean {
+    return this.db.transaction(() => {
+      const row = this.db.prepare("SELECT status, output, output_truncated FROM jobs WHERE id = ?").get(jobId) as
+        | { status: string; output: string | null; output_truncated: number }
+        | undefined;
+      if (!row || !whileIn.includes(row.status)) return false;
+      const tail = utf8Tail((row.output ?? "") + chunk, maxBytes);
+      this.db
+        .prepare("UPDATE jobs SET output = ?, output_truncated = ?, updated_at = ? WHERE id = ?")
+        .run(tail.text, row.output_truncated || tail.truncated ? 1 : 0, this.now(), jobId);
+      return true;
+    })();
   }
 
   /** Jobs are visible only to the user who created them; machine shares never expose them. */
@@ -311,15 +417,8 @@ export class Store {
 
   /** Applies the patch (id, userId and createdAt are immutable) and bumps updatedAt unless the patch sets it. */
   updateJob(jobId: string, patch: Partial<JobRow>): void {
-    const sets: string[] = [];
-    const params: Record<string, unknown> = { id: jobId };
-    const merged: Partial<JobRow> = { updatedAt: this.now(), ...definedOnly(patch) };
-    for (const [key, column] of Object.entries(JOB_COLUMNS)) {
-      const value = merged[key as keyof typeof JOB_COLUMNS];
-      if (value === undefined) continue;
-      sets.push(`${column} = @${key}`);
-      params[key] = value;
-    }
+    const { sets, params } = jobSets(patch, this.now());
+    params.id = jobId;
     this.db.prepare(`UPDATE jobs SET ${sets.join(", ")} WHERE id = @id`).run(params);
   }
 
@@ -346,6 +445,20 @@ export class Store {
   sweepExpired(now: number = this.now()): void {
     this.db.prepare("DELETE FROM pairing_codes WHERE expires_at <= ?").run(now);
   }
+}
+
+/** SET clauses for a job patch; id, userId and createdAt are immutable and never included. */
+function jobSets(patch: Partial<JobRow>, now: number): { sets: string[]; params: Record<string, unknown> } {
+  const sets: string[] = [];
+  const params: Record<string, unknown> = {};
+  const merged: Partial<JobRow> = { updatedAt: now, ...definedOnly(patch) };
+  for (const [key, column] of Object.entries(JOB_COLUMNS)) {
+    const value = merged[key as keyof typeof JOB_COLUMNS];
+    if (value === undefined) continue;
+    sets.push(`${column} = @${key}`);
+    params[key] = sqlValue(value);
+  }
+  return { sets, params };
 }
 
 function definedOnly<T extends object>(value: T): Partial<T> {
@@ -380,7 +493,9 @@ interface JobRecord {
   status: string;
   reason: string | null;
   branch: string | null;
+  exit_code: number | null;
   output: string | null;
+  output_truncated: number;
   created_at: number;
   updated_at: number;
 }
@@ -422,6 +537,8 @@ function toJob(r: JobRecord): JobRow {
   if (r.command !== null) job.command = r.command;
   if (r.reason !== null) job.reason = r.reason;
   if (r.branch !== null) job.branch = r.branch;
+  if (r.exit_code !== null) job.exitCode = r.exit_code;
   if (r.output !== null) job.output = r.output;
+  if (r.output_truncated) job.outputTruncated = true;
   return job;
 }
