@@ -63,6 +63,7 @@ metadata files, symlinks), and it owns the worktree's `.git` file. The agent def
   another repository. The push goes from the mirror.
 - Cache layout: before `git init`, `worktree add` or any cleanup, `<cacheDir>`, `<cacheDir>/repos`,
   `<cacheDir>/work`, `<cacheDir>/jobs` and the mirror path (if present) must be real directories, not symlinks.
+  `<cacheDir>` itself is checked again by every prepare, commit, push and remove.
 - Job ids: a job id is claimed for one repository by an ownership record `<cacheDir>/jobs/<jobId>` (the canonical
   repo), created exclusively. A per-job-id lock across the whole cache is taken before the per-repo lock, so two
   repos preparing the same job id at once cannot both get it. The agent creates `<cacheDir>/work/<jobId>` itself
@@ -75,6 +76,10 @@ metadata files, symlinks), and it owns the worktree's `.git` file. The agent def
   fail), so a runner cannot redirect them to another job's branch. The push sends the validated object id
   (`<sha>:refs/heads/hoistline/<jobId>`). Before the fetch, `refs/remotes/origin/<base>` is deleted with
   `update-ref -d --no-deref`, so a symbolic fetch destination cannot move another branch.
+- Base branch components: before the fetch and again before `worktree add`, each directory component of
+  `refs/remotes/origin/<base>` (such as `refs/remotes/origin/a` for base `a/b`) must be a real directory. A symlink
+  is refused. A regular file there is the stale tracking ref of a former base branch `a`; it is deleted with
+  `update-ref -d --no-deref`.
 - Before every fetch, `worktree add`, commit, push and prune, the mirror is reset, without ever following a
   symlink:
   - Its `config` is unlinked and written fresh from a fixed template: `[core]`, `repositoryformatversion = 0`,
@@ -85,8 +90,10 @@ metadata files, symlinks), and it owns the worktree's `.git` file. The agent def
     `objects/info/http-alternates`, and every `worktrees/*/config.worktree` and `worktrees/*/logs`. (`shallow` and
     `info/grafts` rewrite commit ancestry; `FETCH_HEAD` and reflogs are written through whatever is in place.)
   - A symlink found in place of `info`, `objects/info`, `worktrees` or a `worktrees/<entry>` is removed, never
-    followed. `refs/replace` is only deleted when `refs` is a real directory. More than 10,000 entries in
-    `worktrees` is refused.
+    followed. More than 10,000 entries in `worktrees` is refused.
+  - `refs`, `refs/heads`, `refs/heads/hoistline`, `refs/remotes`, `refs/remotes/origin` and `objects/pack` must be
+    real directories, because git writes refs and packs through them; missing ones are created. A symlink or other
+    non-directory there is refused.
 - The fetch runs with `--no-write-fetch-head`, and every git call with `-c core.logAllRefUpdates=false`. That flag
   alone does not stop git appending to a reflog file that already exists, which is why `logs` is deleted.
 - Platform values: once per cache directory the agent runs `git init --template=` (so the owner's
@@ -119,11 +126,13 @@ metadata files, symlinks), and it owns the worktree's `.git` file. The agent def
      set cannot overflow an output buffer, then commit and delete the temporary index.
 - No remote is stored. The URL `https://github.com/<owner>/<name>.git`, derived only from the canonical repo, is
   passed explicitly to every fetch and push.
-- Every git call also gets `-c` overrides: fsmonitor off, submodule recursion off, fsck on transfer, and every
-  transport except https disabled. Each git call runs with a scrubbed environment. The push never forces and never
+- Every git call also gets `-c` overrides: fsmonitor off, submodule recursion off, fsck on transfer, automatic
+  maintenance and gc off (`maintenance.auto=false`, `gc.auto=0`; fetch and commit otherwise start them, and a
+  detached gc can keep writing after the repo lock is released), and every transport except https disabled. Each git call runs with a scrubbed environment. The push never forces and never
   pushes tags.
 - Hooks: `core.hooksPath=/dev/null` on macOS and Linux, which cannot hold a hook. On Windows, each git call gets a
-  directory created empty for it under the cache and removed afterwards. Hooks such as `post-checkout`,
+  directory created empty for it under the cache and removed afterwards (best effort: a failed removal never hides
+  git's result or error). Hooks such as `post-checkout`,
   `reference-transaction` and `prepare-commit-msg` run even with `--no-verify`, so this is the only switch.
 - Network calls also abort a transfer that stays below 1 byte/s for 60 s. They have an overall timeout (5 minutes
   by default) that kills git's whole process tree: the process group on macOS and Linux, `taskkill /T` on Windows.

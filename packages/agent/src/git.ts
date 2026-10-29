@@ -179,6 +179,9 @@ function hardeningFlags(hooksPath: string, allowFileProtocol: boolean): string[]
     `core.hooksPath=${hooksPath}`,
     // Reflogs are written through whatever is at logs/<ref>, which a runner can make a symlink.
     "core.logAllRefUpdates=false",
+    // fetch and commit start auto maintenance, and a detached gc can outlive this call and the repository lock.
+    "maintenance.auto=false",
+    "gc.auto=0",
     "core.fsmonitor=false",
     "core.sshCommand=false",
     "core.useReplaceRefs=false",
@@ -218,7 +221,8 @@ export async function runGit(args: string[], opts: GitRunOptions): Promise<GitRe
   try {
     return await spawnGit([...hardeningFlags(hooks, opts.allowFileProtocol === true), ...args], args, cacheDir, opts);
   } finally {
-    if (hooks !== "/dev/null") await rm(hooks, { recursive: true, force: true });
+    // Best effort: a failed cleanup must not replace git's result or error.
+    if (hooks !== "/dev/null") await rm(hooks, { recursive: true, force: true }).catch(() => undefined);
   }
 }
 
@@ -467,8 +471,9 @@ async function platformFlags(cacheDir: string): Promise<string[]> {
  * config is rewritten from a fixed template (no remote, url, include, credential, http, filter or core.* overrides
  * beyond the probed platform values), the hooks directory is recreated empty, and commondir, gitdir,
  * config.worktree, FETCH_HEAD, shallow, logs, info/attributes, info/exclude, info/grafts, refs/replace, the object
- * alternates and every worktrees/<x>/config.worktree and worktrees/<x>/logs are deleted. A targeted list, so a
- * concurrent job's lock files survive.
+ * alternates and every worktrees/<x>/config.worktree and worktrees/<x>/logs are deleted. refs, refs/heads,
+ * refs/heads/hoistline, refs/remotes, refs/remotes/origin and objects/pack must be real directories. A targeted list,
+ * so a concurrent job's lock files survive.
  */
 async function resetMirror(mirror: string, config: string): Promise<void> {
   await assertRealDir(dirname(mirror));
@@ -485,8 +490,14 @@ async function resetMirror(mirror: string, config: string): Promise<void> {
   if (await realDirOrRemove(join(mirror, "info"))) {
     for (const name of ["attributes", "exclude", "grafts"]) await removeEntry(join(mirror, "info", name));
   }
+  // Git writes refs and packs through whatever is at these paths, so a symlinked one would put a job branch, a
+  // tracking ref or a pack outside the cache. Missing ones are created here as real directories.
+  for (const rel of [["refs"], ["refs", "heads"], ["refs", "heads", "hoistline"], ["refs", "remotes"],
+    ["refs", "remotes", "origin"], ["objects", "pack"]]) {
+    await ensureRealDir(join(mirror, ...rel));
+  }
   // Packed replace refs survive this; GIT_NO_REPLACE_OBJECTS and core.useReplaceRefs=false cover those.
-  if ((await lstatOrNull(join(mirror, "refs")))?.isDirectory()) await removeEntry(join(mirror, "refs", "replace"));
+  await removeEntry(join(mirror, "refs", "replace"));
   const objectsInfo = join(mirror, "objects", "info");
   if (await realDirOrRemove(objectsInfo)) {
     await removeEntry(join(objectsInfo, "alternates"));
@@ -559,6 +570,26 @@ async function jobBranchSha(git: Git, ref: string, verb: string): Promise<string
   return sha;
 }
 
+/**
+ * Checks each directory component of `refs/remotes/origin/<base>` (resetMirror covers refs/remotes/origin itself),
+ * because git writes the tracking ref through them. A symlink (or anything but a directory or a regular file) is
+ * refused. A regular file is the stale tracking ref of a former base branch (`a` where `a/b` is wanted), and is
+ * deleted as a ref, never followed.
+ */
+async function checkBaseComponents(git: Git, mirror: string, base: string): Promise<void> {
+  const parts = base.split("/");
+  for (let i = 1; i < parts.length; i++) {
+    const prefix = parts.slice(0, i).join("/");
+    const path = join(mirror, "refs", "remotes", "origin", ...parts.slice(0, i));
+    const stat = await lstatOrNull(path);
+    if (!stat) return;
+    if (stat.isDirectory()) continue;
+    if (!stat.isFile()) throw new Error(`refusing to use ${path}: not a plain directory`);
+    await git(["update-ref", "-d", "--no-deref", `refs/remotes/origin/${prefix}`]);
+    return;
+  }
+}
+
 const jobReused = (id: string) =>
   new Error(`job id "${id}" was already used on this machine; refusing to reuse its worktree`);
 
@@ -596,7 +627,8 @@ export async function prepareWorktree(
   return withLock(jobLockKey(cache, id), () =>
     withLock(mirror, async () => {
       // Every directory git will create things in is checked before git runs: a symlink here would send the mirror,
-      // the worktree or a cleanup anywhere on disk.
+      // the worktree or a cleanup anywhere on disk. The cache root too: the probe's check is cached per path.
+      await assertRealDir(cache);
       for (const name of ["repos", "work", "jobs"]) await ensureRealDir(join(cache, name));
       const mirrorStat = await lstatOrNull(mirror);
       if (mirrorStat && !mirrorStat.isDirectory()) throw new Error(`refusing to use ${mirror}: not a plain directory`);
@@ -618,6 +650,7 @@ export async function prepareWorktree(
       await writeFile(record, `${canonical}\n`, { flag: "wx" }).catch(reuseOnExist(id));
       let createdDir = false;
       try {
+        await checkBaseComponents(git, mirror, base);
         // A runner can make the fetch destination a symbolic ref to a job branch, which the forced fetch would move.
         await git(["update-ref", "-d", "--no-deref", `refs/remotes/origin/${base}`]);
         try {
@@ -628,6 +661,7 @@ export async function prepareWorktree(
           throw new GitError(`could not fetch base branch "${base}" of ${canonical}`, e.stderr || e.message);
         }
         await resetMirror(mirror, config);
+        await checkBaseComponents(git, mirror, base);
         // Created here (not by git, which accepts an existing empty directory), so it is known to be this job's.
         await mkdir(dir).catch(reuseOnExist(id));
         createdDir = true;
@@ -663,6 +697,7 @@ export async function pushBranch(
   const config = await mirrorConfig(cache);
 
   await withLock(mirror, async () => {
+    await assertRealDir(cache);
     if (!(await exists(join(mirror, "HEAD")))) throw new Error(`refusing to push: no branch hoistline/${id}`);
     await resetMirror(mirror, config);
     const sha = await jobBranchSha(git, ref, "push");
@@ -685,6 +720,9 @@ export async function removeWorktree(repo: string, jobId: string, cacheDir: stri
   const mirror = mirrorPath(cache, canonical);
 
   await withLock(jobLockKey(cache, id), async () => {
+    const cacheStat = await lstatOrNull(cache);
+    if (!cacheStat) return;
+    if (!cacheStat.isDirectory()) throw new Error(`refusing to use ${cache}: not a plain directory`);
     const rootStat = await lstatOrNull(workRoot);
     if (rootStat && !rootStat.isDirectory()) {
       // A symlinked work directory could point anywhere; never follow it.
@@ -944,6 +982,7 @@ export async function commitWorktree(
   const platformArgs = await platformFlags(cache);
 
   return withLock(mirror, async () => {
+    await assertRealDir(cache);
     if (!(await exists(join(mirror, "HEAD")))) throw new Error(`refusing to commit: no mirror for ${canonical}`);
     await resetMirror(mirror, config);
     await assertRealDir(join(cache, "work")).catch(() => {

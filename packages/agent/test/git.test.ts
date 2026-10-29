@@ -1690,3 +1690,165 @@ describe("round 4: the no-commit nested repository fallback", () => {
     },
   );
 });
+
+// ---------------------------------------------------------------------------------------------------------------
+// Round 5.
+
+/** A bare remote with main plus one branch per name in `extra`, all at the same commit. Returns it and its seed. */
+function remoteWith(extra: string[]): { bare: string; seed: string; opts: typeof file } {
+  const dir = temp();
+  const bare = join(dir, "r.git");
+  const seed = join(dir, "seed");
+  fx(["init", "-q", "--bare", "-b", "main", bare]);
+  fx(["init", "-q", "-b", "main", seed]);
+  writeFileSync(join(seed, "README"), "main\n");
+  fx(["add", "README"], seed);
+  fx(["commit", "-q", "-m", "main"], seed);
+  fx(["push", "-q", bare, "main"], seed);
+  for (const b of extra) fx(["push", "-q", bare, `HEAD:refs/heads/${b}`], seed);
+  return { bare, seed, opts: { remoteFor: () => bare, allowFileProtocol: true } };
+}
+
+/** Replaces `<mirror>/<rel>` with a symlink to a fresh, empty victim directory, and returns the victim. */
+function linkToVictim(mirror: string, rel: string): string {
+  const victim = temp();
+  rmSync(join(mirror, rel), { recursive: true, force: true });
+  mkdirSync(join(mirror, rel, ".."), { recursive: true });
+  symlinkSync(victim, join(mirror, rel));
+  return victim;
+}
+
+describe("round 5: symlinked ref directories", () => {
+  it("refuses a symlinked refs/heads/hoistline", async () => {
+    const main = remoteSha("refs/heads/main") as string;
+    // Control: plain git writes a job branch into the link's target.
+    const ctl = temp();
+    await prepareWorktree("o/n", "main", "rh0", ctl, file);
+    const ctlVictim = linkToVictim(mirrorOf(ctl), "refs/heads/hoistline");
+    fx(["--git-dir", mirrorOf(ctl), "update-ref", "refs/heads/hoistline/j1", main]);
+    expect(readdirSync(ctlVictim)).toEqual(["j1"]);
+
+    const cache = temp();
+    const ws = await prepareWorktree("o/n", "main", "rh1", cache, file);
+    const victim = linkToVictim(mirrorOf(cache), "refs/heads/hoistline");
+    await expect(prepareWorktree("o/n", "main", "rh2", cache, file)).rejects.toThrow(/not a plain directory/);
+    writeFileSync(join(ws.dir, "x.txt"), "x\n");
+    await expect(commitWorktree("o/n", "rh1", cache, file)).rejects.toThrow(/not a plain directory/);
+    expect(readdirSync(victim)).toEqual([]);
+  });
+
+  it("refuses a symlinked refs/remotes/origin", async () => {
+    // Control: a plain fetch writes the tracking ref into the link's target.
+    const ctl = temp();
+    await prepareWorktree("o/n", "main", "ro0", ctl, file);
+    const ctlVictim = linkToVictim(mirrorOf(ctl), "refs/remotes/origin");
+    fx(["--git-dir", mirrorOf(ctl), "fetch", "-q", "--", remote, "+refs/heads/main:refs/remotes/origin/main"]);
+    expect(readdirSync(ctlVictim)).toEqual(["main"]);
+
+    const cache = temp();
+    await prepareWorktree("o/n", "main", "ro1", cache, file);
+    const victim = linkToVictim(mirrorOf(cache), "refs/remotes/origin");
+    await expect(prepareWorktree("o/n", "main", "ro2", cache, file)).rejects.toThrow(/not a plain directory/);
+    expect(readdirSync(victim)).toEqual([]);
+  });
+
+  it("refuses a symlinked directory component of the base branch's tracking ref", async () => {
+    const r = remoteWith(["rel/one"]);
+    // Control: a plain fetch of rel/one writes into the target of a symlinked refs/remotes/origin/rel.
+    const ctl = temp();
+    await prepareWorktree("o/n", "main", "bc0", ctl, r.opts);
+    const ctlVictim = linkToVictim(mirrorOf(ctl), "refs/remotes/origin/rel");
+    fx(["--git-dir", mirrorOf(ctl), "fetch", "-q", "--", r.bare, "+refs/heads/rel/one:refs/remotes/origin/rel/one"]);
+    expect(readdirSync(ctlVictim)).toEqual(["one"]);
+
+    const cache = temp();
+    await prepareWorktree("o/n", "main", "bc1", cache, r.opts);
+    const victim = linkToVictim(mirrorOf(cache), "refs/remotes/origin/rel");
+    await expect(prepareWorktree("o/n", "rel/one", "bc2", cache, r.opts)).rejects.toThrow(/not a plain directory/);
+    expect(readdirSync(victim)).toEqual([]);
+  });
+
+  it("replaces a stale tracking ref that is in the way of a new base branch's directory", async () => {
+    const r = remoteWith(["rel"]);
+    const ctl = temp();
+    const cache = temp();
+    await prepareWorktree("o/n", "rel", "st0", ctl, r.opts);
+    await prepareWorktree("o/n", "rel", "st1", cache, r.opts);
+    // The remote's "rel" becomes "rel/one", with new content.
+    writeFileSync(join(r.seed, "README"), "rel one\n");
+    fx(["commit", "-q", "-am", "rel one"], r.seed);
+    fx(["push", "-q", r.bare, ":refs/heads/rel", "HEAD:refs/heads/rel/one"], r.seed);
+    // Control: a plain fetch cannot create refs/remotes/origin/rel/one while the file refs/remotes/origin/rel exists.
+    expect(() =>
+      fx(["--git-dir", mirrorOf(ctl), "fetch", "-q", "--", r.bare, "+refs/heads/rel/one:refs/remotes/origin/rel/one"]),
+    ).toThrow();
+
+    const ws = await prepareWorktree("o/n", "rel/one", "st2", cache, r.opts);
+    expect(readFileSync(join(ws.dir, "README"), "utf8")).toBe("rel one\n");
+  });
+});
+
+describe("round 5: automatic maintenance", () => {
+  it("pins maintenance.auto=false and gc.auto=0 on every git call", async () => {
+    const cache = temp();
+    const get = async (key: string) => (await runGit(["config", "--get", key], { cacheDir: cache })).stdout.trim();
+    expect(await get("maintenance.auto")).toBe("false");
+    expect(await get("gc.auto")).toBe("0");
+  });
+
+  it("never runs auto gc after a commit, even when the owner's config asks for it", async () => {
+    /** A job whose mirror holds two packs, with one more file in the worktree to commit. */
+    const setup = async (id: string) => {
+      const cache = temp();
+      const ws = await prepareWorktree("o/n", "main", id, cache, file);
+      const mirror = mirrorOf(cache);
+      const packs = () => readdirSync(join(mirror, "objects", "pack")).filter((n) => n.endsWith(".pack")).length;
+      // The fetch left one pack; packing the runner's commit's loose objects adds a second. (No second runner
+      // commit: plain git's own auto maintenance would merge the packs again.)
+      runnerCommit(ws.dir, "a.txt");
+      fx(["--git-dir", mirror, "repack", "-q", "-d"]);
+      writeFileSync(join(ws.dir, "c.txt"), "c\n");
+      expect(packs()).toBeGreaterThanOrEqual(2);
+      return { cache, ws, packs };
+    };
+    // The gc strategy, because newer git's default auto maintenance does not run gc for this.
+    const gcConfig = ["gc.autoPackLimit=1", "gc.autoDetach=false", "maintenance.autoDetach=false", "maintenance.strategy=gc"];
+    // Control: plain git's commit runs auto maintenance, and gc consolidates the packs.
+    const ctl = await setup("ag0");
+    fx(["add", "c.txt"], ctl.ws.dir);
+    plainCommit(ctl.ws.dir, "c", gcConfig.flatMap((c) => ["-c", c]));
+    expect(ctl.packs()).toBe(1);
+
+    const job = await setup("ag1");
+    const before = job.packs();
+    const home = temp();
+    writeFileSync(
+      join(home, ".gitconfig"),
+      "[gc]\n\tautoPackLimit = 1\n\tautoDetach = false\n[maintenance]\n\tautoDetach = false\n\tstrategy = gc\n",
+    );
+    const res = await withHome(home, () => commitWorktree("o/n", "ag1", job.cache, file));
+    expect(res.committed).toBe(true);
+    expect(job.packs()).toBe(before);
+  });
+});
+
+describe("round 5: the cache root", () => {
+  it("refuses a cache root that was replaced by a symlink", async () => {
+    const parent = temp();
+    const cache = join(parent, "cache");
+    mkdirSync(cache);
+    await prepareWorktree("o/n", "main", "k1", cache, file);
+    const moved = join(parent, "moved");
+    renameSync(cache, moved);
+    symlinkSync(moved, cache);
+    writeFileSync(join(moved, "work", "k1", "x.txt"), "x\n");
+
+    await expect(prepareWorktree("o/n", "main", "k2", cache, file)).rejects.toThrow(/not a plain directory/);
+    await expect(commitWorktree("o/n", "k1", cache, file)).rejects.toThrow(/not a plain directory/);
+    await expect(pushBranch("o/n", "k1", cache, file)).rejects.toThrow(/not a plain directory/);
+    await expect(removeWorktree("o/n", "k1", cache)).rejects.toThrow(/not a plain directory/);
+    expect(existsSync(join(moved, "work", "k1", "README"))).toBe(true);
+    expect(existsSync(join(moved, "work", "k2"))).toBe(false);
+    expect(remoteSha("refs/heads/hoistline/k1")).toBeNull();
+  });
+});
