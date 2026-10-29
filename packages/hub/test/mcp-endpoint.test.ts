@@ -4,6 +4,8 @@ import type { AddressInfo } from "node:net";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
+import type { OAuthClientInformationFull, OAuthTokenRevocationRequest } from "@modelcontextprotocol/sdk/shared/auth.js";
+import { InMemoryOAuthProvider } from "../src/auth/in-memory-provider.js";
 import { createApp, type AppDeps } from "../src/server.js";
 
 const CLIENT_REDIRECT = "http://localhost:9999/callback";
@@ -51,7 +53,7 @@ function githubStub(user = { id: 42, login: "octocat" }) {
 
 const ISSUER = "https://issuer.test";
 
-function oidcStub() {
+function oidcStub(userinfo: Record<string, unknown> = { sub: "user-7", preferred_username: "ada" }) {
   return stubFetch([
     (url) =>
       url.href === `${ISSUER}/.well-known/openid-configuration`
@@ -75,7 +77,7 @@ function oidcStub() {
       if (new Headers(init?.headers).get("authorization") !== "Bearer oidc-access") {
         return new Response("unauthorized", { status: 401 });
       }
-      return json({ sub: "user-7", preferred_username: "ada" });
+      return json(userinfo);
     },
   ]);
 }
@@ -144,13 +146,17 @@ beforeEach(() => {
   browser = new Browser();
 });
 
-async function registerClient(hub: string, clientName = "test client"): Promise<string> {
+async function registerClient(
+  hub: string,
+  clientName = "test client",
+  redirectUris = [CLIENT_REDIRECT],
+): Promise<string> {
   const res = await fetch(`${hub}/register`, {
     method: "POST",
     headers: { "content-type": "application/json" },
     body: JSON.stringify({
       client_name: clientName,
-      redirect_uris: [CLIENT_REDIRECT],
+      redirect_uris: redirectUris,
       token_endpoint_auth_method: "none",
     }),
   });
@@ -159,12 +165,18 @@ async function registerClient(hub: string, clientName = "test client"): Promise<
 }
 
 /** GET /authorize in the given browser; returns the raw response (consent page or redirect). */
-function openAuthorize(hub: string, clientId: string, challenge: string, user = browser): Promise<Response> {
+function openAuthorize(
+  hub: string,
+  clientId: string,
+  challenge: string,
+  user = browser,
+  redirectUri = CLIENT_REDIRECT,
+): Promise<Response> {
   const url = new URL(`${hub}/authorize`);
   url.search = new URLSearchParams({
     response_type: "code",
     client_id: clientId,
-    redirect_uri: CLIENT_REDIRECT,
+    redirect_uri: redirectUri,
     code_challenge: challenge,
     code_challenge_method: "S256",
     state: "client-state",
@@ -478,6 +490,25 @@ describe("hub consent and browser binding", () => {
     expect(other.status).toBe(200);
   });
 
+  it("remembers an approval for the approved redirect URI only", async () => {
+    const hub = await startHub({ fetch: githubStub().fetch });
+    const otherRedirect = "http://localhost:9999/other";
+    const clientId = await registerClient(hub, "test client", [CLIENT_REDIRECT, otherRedirect]);
+    await startAuthorize(hub, clientId, pkce().challenge);
+    expect((await openAuthorize(hub, clientId, pkce().challenge)).status).toBe(302);
+    const other = await openAuthorize(hub, clientId, pkce().challenge, browser, otherRedirect);
+    expect(other.status).toBe(200);
+    expect(await other.text()).toContain("/other");
+  });
+
+  it("forbids framing the consent page", async () => {
+    const hub = await startHub({ fetch: githubStub().fetch });
+    const res = await openAuthorize(hub, await registerClient(hub), pkce().challenge);
+    expect(res.status).toBe(200);
+    expect(res.headers.get("content-security-policy")).toBe("frame-ancestors 'none'");
+    expect(res.headers.get("x-frame-options")).toBe("DENY");
+  });
+
   it("ignores a tampered approval cookie", async () => {
     const hub = await startHub({ fetch: githubStub().fetch });
     const clientId = await registerClient(hub);
@@ -553,37 +584,100 @@ describe("allowed users", () => {
     return callback(hub, { code, state: upstream.searchParams.get("state")! });
   }
   const github = (allowedUsers?: string[]) => login({ fetch: githubStub().fetch, allowedUsers }, "gh-code");
-  const oidc = (allowedUsers: string[]) =>
-    login(
+  const oidc = (allowedUsers: string[], userinfo?: Record<string, unknown>) => {
+    browser = new Browser();
+    return login(
       {
-        fetch: oidcStub().fetch,
+        fetch: oidcStub(userinfo).fetch,
         oidc: { issuer: ISSUER, clientId: "oidc-client", clientSecret: "oidc-secret" },
         allowedUsers,
       },
       "oidc-code",
     );
+  };
+  const granted = (back: URL) => back.searchParams.get("code") !== null;
 
   it("lets anyone sign in when no allowlist is set", async () => {
     expect((await github()).searchParams.get("code")).toBeTruthy();
   });
 
-  it("lets a listed user sign in (case-insensitive)", async () => {
-    expect((await github(["someone", "OctoCat"])).searchParams.get("code")).toBeTruthy();
+  it("lets a listed GitHub login sign in (case-insensitive)", async () => {
+    expect((await github(["github:someone", "github:OctoCat"])).searchParams.get("code")).toBeTruthy();
+  });
+
+  it("lets a listed GitHub numeric id sign in", async () => {
+    expect(granted(await github(["github-id:42"]))).toBe(true);
+    browser = new Browser();
+    expect(granted(await github(["github-id:43"]))).toBe(false);
   });
 
   it("denies an unlisted user with access_denied and the client state", async () => {
-    const back = await github(["someone"]);
+    const back = await github(["github:someone"]);
     expect(back.searchParams.get("code")).toBeNull();
     expect(back.searchParams.get("error")).toBe("access_denied");
     expect(back.searchParams.get("state")).toBe("client-state");
   });
 
-  it("matches OIDC users by preferred_username or sub, and denies others", async () => {
-    expect((await oidc(["ada"])).searchParams.get("code")).toBeTruthy();
-    browser = new Browser();
-    expect((await oidc(["user-7"])).searchParams.get("code")).toBeTruthy();
-    browser = new Browser();
-    expect((await oidc(["bob"])).searchParams.get("error")).toBe("access_denied");
+  it("never matches a GitHub identity against email: or sub: entries", async () => {
+    expect(granted(await github(["email:octocat", "sub:42", "sub:octocat"]))).toBe(false);
+  });
+
+  it("accepts a mixed list", async () => {
+    expect(granted(await github(["email:ada@example.com", "sub:user-7", "github-id:42"]))).toBe(true);
+    expect(granted(await oidc(["github-id:42", "github:ada", "sub:user-7"]))).toBe(true);
+  });
+
+  it("matches OIDC email only when email_verified is true", async () => {
+    const allow = ["email:ADA@example.com"];
+    expect(granted(await oidc(allow, { sub: "s1", email: "ada@example.com", email_verified: true }))).toBe(true);
+    expect(granted(await oidc(allow, { sub: "s1", email: "ada@example.com", email_verified: false }))).toBe(false);
+    expect(granted(await oidc(allow, { sub: "s1", email: "ada@example.com" }))).toBe(false);
+  });
+
+  it("never authorizes by OIDC preferred_username", async () => {
+    expect(granted(await oidc(["email:ada@example.com"], { sub: "s1", preferred_username: "ada@example.com" }))).toBe(
+      false,
+    );
+  });
+
+  it("compares OIDC sub case-sensitively and never matches it against github entries", async () => {
+    expect(granted(await oidc(["sub:user-7"]))).toBe(true);
+    expect(granted(await oidc(["sub:USER-7"]))).toBe(false);
+    expect(granted(await oidc(["github:user-7", "github:ada"]))).toBe(false);
+  });
+
+  it("rejects untyped or unknown-prefix entries when the app is created", () => {
+    const deps = { publicUrl: "https://hub.example.com", github: { clientId: "a", clientSecret: "b" } };
+    expect(() => createApp({ ...deps, allowedUsers: ["octocat"] })).toThrow(/"octocat"/);
+    expect(() => createApp({ ...deps, allowedUsers: ["gitlab:x"] })).toThrow(/"gitlab:x"/);
+  });
+});
+
+describe("store pass-through", () => {
+  it("offers /revoke and forwards to the store when the store implements revokeToken", async () => {
+    const revoked: string[] = [];
+    class RevokingStore extends InMemoryOAuthProvider {
+      async revokeToken(_client: OAuthClientInformationFull, request: OAuthTokenRevocationRequest) {
+        revoked.push(request.token);
+      }
+    }
+    const hub = await startHub({ fetch: githubStub().fetch, oauthProvider: new RevokingStore() });
+    const meta = (await (await fetch(`${hub}/.well-known/oauth-authorization-server`)).json()) as Record<string, string>;
+    expect(meta.revocation_endpoint).toBe(`${hub}/revoke`);
+    const clientId = await registerClient(hub);
+    const res = await fetch(`${hub}/revoke`, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ token: "some-token", client_id: clientId }),
+    });
+    expect(res.status).toBe(200);
+    expect(revoked).toEqual(["some-token"]);
+  });
+
+  it("does not offer /revoke when the store lacks revokeToken", async () => {
+    const hub = await startHub({ fetch: githubStub().fetch });
+    const meta = (await (await fetch(`${hub}/.well-known/oauth-authorization-server`)).json()) as Record<string, string>;
+    expect(meta.revocation_endpoint).toBeUndefined();
   });
 });
 

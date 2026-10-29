@@ -36,9 +36,20 @@ describe("configFromEnv", () => {
   });
 
   it("reads HOISTLINE_ALLOWED_USERS as a comma-separated list", () => {
-    const config = configFromEnv({ ...github, HOISTLINE_ALLOWED_USERS: " octocat, ada@example.com ,," });
-    expect(config.deps.allowedUsers).toEqual(["octocat", "ada@example.com"]);
+    const config = configFromEnv({
+      ...github,
+      HOISTLINE_ALLOWED_USERS: " github:octocat, email:ada@example.com ,, github-id:42, sub:user-7",
+    });
+    expect(config.deps.allowedUsers).toEqual(["github:octocat", "email:ada@example.com", "github-id:42", "sub:user-7"]);
     expect(configFromEnv({ ...github, HOISTLINE_ALLOWED_USERS: "" }).deps.allowedUsers).toBeUndefined();
+  });
+
+  it("rejects untyped, unknown-prefix or malformed allowlist entries at startup", () => {
+    const withAllow = (value: string) => () => configFromEnv({ ...github, HOISTLINE_ALLOWED_USERS: value });
+    expect(withAllow("github:octocat, octocat")).toThrow(/"octocat"/);
+    expect(withAllow("gitlab:octocat")).toThrow(/"gitlab:octocat"/);
+    expect(withAllow("github-id:octocat")).toThrow(/"github-id:octocat"/);
+    expect(withAllow("email:")).toThrow(/"email:"/);
   });
 
   it("requires PUBLIC_URL and a login provider", () => {

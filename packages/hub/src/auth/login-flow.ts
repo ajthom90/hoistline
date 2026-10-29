@@ -1,7 +1,8 @@
-import { randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import type { Request, Response } from "express";
 import type { AuthorizationParams, OAuthServerProvider } from "@modelcontextprotocol/sdk/server/auth/provider.js";
 import type { OAuthClientInformationFull } from "@modelcontextprotocol/sdk/shared/auth.js";
+import { parseAllowedUsers } from "./allowlist.js";
 import { CookieSigner, parseCookies, safeEqual, serializeCookie } from "./cookies.js";
 import type { IdentityProvider, UserIdentity } from "./identity.js";
 import type { HubOAuthProvider } from "./in-memory-provider.js";
@@ -11,7 +12,7 @@ export const LOGIN_CALLBACK_PATH = "/oauth/callback";
 
 /** Binds an in-progress login to the browser that started it. */
 const LOGIN_COOKIE = "hl_login";
-/** Signed list of client ids this browser has approved. */
+/** Signed list of (client id, redirect URI) pairs this browser has approved. */
 const APPROVED_COOKIE = "hl_approved";
 const LOGIN_TTL = 600;
 const APPROVED_TTL = 365 * 24 * 3600;
@@ -55,6 +56,12 @@ function clientRedirect(params: AuthorizationParams, query: Record<string, strin
   return url.href;
 }
 
+/** A remembered approval covers exactly one client and one redirect URI, as named on the consent page. */
+function approvalKey(client: OAuthClientInformationFull, params: AuthorizationParams): string {
+  // Hashed to keep the cookie small whatever the redirect URI length.
+  return createHash("sha256").update(JSON.stringify([client.client_id, params.redirectUri])).digest("base64url");
+}
+
 const str = (v: unknown) => (typeof v === "string" ? v : undefined);
 
 /**
@@ -70,13 +77,13 @@ export class LoginFlow {
   constructor(private readonly options: LoginFlowOptions) {
     this.signer = new CookieSigner(options.cookieSecret);
     this.secure = options.publicUrl.protocol === "https:";
-    if (options.allowedUsers?.length) this.allowed = new Set(options.allowedUsers.map((u) => u.toLowerCase()));
+    if (options.allowedUsers?.length) this.allowed = new Set(parseAllowedUsers(options.allowedUsers));
   }
 
   /** The provider handed to the SDK auth router: the store, with `authorize` starting this flow. */
   provider(): OAuthServerProvider {
     const store = this.options.store;
-    return {
+    const provider: OAuthServerProvider = {
       get clientsStore() {
         return store.clientsStore;
       },
@@ -86,6 +93,10 @@ export class LoginFlow {
       exchangeRefreshToken: (...args) => store.exchangeRefreshToken(...args),
       verifyAccessToken: (token) => store.verifyAccessToken(token),
     };
+    // Optional capabilities: the SDK router offers /revoke only when revokeToken exists.
+    if (store.revokeToken) provider.revokeToken = (client, request) => store.revokeToken!(client, request);
+    if (store.skipLocalPkceValidation !== undefined) provider.skipLocalPkceValidation = store.skipLocalPkceValidation;
+    return provider;
   }
 
   /** Called by the SDK's /authorize handler after it validated the client, redirect URI and PKCE. */
@@ -96,7 +107,7 @@ export class LoginFlow {
       params,
       browserNonce: random(),
       csrf: random(),
-      approved: this.approvedClients(res.req).includes(client.client_id),
+      approved: this.approvals(res.req).includes(approvalKey(client, params)),
       expiresAt: now() + LOGIN_TTL,
     };
     this.prune();
@@ -106,7 +117,15 @@ export class LoginFlow {
       res.redirect(302, await this.options.identity.authorizationUrl(state));
       return;
     }
-    res.status(200).type("html").set("Cache-Control", "no-store").send(this.consentPage(state, pending));
+    res
+      .status(200)
+      .type("html")
+      .set({
+        "Cache-Control": "no-store",
+        "Content-Security-Policy": "frame-ancestors 'none'",
+        "X-Frame-Options": "DENY",
+      })
+      .send(this.consentPage(state, pending));
   }
 
   /** POST /oauth/consent from the consent page. */
@@ -125,8 +144,9 @@ export class LoginFlow {
       return;
     }
     pending.approved = true;
-    const approved = [pending.client.client_id, ...this.approvedClients(req).filter((id) => id !== pending.client.client_id)];
-    res.append("Set-Cookie", this.cookie(APPROVED_COOKIE, this.signer.sign(JSON.stringify(approved.slice(0, MAX_APPROVED))), APPROVED_TTL));
+    const key = approvalKey(pending.client, pending.params);
+    const approved = [key, ...this.approvals(req).filter((k) => k !== key)].slice(0, MAX_APPROVED);
+    res.append("Set-Cookie", this.cookie(APPROVED_COOKIE, this.signer.sign(JSON.stringify(approved)), APPROVED_TTL));
     res.redirect(302, await this.options.identity.authorizationUrl(state));
   }
 
@@ -152,7 +172,7 @@ export class LoginFlow {
     } catch (err) {
       return denied(`Login failed: ${err instanceof Error ? err.message : String(err)}`);
     }
-    if (this.allowed && !user.identifiers.some((id) => this.allowed!.has(id.toLowerCase()))) {
+    if (this.allowed && !user.identifiers.some((id) => this.allowed!.has(id))) {
       return denied(`${user.name} is not allowed to use this hub`);
     }
     const hubCode = await this.options.store.issueAuthorizationCode(pending.client.client_id, pending.params, user);
@@ -169,12 +189,13 @@ export class LoginFlow {
     return nonce !== undefined && safeEqual(nonce, pending.browserNonce);
   }
 
-  private approvedClients(req: Request): string[] {
+  /** Approval keys (see approvalKey) remembered in this browser's signed cookie. */
+  private approvals(req: Request): string[] {
     const data = this.signer.verify(parseCookies(req.headers.cookie).get(APPROVED_COOKIE));
     if (!data) return [];
     try {
-      const ids: unknown = JSON.parse(data);
-      return Array.isArray(ids) ? ids.filter((id): id is string => typeof id === "string") : [];
+      const keys: unknown = JSON.parse(data);
+      return Array.isArray(keys) ? keys.filter((k): k is string => typeof k === "string") : [];
     } catch {
       return [];
     }

@@ -27,7 +27,10 @@ export interface AppDeps {
   github: GithubOAuthConfig;
   /** When set, login goes through this OIDC provider instead of GitHub. */
   oidc?: OidcConfig;
-  /** When set and non-empty, only these users may sign in (GitHub login, or OIDC preferred_username, email or sub). */
+  /**
+   * When set and non-empty, only these users may sign in. Typed entries: `github-id:<id>`,
+   * `github:<login>`, `email:<verified OIDC email>`, `sub:<OIDC subject>`; anything else throws.
+   */
   allowedUsers?: string[];
   /** fetch used for identity-provider calls (inject a stub in tests). */
   fetch?: FetchFn;

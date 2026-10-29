@@ -3,6 +3,8 @@
  * clients; GitHub (default) or a generic OIDC provider only answers "who is this user".
  */
 
+import { identifier } from "./allowlist.js";
+
 export interface GithubOAuthConfig {
   clientId: string;
   clientSecret: string;
@@ -21,7 +23,11 @@ export interface UserIdentity {
   subject: string;
   /** Human-readable name (GitHub login, OIDC preferred_username or email). */
   name: string;
-  /** Values an allowlist entry may match: GitHub login; OIDC preferred_username, email and sub. */
+  /**
+   * Typed, normalized values an allowlist entry may match (see allowlist.ts): GitHub gives
+   * `github-id:` and `github:`; OIDC gives `sub:` and, only when verified, `email:`.
+   * Display-only fields such as preferred_username are never included.
+   */
   identifiers: string[];
 }
 
@@ -89,11 +95,12 @@ export class GithubIdentityProvider implements IdentityProvider {
     });
     const user = await readJson(userRes, "GitHub user lookup");
     const login = requireString(user, "login", "GitHub user");
+    const id = requireString(user, "id", "GitHub user");
     return {
       provider: "github",
-      subject: requireString(user, "id", "GitHub user"),
+      subject: id,
       name: login,
-      identifiers: [login],
+      identifiers: [identifier("github-id", id), identifier("github", login)],
     };
   }
 }
@@ -168,8 +175,11 @@ export class OidcIdentityProvider implements IdentityProvider {
       provider: "oidc",
       subject,
       name,
-      // An email the provider marks as unverified is not trusted for the allowlist.
-      identifiers: strings(info.preferred_username, info.email_verified === false ? undefined : info.email, subject),
+      // `sub` comes from the one configured issuer. Email counts only when explicitly verified.
+      identifiers: [
+        identifier("sub", subject),
+        ...(info.email_verified === true ? strings(info.email).map((e) => identifier("email", e)) : []),
+      ],
     };
   }
 }

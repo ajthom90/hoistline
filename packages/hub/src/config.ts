@@ -1,3 +1,4 @@
+import { parseAllowedUsers } from "./auth/allowlist.js";
 import type { AppDeps } from "./server.js";
 
 export interface HubConfig {
@@ -19,10 +20,13 @@ export function configFromEnv(env: Env): HubConfig {
   const port = env.PORT ? Number(env.PORT) : 3000;
   if (!Number.isInteger(port) || port <= 0) throw new Error(`PORT must be a port number, got ${env.PORT}`);
 
-  const allowedUsers = (env.HOISTLINE_ALLOWED_USERS ?? "")
-    .split(",")
-    .map((u) => u.trim())
-    .filter(Boolean);
+  // Validated here so a bad entry fails at startup, not at someone's login.
+  const allowedUsers = parseAllowedUsers(
+    (env.HOISTLINE_ALLOWED_USERS ?? "")
+      .split(",")
+      .map((u) => u.trim())
+      .filter(Boolean),
+  );
   const config = loginConfig(env, publicUrl, port);
   if (allowedUsers.length) config.deps.allowedUsers = allowedUsers;
   return config;

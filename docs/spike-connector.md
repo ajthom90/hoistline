@@ -28,9 +28,10 @@ Why the consent page: any app can register itself at `/register`, and GitHub ski
 consent screen for an app you already authorized. Without a hub consent step, a link to
 `/authorize` from someone else's app could silently sign you in and hand your access to that app.
 The hub sets two cookies, both HttpOnly, SameSite=Lax, and Secure when `PUBLIC_URL` is https:
-`hl_login` ties a login in progress to your browser, and `hl_approved` (signed) remembers the
-clients you approved so you are not asked again. The signing key is random per process, so a
-restart asks for consent again.
+`hl_login` ties a login in progress to your browser, and `hl_approved` (signed) remembers each
+client and redirect URI you approved so you are not asked again for that exact pair. The signing
+key is random per process, so a restart asks for consent again. The consent page cannot be framed
+(`Content-Security-Policy: frame-ancestors 'none'`, `X-Frame-Options: DENY`).
 
 State (clients, codes, tokens) is in memory for this spike: restarting the hub logs everyone out
 and claude.ai must re-register. Task 3 moves it to SQLite.
@@ -46,7 +47,19 @@ and claude.ai must re-register. Task 3 moves it to SQLite.
 | `OIDC_ISSUER` | no | OIDC issuer URL. When all three `OIDC_*` are set, login uses OIDC discovery instead of GitHub. Setting only some of them is an error. |
 | `OIDC_CLIENT_ID` | no | OIDC client ID. |
 | `OIDC_CLIENT_SECRET` | no | OIDC client secret. |
-| `HOISTLINE_ALLOWED_USERS` | no | Comma-separated list of users who may sign in: GitHub logins, or for OIDC the `preferred_username`, `email` (unless marked unverified) or `sub`. Case-insensitive. Anyone else gets `access_denied`. **When unset, every GitHub (or OIDC) account can sign in to the hub.** Set it for any hub reachable from the internet. |
+| `HOISTLINE_ALLOWED_USERS` | no | Comma-separated list of users who may sign in. Anyone else gets `access_denied`. **When unset, every GitHub (or OIDC) account can sign in to the hub.** Set it for any hub reachable from the internet. Each entry is typed (see below); an untyped or unknown entry stops the hub at startup. |
+
+Allowlist entry types:
+
+| Entry | Matches | Notes |
+| --- | --- | --- |
+| `github-id:<numeric id>` | GitHub account id | **Recommended for GitHub.** Ids never change. Find yours with `curl -s https://api.github.com/users/<login> \| jq .id`. |
+| `github:<login>` | GitHub login, case-insensitive | Logins can be renamed and a freed login can be claimed by someone else. |
+| `email:<address>` | OIDC `email`, case-insensitive | Counts only when the provider returns `email_verified: true`. |
+| `sub:<value>` | OIDC `sub` from the configured issuer, case-sensitive | Stable per issuer. |
+
+A GitHub login only matches `github-id:` and `github:` entries; an OIDC login only matches `email:`
+and `sub:` entries. OIDC `preferred_username` is never used to decide access.
 
 The callback URL to register with GitHub or the OIDC provider is always `<PUBLIC_URL>/oauth/callback`.
 
@@ -89,7 +102,7 @@ curl -s -X POST $HUB/register -H 'content-type: application/json' \
    pnpm install && pnpm build
    PUBLIC_URL=https://hoistline.example.com PORT=3000 \
    GITHUB_CLIENT_ID=... GITHUB_CLIENT_SECRET=... \
-   HOISTLINE_ALLOWED_USERS=<your-github-login> \
+   HOISTLINE_ALLOWED_USERS=github-id:<your-github-numeric-id> \
    node packages/hub/dist/main.js
    ```
    Expect `Hoistline hub listening on port 3000`.
