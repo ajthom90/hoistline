@@ -203,14 +203,14 @@ describe("approval queue", () => {
       JSON.stringify({ jobId: req.jobId, decision: "deny", specHash: req.specHash, decidedAt: 1_000_000 }),
       { mode: 0o600 },
     );
-    let q2: ApprovalQueue | undefined;
+    // The owner's CLI, a separate queue on the same directory.
+    const q2 = createApprovalQueue({ dir });
     const q = createApprovalQueue({
       dir,
       pollIntervalMs: 5,
       // The owner answers as soon as the request is visible, before anything else runs.
-      onPendingPublished: (jobId) => q2!.decide(jobId, "approve", req.specHash),
+      onPendingPublished: (jobId) => q2.decide(jobId, "approve", req.specHash),
     });
-    q2 = createApprovalQueue({ dir });
     queues.push(q, q2);
     expect(await q.requestApproval(req)).toBe(true);
   });
