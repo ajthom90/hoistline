@@ -69,8 +69,8 @@ export type ApprovalQueueOptions = {
   onError?: (err: unknown) => void;
 };
 
-export const MAX_PENDING_BYTES = 64 * 1024;
-export const MAX_DECISION_BYTES = 4 * 1024;
+const MAX_PENDING_BYTES = 64 * 1024;
+const MAX_DECISION_BYTES = 4 * 1024;
 const DEFAULT_TTL_MS = 3600_000;
 const DECISION_MAX_AGE_MS = 3600_000;
 const PENDING_MAX_AGE_MS = 24 * 3600_000;
@@ -111,7 +111,7 @@ function isJobId(id: unknown): id is string {
 }
 
 /** Constant-time comparison of two full lowercase sha256 hex strings. */
-export function sameHash(a: unknown, b: unknown): boolean {
+function sameHash(a: unknown, b: unknown): boolean {
   if (typeof a !== "string" || typeof b !== "string" || !HASH.test(a) || !HASH.test(b)) return false;
   return timingSafeEqual(Buffer.from(a, "hex"), Buffer.from(b, "hex"));
 }
