@@ -16,12 +16,21 @@ The hub is its own OAuth 2.1 authorization server (built on `mcpAuthRouter` from
 | `GET /.well-known/oauth-protected-resource` | Protected-resource metadata (RFC 9728). Also served at `/.well-known/oauth-protected-resource/mcp`. |
 | `GET /.well-known/oauth-authorization-server` | Authorization-server metadata (RFC 8414). |
 | `POST /register` | Dynamic client registration (RFC 7591). claude.ai registers itself here. |
-| `GET /authorize` | Starts login: checks the client and PKCE, then redirects the browser to GitHub (or the OIDC provider). |
-| `GET /oauth/callback` | Where GitHub/OIDC sends the browser back. The hub looks up the user, then redirects to the client's `redirect_uri` with the hub's own authorization code. |
+| `GET /authorize` | Starts login: checks the client and PKCE, then shows the hub's consent page naming the client and its redirect host. If this browser already approved this client, it goes straight to GitHub (or the OIDC provider). |
+| `POST /oauth/consent` | The consent page's Approve/Deny form (CSRF-protected). Approve redirects to GitHub/OIDC; Deny returns `error=access_denied` to the client. |
+| `GET /oauth/callback` | Where GitHub/OIDC sends the browser back. It must be the same browser that started the login (checked with a cookie). The hub looks up the user, checks the allowlist, then redirects to the client's `redirect_uri` with the hub's own authorization code. |
 | `POST /token` | Exchanges the code (PKCE S256) for a hub access token (1 hour) and refresh token (30 days, rotated on use). |
 | `POST /revoke` | Not offered yet. |
 
 The only tool is `ping`, which returns `pong`.
+
+Why the consent page: any app can register itself at `/register`, and GitHub skips its own
+consent screen for an app you already authorized. Without a hub consent step, a link to
+`/authorize` from someone else's app could silently sign you in and hand your access to that app.
+The hub sets two cookies, both HttpOnly, SameSite=Lax, and Secure when `PUBLIC_URL` is https:
+`hl_login` ties a login in progress to your browser, and `hl_approved` (signed) remembers the
+clients you approved so you are not asked again. The signing key is random per process, so a
+restart asks for consent again.
 
 State (clients, codes, tokens) is in memory for this spike: restarting the hub logs everyone out
 and claude.ai must re-register. Task 3 moves it to SQLite.
@@ -37,6 +46,7 @@ and claude.ai must re-register. Task 3 moves it to SQLite.
 | `OIDC_ISSUER` | no | OIDC issuer URL. When all three `OIDC_*` are set, login uses OIDC discovery instead of GitHub. Setting only some of them is an error. |
 | `OIDC_CLIENT_ID` | no | OIDC client ID. |
 | `OIDC_CLIENT_SECRET` | no | OIDC client secret. |
+| `HOISTLINE_ALLOWED_USERS` | no | Comma-separated list of users who may sign in: GitHub logins, or for OIDC the `preferred_username`, `email` (unless marked unverified) or `sub`. Case-insensitive. Anyone else gets `access_denied`. **When unset, every GitHub (or OIDC) account can sign in to the hub.** Set it for any hub reachable from the internet. |
 
 The callback URL to register with GitHub or the OIDC provider is always `<PUBLIC_URL>/oauth/callback`.
 
@@ -79,6 +89,7 @@ curl -s -X POST $HUB/register -H 'content-type: application/json' \
    pnpm install && pnpm build
    PUBLIC_URL=https://hoistline.example.com PORT=3000 \
    GITHUB_CLIENT_ID=... GITHUB_CLIENT_SECRET=... \
+   HOISTLINE_ALLOWED_USERS=<your-github-login> \
    node packages/hub/dist/main.js
    ```
    Expect `Hoistline hub listening on port 3000`.
@@ -93,7 +104,7 @@ curl -s -X POST $HUB/register -H 'content-type: application/json' \
    The hub trusts `X-Forwarded-For` only from loopback, which is where cloudflared connects from. If cloudflared runs on another host, rate limiting will see that host as the client.
 5. Run the curl commands in "Inspecting the endpoints" against `https://hoistline.example.com` and check the results match the comments.
 6. In claude.ai: Settings, Connectors, Add custom connector. Name `Hoistline`, URL `https://hoistline.example.com/mcp`. Leave the OAuth client ID and secret fields empty (the hub supports dynamic registration).
-7. Click Connect. Expected flow: claude.ai registers a client at `/register` (its `redirect_uris` should be `https://claude.ai/api/mcp/auth_callback`; note the actual value), the browser goes to `/authorize`, then to GitHub. Approve the GitHub app. GitHub returns to `/oauth/callback`, then the browser lands back on claude.ai and the connector shows as connected.
+7. Click Connect. Expected flow: claude.ai registers a client at `/register` (its `redirect_uris` should be `https://claude.ai/api/mcp/auth_callback`; note the actual value), the browser goes to `/authorize` and shows the Hoistline consent page naming the client (note the name and host claude.ai registers). Click Approve; the browser goes to GitHub. Approve the GitHub app. GitHub returns to `/oauth/callback`, then the browser lands back on claude.ai and the connector shows as connected.
 8. In a claude.ai chat with the connector enabled, ask Claude to call the Hoistline `ping` tool. Expect `pong`.
 9. From a Claude Code session using the same connector, call `ping` and expect `pong`.
 10. Restart the hub and note what claude.ai does (in-memory state is gone, so the token is invalid; it should ask to reconnect).

@@ -19,6 +19,16 @@ export function configFromEnv(env: Env): HubConfig {
   const port = env.PORT ? Number(env.PORT) : 3000;
   if (!Number.isInteger(port) || port <= 0) throw new Error(`PORT must be a port number, got ${env.PORT}`);
 
+  const allowedUsers = (env.HOISTLINE_ALLOWED_USERS ?? "")
+    .split(",")
+    .map((u) => u.trim())
+    .filter(Boolean);
+  const config = loginConfig(env, publicUrl, port);
+  if (allowedUsers.length) config.deps.allowedUsers = allowedUsers;
+  return config;
+}
+
+function loginConfig(env: Env, publicUrl: string, port: number): HubConfig {
   const oidcVars = ["OIDC_ISSUER", "OIDC_CLIENT_ID", "OIDC_CLIENT_SECRET"];
   if (oidcVars.some((name) => env[name]?.trim())) {
     const why = "when any OIDC_* variable is set";

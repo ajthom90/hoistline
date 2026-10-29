@@ -35,6 +35,12 @@ describe("configFromEnv", () => {
     });
   });
 
+  it("reads HOISTLINE_ALLOWED_USERS as a comma-separated list", () => {
+    const config = configFromEnv({ ...github, HOISTLINE_ALLOWED_USERS: " octocat, ada@example.com ,," });
+    expect(config.deps.allowedUsers).toEqual(["octocat", "ada@example.com"]);
+    expect(configFromEnv({ ...github, HOISTLINE_ALLOWED_USERS: "" }).deps.allowedUsers).toBeUndefined();
+  });
+
   it("requires PUBLIC_URL and a login provider", () => {
     expect(() => configFromEnv({ GITHUB_CLIENT_ID: "id", GITHUB_CLIENT_SECRET: "s" })).toThrow(/PUBLIC_URL/);
     expect(() => configFromEnv({ PUBLIC_URL: "https://hub.example.com" })).toThrow(/GITHUB_CLIENT_ID/);

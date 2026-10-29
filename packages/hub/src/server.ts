@@ -1,3 +1,4 @@
+import { randomBytes } from "node:crypto";
 import express from "express";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
@@ -13,9 +14,12 @@ import {
   type OidcConfig,
 } from "./auth/identity.js";
 import { InMemoryOAuthProvider, type HubOAuthProvider } from "./auth/in-memory-provider.js";
+import { CONSENT_PATH, LOGIN_CALLBACK_PATH, LoginFlow } from "./auth/login-flow.js";
 
 export type { FetchFn, GithubOAuthConfig, OidcConfig } from "./auth/identity.js";
 export type { HubOAuthProvider } from "./auth/in-memory-provider.js";
+/** Path the identity provider redirects back to; register `${publicUrl}${LOGIN_CALLBACK_PATH}` with it. */
+export { LOGIN_CALLBACK_PATH } from "./auth/login-flow.js";
 
 export interface AppDeps {
   /** Public base URL clients reach the hub at, e.g. the Cloudflare Tunnel hostname. No trailing slash. */
@@ -23,14 +27,15 @@ export interface AppDeps {
   github: GithubOAuthConfig;
   /** When set, login goes through this OIDC provider instead of GitHub. */
   oidc?: OidcConfig;
+  /** When set and non-empty, only these users may sign in (GitHub login, or OIDC preferred_username, email or sub). */
+  allowedUsers?: string[];
   /** fetch used for identity-provider calls (inject a stub in tests). */
   fetch?: FetchFn;
-  /** OAuth state store; built from the identity provider when omitted. */
-  createOAuthProvider?: (identity: IdentityProvider) => HubOAuthProvider;
+  /** OAuth store (clients, codes, tokens); in memory when omitted. */
+  oauthProvider?: HubOAuthProvider;
+  /** Secret for signing browser cookies; random per process when omitted. */
+  cookieSecret?: string;
 }
-
-/** Path the identity provider redirects back to; register `${publicUrl}${LOGIN_CALLBACK_PATH}` with it. */
-export const LOGIN_CALLBACK_PATH = "/oauth/callback";
 
 function buildMcpServer(): McpServer {
   const server = new McpServer({ name: "hoistline", version: "0.0.0" });
@@ -46,7 +51,15 @@ export function createApp(deps: AppDeps): express.Express {
   const identity: IdentityProvider = deps.oidc
     ? new OidcIdentityProvider(deps.oidc, callbackUrl, deps.fetch)
     : new GithubIdentityProvider(deps.github, callbackUrl, deps.fetch);
-  const provider = deps.createOAuthProvider?.(identity) ?? new InMemoryOAuthProvider(identity);
+  const store = deps.oauthProvider ?? new InMemoryOAuthProvider();
+  const login = new LoginFlow({
+    identity,
+    store,
+    publicUrl,
+    cookieSecret: deps.cookieSecret ?? randomBytes(32).toString("base64url"),
+    allowedUsers: deps.allowedUsers,
+  });
+  const provider = login.provider();
 
   const app = express();
   // cloudflared connects from loopback; trust its X-Forwarded-For so rate limiting sees real client IPs.
@@ -60,19 +73,16 @@ export function createApp(deps: AppDeps): express.Express {
     metadataHandler({ resource: publicUrl.href, authorization_servers: [publicUrl.href], resource_name: "Hoistline" }),
   );
 
+  app.post(CONSENT_PATH, express.urlencoded({ extended: false }), async (req, res, next) => {
+    try {
+      await login.consent(req, res);
+    } catch (err) {
+      next(err);
+    }
+  });
   app.get(LOGIN_CALLBACK_PATH, async (req, res, next) => {
     try {
-      const str = (v: unknown) => (typeof v === "string" ? v : undefined);
-      const redirect = await provider.completeLogin({
-        state: str(req.query.state),
-        code: str(req.query.code),
-        error: str(req.query.error),
-      });
-      if (!redirect) {
-        res.status(400).type("text/plain").send("Login expired or invalid. Start again from your MCP client.");
-        return;
-      }
-      res.redirect(302, redirect);
+      await login.callback(req, res);
     } catch (err) {
       next(err);
     }

@@ -1,33 +1,25 @@
 import { randomBytes, randomUUID } from "node:crypto";
-import type { Response } from "express";
 import type { OAuthRegisteredClientsStore } from "@modelcontextprotocol/sdk/server/auth/clients.js";
 import { InvalidGrantError, InvalidTokenError } from "@modelcontextprotocol/sdk/server/auth/errors.js";
 import type { AuthorizationParams, OAuthServerProvider } from "@modelcontextprotocol/sdk/server/auth/provider.js";
 import type { AuthInfo } from "@modelcontextprotocol/sdk/server/auth/types.js";
 import type { OAuthClientInformationFull, OAuthTokens } from "@modelcontextprotocol/sdk/shared/auth.js";
-import type { IdentityProvider, UserIdentity } from "./identity.js";
+import type { UserIdentity } from "./identity.js";
 
-/** An OAuth server provider that delegates login to an upstream identity provider. */
-export interface HubOAuthProvider extends OAuthServerProvider {
-  /**
-   * Handles the upstream identity provider's redirect back to the hub. Returns the URL to send
-   * the browser to (the MCP client's redirect URI with a hub code or an error), or undefined
-   * when `state` is unknown or expired.
-   */
-  completeLogin(params: { state?: string; code?: string; error?: string }): Promise<string | undefined>;
+/**
+ * The hub's OAuth store: registered clients, authorization codes and tokens. The browser side
+ * of `/authorize` (consent page, upstream login, allowlist) lives in LoginFlow, which calls
+ * `issueAuthorizationCode` once the user is identified.
+ */
+export interface HubOAuthProvider extends Omit<OAuthServerProvider, "authorize"> {
+  /** Issues a single-use code for the client's redirect, bound to the client, its request and the user. */
+  issueAuthorizationCode(clientId: string, params: AuthorizationParams, user: UserIdentity): Promise<string>;
 }
 
 /** Lifetimes in seconds. */
-const LOGIN_TTL = 600;
 const CODE_TTL = 600;
 const ACCESS_TOKEN_TTL = 3600;
 const REFRESH_TOKEN_TTL = 30 * 24 * 3600;
-
-interface PendingLogin {
-  clientId: string;
-  params: AuthorizationParams;
-  expiresAt: number;
-}
 
 interface AuthorizationCode {
   clientId: string;
@@ -53,22 +45,12 @@ function takeLive<T extends { expiresAt: number }>(map: Map<string, T>, key: str
   return value && value.expiresAt > now() ? value : undefined;
 }
 
-function clientRedirect(params: AuthorizationParams, query: Record<string, string>): string {
-  const url = new URL(params.redirectUri);
-  for (const [k, v] of Object.entries(query)) url.searchParams.set(k, v);
-  if (params.state !== undefined) url.searchParams.set("state", params.state);
-  return url.href;
-}
-
 /** In-memory OAuth state for the spike; Task 3 replaces it with a SQLite-backed provider. */
 export class InMemoryOAuthProvider implements HubOAuthProvider {
   private readonly clients = new Map<string, OAuthClientInformationFull>();
-  private readonly logins = new Map<string, PendingLogin>();
   private readonly codes = new Map<string, AuthorizationCode>();
   private readonly accessTokens = new Map<string, Grant>();
   private readonly refreshTokens = new Map<string, Grant>();
-
-  constructor(private readonly identity: IdentityProvider) {}
 
   readonly clientsStore: OAuthRegisteredClientsStore = {
     getClient: (clientId) => this.clients.get(clientId),
@@ -83,32 +65,10 @@ export class InMemoryOAuthProvider implements HubOAuthProvider {
     },
   };
 
-  async authorize(client: OAuthClientInformationFull, params: AuthorizationParams, res: Response): Promise<void> {
-    const state = secret();
-    this.logins.set(state, { clientId: client.client_id, params, expiresAt: now() + LOGIN_TTL });
-    res.redirect(302, await this.identity.authorizationUrl(state));
-  }
-
-  async completeLogin(query: { state?: string; code?: string; error?: string }): Promise<string | undefined> {
-    const pending = query.state ? takeLive(this.logins, query.state) : undefined;
-    if (!pending) return undefined;
-    const denied = (description: string) =>
-      clientRedirect(pending.params, { error: "access_denied", error_description: description });
-    if (query.error || !query.code) return denied(`Login was not completed: ${query.error ?? "no code"}`);
-    let user: UserIdentity;
-    try {
-      user = await this.identity.resolveCode(query.code);
-    } catch (err) {
-      return denied(`Login failed: ${err instanceof Error ? err.message : String(err)}`);
-    }
+  async issueAuthorizationCode(clientId: string, params: AuthorizationParams, user: UserIdentity): Promise<string> {
     const code = secret();
-    this.codes.set(code, {
-      clientId: pending.clientId,
-      params: pending.params,
-      user,
-      expiresAt: now() + CODE_TTL,
-    });
-    return clientRedirect(pending.params, { code });
+    this.codes.set(code, { clientId, params, user, expiresAt: now() + CODE_TTL });
+    return code;
   }
 
   async challengeForAuthorizationCode(client: OAuthClientInformationFull, authorizationCode: string): Promise<string> {

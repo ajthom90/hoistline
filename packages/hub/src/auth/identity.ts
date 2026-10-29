@@ -21,6 +21,8 @@ export interface UserIdentity {
   subject: string;
   /** Human-readable name (GitHub login, OIDC preferred_username or email). */
   name: string;
+  /** Values an allowlist entry may match: GitHub login; OIDC preferred_username, email and sub. */
+  identifiers: string[];
 }
 
 export interface IdentityProvider {
@@ -86,10 +88,12 @@ export class GithubIdentityProvider implements IdentityProvider {
       },
     });
     const user = await readJson(userRes, "GitHub user lookup");
+    const login = requireString(user, "login", "GitHub user");
     return {
       provider: "github",
       subject: requireString(user, "id", "GitHub user"),
-      name: requireString(user, "login", "GitHub user"),
+      name: login,
+      identifiers: [login],
     };
   }
 }
@@ -158,7 +162,14 @@ export class OidcIdentityProvider implements IdentityProvider {
     });
     const info = await readJson(infoRes, "OIDC userinfo");
     const subject = requireString(info, "sub", "OIDC userinfo");
-    const name = [info.preferred_username, info.email, info.name].find((v) => typeof v === "string" && v);
-    return { provider: "oidc", subject, name: typeof name === "string" ? name : subject };
+    const strings = (...values: unknown[]) => values.filter((v): v is string => typeof v === "string" && v !== "");
+    const name = strings(info.preferred_username, info.email, info.name)[0] ?? subject;
+    return {
+      provider: "oidc",
+      subject,
+      name,
+      // An email the provider marks as unverified is not trusted for the allowlist.
+      identifiers: strings(info.preferred_username, info.email_verified === false ? undefined : info.email, subject),
+    };
   }
 }
