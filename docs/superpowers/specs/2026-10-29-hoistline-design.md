@@ -70,7 +70,7 @@ Hoistline is a **single authenticated public MCP endpoint** that a cloud session
 
 Per machine, set by the owner on the agent:
 
-- **Trusted mode**: anything the authenticated user sends may run.
+- **Trusted mode (fully unrestricted)**: the person who sets up the agent may choose to allow everything. Any repo, runner, model and tool, any runner flags (including auto-approve modes such as `--yolo`), and no approval prompts. This is the owner's explicit choice, made at agent setup, and the agent must not nag or second-guess it. The setup flow should state the consequence once, in plain words, then honor the choice. If the machine is shared, shared users get the same unrestricted access, so the setup flow should say that too.
 - **Restricted mode**: owner-defined rules, such as allowed repos, allowed runners/models and tools, and which actions need the owner's approval. Anything outside the rules is denied or held for approval.
 
 Enforcement lives on the agent, not only the hub.
