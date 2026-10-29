@@ -1,8 +1,11 @@
 CREATE TABLE users (
   id TEXT PRIMARY KEY,
-  github_id TEXT NOT NULL UNIQUE,
+  provider TEXT NOT NULL,
+  subject TEXT NOT NULL,
+  -- Display only; never used for authorization.
   login TEXT NOT NULL,
-  created_at INTEGER NOT NULL
+  created_at INTEGER NOT NULL,
+  UNIQUE (provider, subject)
 );
 
 CREATE TABLE machines (
@@ -15,13 +18,13 @@ CREATE TABLE machines (
 );
 CREATE INDEX machines_owner ON machines(owner_id);
 
--- Shares are keyed by lowercased GitHub login so they can be granted before the person has signed in.
+-- Shares are keyed on the stable user id, never on the mutable display login.
 CREATE TABLE machine_shares (
   machine_id TEXT NOT NULL REFERENCES machines(id) ON DELETE CASCADE,
-  login TEXT NOT NULL,
-  PRIMARY KEY (machine_id, login)
+  user_id TEXT NOT NULL REFERENCES users(id) ON DELETE CASCADE,
+  PRIMARY KEY (machine_id, user_id)
 );
-CREATE INDEX machine_shares_login ON machine_shares(login);
+CREATE INDEX machine_shares_user ON machine_shares(user_id);
 
 -- Only the SHA-256 of a pairing code is stored.
 CREATE TABLE pairing_codes (

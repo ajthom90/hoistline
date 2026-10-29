@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -5,6 +6,8 @@ import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import type { OAuthClientInformationFull } from "@modelcontextprotocol/sdk/shared/auth.js";
 import { SqliteOAuthProvider } from "../src/auth/sqlite-provider.js";
 import { Store, type JobRow } from "../src/store.js";
+
+const sha256 = (value: string) => createHash("sha256").update(value).digest("hex");
 
 let dir: string;
 let clock: number;
@@ -44,7 +47,7 @@ function job(userId: string, machineId: string, id = "job-1"): JobRow {
 describe("pairing codes", () => {
   it("returns a machine once and null the second time", () => {
     const store = open();
-    const alice = store.upsertUser({ id: "1", login: "alice" });
+    const alice = store.upsertUser({ provider: "github", subject: "1", login: "alice" });
     const code = store.createPairingCode(alice.id);
     const machine = store.redeemPairingCode(code, "laptop", "pk");
     expect(machine).toMatchObject({ ownerId: alice.id, name: "laptop", publicKey: "pk" });
@@ -54,7 +57,7 @@ describe("pairing codes", () => {
 
   it("expires after 10 minutes", () => {
     const store = open();
-    const alice = store.upsertUser({ id: "1", login: "alice" });
+    const alice = store.upsertUser({ provider: "github", subject: "1", login: "alice" });
     const code = store.createPairingCode(alice.id);
     clock += 10 * 60 * 1000;
     expect(store.redeemPairingCode(code, "laptop", "pk")).toBeNull();
@@ -63,10 +66,13 @@ describe("pairing codes", () => {
 
   it("is redeemable just before expiry, ignoring case and dashes, and is not stored in clear", () => {
     const store = open();
-    const alice = store.upsertUser({ id: "1", login: "alice" });
+    const alice = store.upsertUser({ provider: "github", subject: "1", login: "alice" });
     const code = store.createPairingCode(alice.id);
     expect(code).toMatch(/^[0-9A-Z]{4}-[0-9A-Z]{4}-[0-9A-Z]{4}$/);
+    const normalized = code.replaceAll("-", "");
     const stored = store.db.prepare("SELECT code_hash FROM pairing_codes").all() as { code_hash: string }[];
+    expect(stored.map((r) => r.code_hash)).toEqual([sha256(normalized)]);
+    expect(stored.map((r) => r.code_hash)).not.toContain(normalized);
     expect(stored.map((r) => r.code_hash)).not.toContain(code);
     clock += 10 * 60 * 1000 - 1;
     expect(store.redeemPairingCode(code.toLowerCase().replaceAll("-", ""), "laptop", "pk")).not.toBeNull();
@@ -74,7 +80,7 @@ describe("pairing codes", () => {
 
   it("rejects unknown codes and sweeps expired ones", () => {
     const store = open();
-    const alice = store.upsertUser({ id: "1", login: "alice" });
+    const alice = store.upsertUser({ provider: "github", subject: "1", login: "alice" });
     expect(store.redeemPairingCode("NOPE-NOPE-NOPE", "x", "pk")).toBeNull();
     store.createPairingCode(alice.id);
     clock += 11 * 60 * 1000;
@@ -86,16 +92,16 @@ describe("pairing codes", () => {
 describe("machines and sharing", () => {
   function setup() {
     const store = open();
-    const alice = store.upsertUser({ id: "1", login: "Alice" });
-    const bob = store.upsertUser({ id: "2", login: "bob" });
+    const alice = store.upsertUser({ provider: "github", subject: "1", login: "Alice" });
+    const bob = store.upsertUser({ provider: "github", subject: "2", login: "bob" });
     const machine = store.redeemPairingCode(store.createPairingCode(alice.id), "laptop", "pk")!;
     return { store, alice, bob, machine };
   }
 
   it("upsertUser is stable per GitHub id and tracks login changes", () => {
     const store = open();
-    const a = store.upsertUser({ id: "1", login: "old" });
-    const b = store.upsertUser({ id: "1", login: "new" });
+    const a = store.upsertUser({ provider: "github", subject: "1", login: "old" });
+    const b = store.upsertUser({ provider: "github", subject: "1", login: "new" });
     expect(b.id).toBe(a.id);
     expect(b.login).toBe("new");
   });
@@ -123,19 +129,62 @@ describe("machines and sharing", () => {
     expect(store.getMachine(bob.id, machine.id)).toBeNull();
   });
 
-  it("a share can be granted before the person has signed in", () => {
+  it("sharing with a login that has not signed in throws", () => {
     const { store, alice, machine } = setup();
-    store.shareMachine(alice.id, machine.id, "carol");
-    const carol = store.upsertUser({ id: "3", login: "carol" });
-    expect(store.getMachine(carol.id, machine.id)?.id).toBe(machine.id);
+    expect(() => store.shareMachine(alice.id, machine.id, "carol")).toThrow(/has not signed in to Hoistline yet/);
+    expect(() => store.shareMachine(alice.id, machine.id, "")).toThrow(/has not signed in to Hoistline yet/);
+  });
+
+  it("sharing with an ambiguous login throws", () => {
+    const { store, alice, machine } = setup();
+    store.upsertUser({ provider: "oidc:https://idp", subject: "9", login: "bob" });
+    expect(() => store.shareMachine(alice.id, machine.id, "bob")).toThrow(/ambiguous login/);
+  });
+
+  it("a share survives the grantee renaming their login", () => {
+    const { store, alice, bob, machine } = setup();
+    store.shareMachine(alice.id, machine.id, "bob");
+    store.upsertUser({ provider: "github", subject: "2", login: "bob2" });
+    expect(store.getMachine(bob.id, machine.id)?.id).toBe(machine.id);
+    store.unshareMachine(alice.id, machine.id, "bob2");
+    expect(store.getMachine(bob.id, machine.id)).toBeNull();
+  });
+
+  it("a login taken over after a rename does not inherit the share", () => {
+    const { store, alice, bob, machine } = setup();
+    store.shareMachine(alice.id, machine.id, "bob");
+    store.upsertUser({ provider: "github", subject: "2", login: "bob2" });
+    const attacker = store.upsertUser({ provider: "github", subject: "666", login: "bob" });
+    expect(attacker.id).not.toBe(bob.id);
+    expect(store.getMachine(attacker.id, machine.id)).toBeNull();
+    expect(store.machinesFor(attacker.id)).toEqual([]);
+    expect(store.getMachine(bob.id, machine.id)?.id).toBe(machine.id);
+  });
+
+  it("a stale holder of a login (same provider) has the login cleared", () => {
+    const { store, alice, bob, machine } = setup();
+    // Bob's rename was never seen; a new subject signs in as "bob".
+    const attacker = store.upsertUser({ provider: "github", subject: "666", login: "Bob" });
+    expect(store.getMachine(attacker.id, machine.id)).toBeNull();
+    store.shareMachine(alice.id, machine.id, "bob");
+    expect(store.getMachine(attacker.id, machine.id)?.id).toBe(machine.id);
+    expect(store.getMachine(bob.id, machine.id)).toBeNull();
+  });
+
+  it("the same subject under different providers is two users", () => {
+    const store = open();
+    const gh = store.upsertUser({ provider: "github", subject: "42", login: "alice" });
+    const oidc = store.upsertUser({ provider: "oidc:https://idp", subject: "42", login: "alice2" });
+    expect(oidc.id).not.toBe(gh.id);
+    expect(store.upsertUser({ provider: "github", subject: "42", login: "alice" }).id).toBe(gh.id);
   });
 });
 
 describe("jobs", () => {
   function setup() {
     const store = open();
-    const alice = store.upsertUser({ id: "1", login: "alice" });
-    const bob = store.upsertUser({ id: "2", login: "bob" });
+    const alice = store.upsertUser({ provider: "github", subject: "1", login: "alice" });
+    const bob = store.upsertUser({ provider: "github", subject: "2", login: "bob" });
     const machine = store.redeemPairingCode(store.createPairingCode(alice.id), "laptop", "pk")!;
     return { store, alice, bob, machine };
   }
@@ -179,9 +228,9 @@ describe("persistence", () => {
 
   it("re-running migrations on an existing database is a no-op", () => {
     const first = open();
-    const alice = first.upsertUser({ id: "1", login: "alice" });
+    const alice = first.upsertUser({ provider: "github", subject: "1", login: "alice" });
     first.close();
-    expect(open().upsertUser({ id: "1", login: "alice" }).id).toBe(alice.id);
+    expect(open().upsertUser({ provider: "github", subject: "1", login: "alice" }).id).toBe(alice.id);
   });
 });
 
@@ -299,7 +348,17 @@ describe("SqliteOAuthProvider", () => {
     const { store, provider, client } = setup();
     const code = await provider.issueAuthorizationCode(client.client_id, params, user);
     const tokens = await provider.exchangeAuthorizationCode(client, code, undefined, params.redirectUri);
-    const dump = JSON.stringify(store.db.prepare("SELECT token_hash FROM oauth_tokens").all());
+    const unused = await provider.issueAuthorizationCode(client.client_id, params, user);
+    const codeHashes = (store.db.prepare("SELECT code_hash FROM oauth_codes").all() as { code_hash: string }[]).map(
+      (r) => r.code_hash,
+    );
+    expect(codeHashes).toEqual([sha256(unused)]);
+    expect(JSON.stringify(store.db.prepare("SELECT * FROM oauth_codes").all())).not.toContain(unused);
+    const tokenHashes = (store.db.prepare("SELECT token_hash FROM oauth_tokens").all() as { token_hash: string }[]).map(
+      (r) => r.token_hash,
+    );
+    expect(tokenHashes.sort()).toEqual([sha256(tokens.access_token), sha256(tokens.refresh_token!)].sort());
+    const dump = JSON.stringify(store.db.prepare("SELECT * FROM oauth_tokens").all());
     expect(dump).not.toContain(tokens.access_token);
     expect(dump).not.toContain(tokens.refresh_token!);
   });

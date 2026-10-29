@@ -4,7 +4,8 @@ import Database from "better-sqlite3";
 
 export interface User {
   id: string;
-  githubId: string;
+  provider: string;
+  subject: string;
   login: string;
   createdAt: number;
 }
@@ -108,21 +109,35 @@ export class Store {
     }
   }
 
-  upsertUser(github: { id: string; login: string }): User {
-    const githubId = String(github.id);
+  /**
+   * Finds or creates the user for an identity-provider subject. `provider` is "github" (subject = numeric id)
+   * or "oidc:<issuer>". The login is display-only. Logins are unique per provider, so another subject
+   * still holding the same login is stale and has its login cleared.
+   */
+  upsertUser(identity: { provider: string; subject: string; login: string }): User {
+    const { provider, subject, login } = identity;
     return this.db.transaction(() => {
-      const existing = this.db.prepare("SELECT * FROM users WHERE github_id = ?").get(githubId) as UserRecord | undefined;
+      const existing = this.db
+        .prepare("SELECT * FROM users WHERE provider = ? AND subject = ?")
+        .get(provider, subject) as UserRecord | undefined;
+      let record: UserRecord;
       if (existing) {
-        if (existing.login !== github.login) {
-          this.db.prepare("UPDATE users SET login = ? WHERE id = ?").run(github.login, existing.id);
-        }
-        return toUser({ ...existing, login: github.login });
+        this.db.prepare("UPDATE users SET login = ? WHERE id = ?").run(login, existing.id);
+        record = { ...existing, login };
+      } else {
+        record = { id: randomUUID(), provider, subject, login, created_at: this.now() };
+        this.db
+          .prepare(
+            "INSERT INTO users (id, provider, subject, login, created_at) VALUES (@id, @provider, @subject, @login, @created_at)",
+          )
+          .run(record);
       }
-      const row: UserRecord = { id: randomUUID(), github_id: githubId, login: github.login, created_at: this.now() };
-      this.db
-        .prepare("INSERT INTO users (id, github_id, login, created_at) VALUES (@id, @github_id, @login, @created_at)")
-        .run(row);
-      return toUser(row);
+      if (login) {
+        this.db
+          .prepare("UPDATE users SET login = '' WHERE provider = ? AND id != ? AND lower(login) = lower(?)")
+          .run(provider, record.id, login);
+      }
+      return toUser(record);
     })();
   }
 
@@ -169,7 +184,7 @@ export class Store {
       .prepare(
         `SELECT m.* FROM machines m
          WHERE m.owner_id = @userId
-            OR m.id IN (SELECT s.machine_id FROM machine_shares s JOIN users u ON lower(u.login) = s.login WHERE u.id = @userId)
+            OR m.id IN (SELECT machine_id FROM machine_shares WHERE user_id = @userId)
          ORDER BY m.created_at, m.id`,
       )
       .all({ userId }) as MachineRecord[];
@@ -184,19 +199,31 @@ export class Store {
     this.db.prepare("UPDATE machines SET last_seen_at = ? WHERE id = ?").run(this.now(), machineId);
   }
 
-  /** Only the owner may share. Throws when the machine is not the owner's. */
+  /**
+   * Only the owner may share. `withLogin` (case-insensitive display login) is resolved to a user id now and
+   * the share is keyed on that id. Throws if the machine is not the owner's, nobody with that login has
+   * signed in, or the login is ambiguous.
+   */
   shareMachine(ownerId: string, machineId: string, withLogin: string): void {
     this.requireOwned(ownerId, machineId);
-    this.db
-      .prepare("INSERT OR IGNORE INTO machine_shares (machine_id, login) VALUES (?, ?)")
-      .run(machineId, withLogin.trim().toLowerCase());
+    const userId = this.resolveLogin(withLogin);
+    this.db.prepare("INSERT OR IGNORE INTO machine_shares (machine_id, user_id) VALUES (?, ?)").run(machineId, userId);
   }
 
   unshareMachine(ownerId: string, machineId: string, withLogin: string): void {
     this.requireOwned(ownerId, machineId);
-    this.db
-      .prepare("DELETE FROM machine_shares WHERE machine_id = ? AND login = ?")
-      .run(machineId, withLogin.trim().toLowerCase());
+    const userId = this.resolveLogin(withLogin);
+    this.db.prepare("DELETE FROM machine_shares WHERE machine_id = ? AND user_id = ?").run(machineId, userId);
+  }
+
+  private resolveLogin(login: string): string {
+    const name = login.trim();
+    const rows = (name ? this.db.prepare("SELECT id FROM users WHERE lower(login) = lower(?)").all(name) : []) as {
+      id: string;
+    }[];
+    if (rows.length === 0) throw new Error(`${name} has not signed in to Hoistline yet`);
+    if (rows.length > 1) throw new Error(`ambiguous login: ${name}`);
+    return rows[0]!.id;
   }
 
   private requireOwned(ownerId: string, machineId: string): void {
@@ -257,7 +284,8 @@ function definedOnly<T extends object>(value: T): Partial<T> {
 
 interface UserRecord {
   id: string;
-  github_id: string;
+  provider: string;
+  subject: string;
   login: string;
   created_at: number;
 }
@@ -287,7 +315,13 @@ interface JobRecord {
   updated_at: number;
 }
 
-const toUser = (r: UserRecord): User => ({ id: r.id, githubId: r.github_id, login: r.login, createdAt: r.created_at });
+const toUser = (r: UserRecord): User => ({
+  id: r.id,
+  provider: r.provider,
+  subject: r.subject,
+  login: r.login,
+  createdAt: r.created_at,
+});
 
 function toMachine(r: MachineRecord): Machine {
   const machine: Machine = {
