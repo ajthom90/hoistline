@@ -1,6 +1,7 @@
 export {
   buildCommand,
   registerRunner,
+  registeredRunners,
   type RunnerCommand,
   type RunnerContext,
   type RunnerTemplate,

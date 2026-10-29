@@ -28,6 +28,11 @@ export function registerRunner(name: RunnerName, template: RunnerTemplate): void
   registry.set(name, template);
 }
 
+/** The names of the registered runners, in registration order. */
+export function registeredRunners(): RunnerName[] {
+  return [...registry.keys()];
+}
+
 /** @internal Test hook: empties the registry. */
 export function _resetRunnersForTests(): void {
   registry.clear();

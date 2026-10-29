@@ -45,6 +45,7 @@ export {
   museTemplate,
   registerBuiltinRunners,
   registerRunner,
+  registeredRunners,
   runJob,
   type OutputStream,
   type RunJobOptions,
@@ -71,3 +72,12 @@ export {
   type AgentHandlers,
   type ConnectOptions,
 } from "./connection.js";
+export {
+  createApprovalQueue,
+  escapeForTerminal,
+  type ApprovalDecision,
+  type ApprovalQueue,
+  type ApprovalQueueOptions,
+  type PendingApproval,
+} from "./approvals.js";
+export { AGENT_VERSION, main, type CliDeps, type CliIO } from "./cli.js";
