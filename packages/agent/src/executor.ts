@@ -50,7 +50,10 @@ export type ExecutorDeps = {
   cacheDir: string;
   /** Reports to the hub. May throw (not connected); the executor carries on. */
   send: (msg: AgentToHub) => void;
-  /** Read when a job starts, so policy edits apply without a restart. Default: the policy file, missing = deny all. */
+  /**
+   * Read when a job starts, so policy edits apply without a restart. Default: the policy file, missing or bad = deny
+   * all. A loader that throws fails the job with internal_error.
+   */
   loadPolicy?: () => PolicyConfig;
   /** Asks the owner about a job the policy marks `ask`. Default: deny. */
   requestApproval?: (req: ApprovalRequest) => Promise<boolean>;
@@ -349,7 +352,11 @@ export type Executor = {
    * arrival order, then finished jobs whose result the hub has not acknowledged yet.
    */
   runningJobs(): string[];
-  /** Sends every unacknowledged result again. Call it after every welcome. Never throws. */
+  /**
+   * Sends every unacknowledged result again. Never throws. Call it synchronously from the connection's onConnected
+   * (that is, inside the welcome handler): the hub's reconcile may follow the welcome with a job.cancel for a listed
+   * id, which discards the entry, so the replay must already be on the wire by then.
+   */
   flushOutbox(): void;
   /** Applies log retention, the log budget and the orphaned work sweep now (also run at start and hourly). */
   runMaintenance(): Promise<void>;
