@@ -10,7 +10,7 @@
     "node": ">=22"
   },
   "scripts": {
-    "test": "vitest run --passWithNoTests",
+    "test": "pnpm -r build && vitest run --passWithNoTests",
     "build": "pnpm -r build",
     "lint": "eslint ."
   },
