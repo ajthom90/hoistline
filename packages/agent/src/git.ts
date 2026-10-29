@@ -612,7 +612,7 @@ export async function prepareWorktree(
   jobId: string,
   cacheDir: string,
   opts: PrepareOptions = {},
-): Promise<{ dir: string; branch: string }> {
+): Promise<{ dir: string; branch: string; baseSha: string }> {
   const canonical = validateRepo(repo);
   const base = validateBranch(baseBranch);
   const id = validateJobId(jobId);
@@ -649,6 +649,7 @@ export async function prepareWorktree(
       // Exclusive create: the claim on this job id, also against another process using the same cache.
       await writeFile(record, `${canonical}\n`, { flag: "wx" }).catch(reuseOnExist(id));
       let createdDir = false;
+      let baseSha: string;
       try {
         await checkBaseComponents(git, mirror, base);
         // A runner can make the fetch destination a symbolic ref to a job branch, which the forced fetch would move.
@@ -662,17 +663,22 @@ export async function prepareWorktree(
         }
         await resetMirror(mirror, config);
         await checkBaseComponents(git, mirror, base);
+        // The fetched base commit, by object id, so the worktree starts exactly there.
+        baseSha = (
+          await git(["rev-parse", "--verify", "--end-of-options", `refs/remotes/origin/${base}^{commit}`])
+        ).stdout.trim();
+        if (!/^[0-9a-f]{40}$/.test(baseSha)) throw new GitError(`could not resolve base branch "${base}"`);
         // Created here (not by git, which accepts an existing empty directory), so it is known to be this job's.
         await mkdir(dir).catch(reuseOnExist(id));
         createdDir = true;
-        await git(["worktree", "add", "--quiet", "--no-track", "-b", branch, "--", dir, `refs/remotes/origin/${base}`]);
+        await git(["worktree", "add", "--quiet", "--no-track", "-b", branch, "--", dir, baseSha]);
       } catch (err) {
         if (createdDir) await rm(dir, { recursive: true, force: true });
         await unlink(record).catch(() => undefined);
         await git(["worktree", "prune"]).catch(() => undefined);
         throw err;
       }
-      return { dir, branch };
+      return { dir, branch, baseSha };
     }),
   );
 }
@@ -961,14 +967,15 @@ async function stageCaseRenames(git: Git, root: string): Promise<void> {
  * and through a fresh index read from the branch's commit, so nothing the runner left in the worktree's own index
  * (staged entries, assume-unchanged or skip-worktree flags) or admin dir (MERGE_HEAD, CHERRY_PICK_HEAD, message
  * files) shapes the commit. Returns `{ committed: false }` when there is nothing to commit (a runner that committed
- * itself leaves its commits on the branch).
+ * itself leaves its commits on the branch). `tip` is the branch's commit after the call either way; compare it with
+ * prepareWorktree's `baseSha` to tell whether the job produced anything.
  */
 export async function commitWorktree(
   repo: string,
   jobId: string,
   cacheDir: string,
   opts: PrepareOptions & { message?: string } = {},
-): Promise<{ committed: boolean; sha?: string }> {
+): Promise<{ committed: boolean; sha?: string; tip: string }> {
   const canonical = validateRepo(repo);
   const id = validateJobId(jobId);
   const cache = resolve(cacheDir);
@@ -1018,10 +1025,10 @@ export async function commitWorktree(
         ["diff", "--cached", "--quiet", "--no-ext-diff", "--no-textconv", "--ignore-submodules=none"],
         { okCodes: [1] },
       );
-      if (code === 0) return { committed: false };
+      if (code === 0) return { committed: false, tip: head };
       await git(["commit", "--quiet", "--no-verify", "-m", message]);
       const sha = (await mgit(["rev-parse", "--verify", "--end-of-options", ref])).stdout.trim();
-      return { committed: true, sha };
+      return { committed: true, sha, tip: sha };
     } finally {
       await rm(indexDir, { recursive: true, force: true });
     }

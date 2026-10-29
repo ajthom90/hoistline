@@ -255,7 +255,7 @@ describe("prepareWorktree", () => {
       allowFileProtocol: true,
     });
     expect(seen).toEqual(["owner/name"]);
-    expect(ws).toEqual({ dir: join(cache, "work", "job1"), branch: "hoistline/job1" });
+    expect(ws).toEqual({ dir: join(cache, "work", "job1"), branch: "hoistline/job1", baseSha: remoteSha("refs/heads/dev") });
     expect(readFileSync(join(ws.dir, "README"), "utf8")).toBe("dev\n");
     expect(fx(["symbolic-ref", "HEAD"], ws.dir).trim()).toBe("refs/heads/hoistline/job1");
     const mirror = join(cache, "repos", "owner__name.git");
@@ -1072,6 +1072,8 @@ describe("commitWorktree", () => {
     const mirror = mirrorOf(cache);
     expect(res.committed).toBe(true);
     expect(res.sha).toBe(shaIn(mirror, "refs/heads/hoistline/c1"));
+    expect(res.tip).toBe(res.sha);
+    expect(res.tip).not.toBe(ws.baseSha);
     expect(log(mirror, "refs/heads/hoistline/c1")).toEqual(["hoistline: job c1", "main"]);
     expect(show(mirror, "refs/heads/hoistline/c1", "README")).toBe("changed\n");
     expect(show(mirror, "refs/heads/hoistline/c1", "sub/new.txt")).toBe("new\n");
@@ -1087,10 +1089,12 @@ describe("commitWorktree", () => {
   it("returns committed:false when there is nothing to commit", async () => {
     const cache = temp();
     const ws = await prepareWorktree("o/n", "main", "c2", cache, file);
-    expect(await commitWorktree("o/n", "c2", cache, file)).toEqual({ committed: false });
+    // Nothing at all: the tip is still the base commit.
+    expect(await commitWorktree("o/n", "c2", cache, file)).toEqual({ committed: false, tip: ws.baseSha });
+    expect(ws.baseSha).toBe(remoteSha("refs/heads/main"));
     // A runner that committed itself: nothing new to commit, and the branch carries its commit.
     const head = runnerCommit(ws.dir, "own.txt");
-    expect(await commitWorktree("o/n", "c2", cache, file)).toEqual({ committed: false });
+    expect(await commitWorktree("o/n", "c2", cache, file)).toEqual({ committed: false, tip: head });
     expect(shaIn(mirrorOf(cache), "refs/heads/hoistline/c2")).toBe(head);
   });
 
