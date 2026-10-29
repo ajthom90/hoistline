@@ -55,7 +55,7 @@ const ran: JobSpec[] = [];
 
 /**
  * The fake runner: a node script driven by the job's prompt, a JSON object:
- * { stdout, stderr, big: {chunk, n}, write: {file: content}, commit, gate: path, sleepMs, exit }.
+ * { stdout, stderr, big: {chunk, n}, write: {file: content}, commit, gate: path, sleepMs, exit, ignoreTerm, pidFile }.
  */
 const RUNNER_SOURCE = `
 import { execFileSync } from "node:child_process";
@@ -63,6 +63,8 @@ import { existsSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 const [cwd, prompt] = process.argv.slice(2);
 const p = JSON.parse(prompt);
+if (p.ignoreTerm) process.on("SIGTERM", () => {});
+if (p.pidFile) writeFileSync(p.pidFile, String(process.pid));
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 if (p.stdout) process.stdout.write(p.stdout);
 if (p.stderr) process.stderr.write(p.stderr);
@@ -126,6 +128,8 @@ type Script = {
   gate?: string;
   sleepMs?: number;
   exit?: number;
+  ignoreTerm?: boolean;
+  pidFile?: string;
 };
 
 function sign(
@@ -371,6 +375,29 @@ describe("policy", () => {
     expect(h.statuses()).toEqual(["awaiting_approval"]);
     expect(h.result()).toEqual({ type: "job.result", jobId: signed.spec.jobId, status: "failed", reason: "approval_denied" });
     expect(ran.length).toBe(before);
+  });
+
+  it("fails approval_unavailable, not approval_denied, when the approval queue itself fails", async () => {
+    for (const requestApproval of [
+      async () => {
+        throw new Error("refusing approvals: owned by another user");
+      },
+      () => {
+        throw new Error("synchronous failure");
+      },
+    ]) {
+      const h = harness({ loadPolicy: () => RESTRICTED_ASK, requestApproval });
+      const before = ran.length;
+      const signed = sign();
+      await execute(signed, h.deps);
+      expect(h.result()).toEqual({
+        type: "job.result",
+        jobId: signed.spec.jobId,
+        status: "failed",
+        reason: "approval_unavailable",
+      });
+      expect(ran.length).toBe(before);
+    }
   });
 
   it("denies by default when nobody can approve", async () => {
@@ -981,6 +1008,55 @@ describe("scheduling", () => {
     await ex.close();
   });
 
+  it("fails approval_unavailable past maxAwaitingApproval, without asking or running", async () => {
+    const asked: string[] = [];
+    const answers: ((ok: boolean) => void)[] = [];
+    const h = harness({
+      loadPolicy: () => RESTRICTED_ASK,
+      requestApproval: (req) => {
+        asked.push(req.jobId);
+        return new Promise<boolean>((r) => answers.push(r));
+      },
+    });
+    const ex = createExecutor({ ...h.deps, maxAwaitingApproval: 2 });
+    const a = sign();
+    const b = sign();
+    const c = sign({ write: { "c.txt": "c" } });
+    assign(ex, a);
+    assign(ex, b);
+    await waitFor(() => asked.length === 2, "two approval requests");
+    assign(ex, c);
+    await waitFor(() => h.results().length === 1, "the third job's result");
+    expect(h.results()).toEqual([{ type: "job.result", jobId: c.spec.jobId, status: "failed", reason: "approval_unavailable" }]);
+    expect(asked).toEqual([a.spec.jobId, b.spec.jobId]);
+    expect(ranJob(c.spec.jobId)).toBe(false);
+    // An answered request frees its place.
+    answers[0]!(false);
+    await waitFor(() => h.results().length === 2, "the first job's result");
+    const d = sign();
+    assign(ex, d);
+    await waitFor(() => asked.length === 3, "a new approval request");
+    expect(asked[2]).toBe(d.spec.jobId);
+    await ex.close();
+  });
+
+  it("caps approval waiters at 20 by default", async () => {
+    let asked = 0;
+    const h = harness({
+      loadPolicy: () => RESTRICTED_ASK,
+      requestApproval: () => {
+        asked++;
+        return new Promise<boolean>(() => {});
+      },
+    });
+    const ex = createExecutor(h.deps);
+    for (let i = 0; i < 21; i++) assign(ex, sign());
+    await waitFor(() => h.results().length === 1, "the 21st job's result");
+    expect(asked).toBe(20);
+    expect(h.result()).toMatchObject({ status: "failed", reason: "approval_unavailable" });
+    await ex.close();
+  });
+
   it("fails agent_busy once maxQueuedJobs are waiting, without running it", async () => {
     const h = harness();
     const ex = createExecutor({ ...h.deps, maxConcurrentJobs: 1, maxQueuedJobs: 1 });
@@ -1050,6 +1126,39 @@ describe("cancellation", () => {
     await waitFor(() => h.results().length === 1, "result");
     expect(h.results()[0]).toMatchObject({ jobId: signed.spec.jobId, status: "cancelled" });
     await ex.close();
+  });
+});
+
+describe("forceStop", () => {
+  const alive = (pid: number) => {
+    try {
+      process.kill(pid, 0);
+      return true;
+    } catch {
+      return false;
+    }
+  };
+
+  it.runIf(posix)("SIGKILLs a runner that ignores SIGTERM at once, without waiting for the grace period", async () => {
+    const h = harness();
+    const ex = createExecutor(h.deps);
+    const dir = temp();
+    const pidFile = join(dir, "pid");
+    const signed = sign({ ignoreTerm: true, pidFile, gate: join(dir, "never") });
+    assign(ex, signed);
+    await waitFor(() => existsSync(pidFile) && readFileSync(pidFile, "utf8") !== "", "runner started");
+    const pid = Number(readFileSync(pidFile, "utf8"));
+    const closing = ex.close();
+    await sleep(300);
+    // SIGTERM was sent and ignored; the SIGKILL escalation is 1.5 s away.
+    expect(alive(pid)).toBe(true);
+    ex.forceStop();
+    await waitFor(() => !alive(pid), "runner killed", 700);
+    await closing;
+    expect(h.result()).toMatchObject({ status: "cancelled", reason: "agent_shutdown" });
+    // Later assignments are ignored.
+    assign(ex, sign());
+    expect(h.results()).toHaveLength(1);
   });
 });
 

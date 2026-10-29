@@ -3,6 +3,7 @@ import { realpath, stat } from "node:fs/promises";
 import { constants } from "node:os";
 import { StringDecoder } from "node:string_decoder";
 import type { JobSpec } from "@hoistline/protocol";
+import { trackProcessGroup } from "../children.js";
 import { buildCommand } from "./template.js";
 
 /** The runner's executable was not found on PATH. */
@@ -159,6 +160,8 @@ export async function runJob(
     throw new RunnerSpawnError((err as NodeJS.ErrnoException).code ?? (err as Error).message, err);
   }
 
+  // Until runJob settles, a forced stop (killTrackedProcessGroups) can SIGKILL the whole group at once.
+  const untrack = trackProcessGroup(child.pid);
   return new Promise<RunJobResult>((resolve, reject) => {
     let settled = false;
     let stopped: "aborted" | "timedOut" | null = null;
@@ -194,6 +197,7 @@ export async function runJob(
 
     const cleanup = () => {
       settled = true;
+      untrack();
       clearTimeout(timer);
       clearTimeout(pipeGrace);
       clearTimeout(reapTimer);

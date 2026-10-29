@@ -2,6 +2,7 @@ import { execFile, spawn } from "node:child_process";
 import { constants } from "node:fs";
 import { lstat, mkdir, mkdtemp, open, readdir, realpath, rm, unlink, writeFile } from "node:fs/promises";
 import { dirname, join, resolve, sep } from "node:path";
+import { trackProcessGroup } from "./children.js";
 import { canonicalRepo } from "./repo.js";
 
 // Everything in this module takes values from a signed job and runs git on the owner's machine, so every input is
@@ -248,9 +249,12 @@ function spawnGit(argv: string[], args: string[], cacheDir: string, opts: GitRun
     let failure: string | null = null;
     let settled = false;
     let grace: NodeJS.Timeout | undefined;
+    // Until settled, a forced stop (killTrackedProcessGroups) can SIGKILL git and its helpers at once.
+    const untrack = trackProcessGroup(child.pid);
     const settle = (err: GitError | null, result?: GitResult) => {
       if (settled) return;
       settled = true;
+      untrack();
       clearTimeout(timer);
       clearTimeout(grace);
       if (err) reject(err);

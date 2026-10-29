@@ -19,6 +19,7 @@ import {
   validateRepo,
   type PrepareOptions,
 } from "./git.js";
+import { killTrackedProcessGroups } from "./children.js";
 import { EventStreamer, OutputTail, enforceLogBudget, openJobLog, type Timers } from "./job-output.js";
 import { sweepOrphanWork } from "./maintenance.js";
 import { Outbox, type JobResult } from "./outbox.js";
@@ -99,6 +100,10 @@ type RunContext = {
   finish: (result: JobResult) => void;
   /** The job now waits for its owner: whatever it holds while waiting can be released. */
   onAwaitingApproval?: () => void;
+  /** About to ask the owner: false when too many jobs already wait for approval (the job then fails). */
+  beginAwaiting?: () => boolean;
+  /** The approval wait is over (answered, timed out, cancelled or failed). */
+  endAwaiting?: () => void;
   /** Approved: resolves once the job may run (or the signal aborts). */
   reacquire?: (signal: AbortSignal) => Promise<void>;
 };
@@ -241,18 +246,26 @@ async function decideAndRun(job: Admitted, ctx: RunContext): Promise<Outcome> {
   const decision = evaluateJob(policy, runSpec);
   if (decision.result === "deny") return { status: "failed", reason: sanitizeReason(decision.reason, deps.cacheDir) };
   if (decision.result === "ask") {
-    ctx.send({ type: "job.event", jobId, stream: "status", data: "awaiting_approval" });
-    ctx.onAwaitingApproval?.();
-    const answer = await askApproval(deps, signal, {
-      jobId,
-      userId,
-      spec: { ...runSpec },
-      reason: decision.reason,
-      specHash: specHash(runSpec),
-    });
+    if (ctx.beginAwaiting && !ctx.beginAwaiting()) return { status: "failed", reason: "approval_unavailable" };
+    let answer: Awaited<ReturnType<typeof askApproval>>;
+    try {
+      ctx.send({ type: "job.event", jobId, stream: "status", data: "awaiting_approval" });
+      ctx.onAwaitingApproval?.();
+      answer = await askApproval(deps, signal, {
+        jobId,
+        userId,
+        spec: { ...runSpec },
+        reason: decision.reason,
+        specHash: specHash(runSpec),
+      });
+    } finally {
+      ctx.endAwaiting?.();
+    }
     if (answer === "aborted") return cancelled(signal);
     if (answer === "timeout") return { status: "failed", reason: "approval_timeout" };
     if (answer === "denied") return { status: "failed", reason: "approval_denied" };
+    // The approval queue itself failed: nobody said no, so this is not a denial.
+    if (answer === "unavailable") return { status: "failed", reason: "approval_unavailable" };
     await ctx.reacquire?.(signal);
   }
   if (signal.aborted) return cancelled(signal);
@@ -277,12 +290,15 @@ async function decideAndRun(job: Admitted, ctx: RunContext): Promise<Outcome> {
   return outcome;
 }
 
-/** Resolves with the owner's answer, or "timeout", or "aborted"; an answer after an abort is ignored. */
+/**
+ * Resolves with the owner's answer, or "timeout", or "aborted", or "unavailable" when requestApproval fails (rejects
+ * or throws); an answer after an abort is ignored.
+ */
 async function askApproval(
   deps: ExecutorDeps,
   signal: AbortSignal,
   req: ApprovalRequest,
-): Promise<"approved" | "denied" | "timeout" | "aborted"> {
+): Promise<"approved" | "denied" | "timeout" | "aborted" | "unavailable"> {
   const setT = deps.setTimeout ?? defaultSetTimeout;
   const clearT = deps.clearTimeout ?? ((h: unknown) => clearTimeout(h as NodeJS.Timeout));
   if (!deps.requestApproval) return "denied";
@@ -300,7 +316,7 @@ async function askApproval(
         .then(() => deps.requestApproval!({ ...req, signal: AbortSignal.any([signal, stopWaiting.signal]) }))
         .then(
           (ok) => settle(ok === true ? "approved" : "denied"),
-          () => settle("denied"),
+          () => settle("unavailable"),
         );
     });
   } finally {
@@ -378,6 +394,11 @@ export type Executor = {
   runMaintenance(): Promise<void>;
   /** Cancels every job (reason agent_shutdown) and resolves once they have all settled. Later assignments are ignored. */
   close(): Promise<void>;
+  /**
+   * The forced stop (a second Ctrl-C): cancels every job like close and synchronously SIGKILLs every runner and git
+   * process group still running, without the SIGTERM grace period. Later assignments are ignored.
+   */
+  forceStop(): void;
 };
 
 export type CreateExecutorOptions = ExecutorDeps & {
@@ -385,6 +406,8 @@ export type CreateExecutorOptions = ExecutorDeps & {
   maxConcurrentJobs?: number;
   /** Jobs that may wait for a slot; more fail with agent_busy. Default 200. */
   maxQueuedJobs?: number;
+  /** Jobs that may wait for the owner's approval at once; more fail with approval_unavailable unasked. Default 20. */
+  maxAwaitingApproval?: number;
   /** Total size of the job logs; the oldest finished logs go first. Default 1 GiB. */
   maxTotalLogBytes?: number;
   /** Unacknowledged results kept; past this the oldest is dropped. Default 1000. */
@@ -427,6 +450,7 @@ export function createExecutorInternal(opts: CreateExecutorOptions, internal: In
   const git = gitOf(internal);
   const max = Math.max(1, opts.maxConcurrentJobs ?? 2);
   const maxQueued = Math.max(0, opts.maxQueuedJobs ?? 200);
+  const maxAwaiting = Math.max(0, opts.maxAwaitingApproval ?? 20);
   const now = deps.now ?? Date.now;
   const send = safeSend(deps);
   const outbox = new Outbox(deps.cacheDir, { maxEntries: opts.outboxMaxEntries, now, onDrop: opts.onOutboxDrop });
@@ -440,6 +464,7 @@ export function createExecutorInternal(opts: CreateExecutorOptions, internal: In
   let served = 0;
   let seq = 0;
   let queuedCount = 0;
+  let awaitingCount = 0;
   let closed = false;
 
   function deliver(result: JobResult): void {
@@ -541,6 +566,14 @@ export function createExecutorInternal(opts: CreateExecutorOptions, internal: In
         release(entry);
         pump();
       },
+      beginAwaiting: () => {
+        if (awaitingCount >= maxAwaiting) return false;
+        awaitingCount++;
+        return true;
+      },
+      endAwaiting: () => {
+        awaitingCount--;
+      },
       reacquire: (signal) => reacquire(entry, signal),
     }).finally(() => {
       release(entry);
@@ -607,6 +640,21 @@ export function createExecutorInternal(opts: CreateExecutorOptions, internal: In
     addTombstone(jobId);
   }
 
+  /** Stops accepting jobs and cancels every one held (reason agent_shutdown); returns the running jobs' completions. */
+  function stopAll(): Promise<void>[] {
+    if (!closed) {
+      closed = true;
+      clearRepeat(timer);
+    }
+    for (const entry of [...entries.values()]) if (entry.queued) cancelQueued(entry, "agent_shutdown");
+    const settling: Promise<void>[] = [];
+    for (const entry of entries.values()) {
+      entry.controller.abort("agent_shutdown");
+      if (entry.done) settling.push(entry.done);
+    }
+    return settling;
+  }
+
   let maintenance: Promise<void> = Promise.resolve();
   function runMaintenance(): Promise<void> {
     maintenance = maintenance.then(async () => {
@@ -662,18 +710,15 @@ export function createExecutorInternal(opts: CreateExecutorOptions, internal: In
     },
     runMaintenance,
     async close() {
-      if (!closed) {
-        closed = true;
-        clearRepeat(timer);
-      }
-      for (const entry of [...entries.values()]) if (entry.queued) cancelQueued(entry, "agent_shutdown");
-      const settling: Promise<void>[] = [];
-      for (const entry of entries.values()) {
-        entry.controller.abort("agent_shutdown");
-        if (entry.done) settling.push(entry.done);
-      }
-      await Promise.all(settling);
+      await Promise.all(stopAll());
       await maintenance;
+    },
+    forceStop() {
+      try {
+        stopAll();
+      } finally {
+        killTrackedProcessGroups();
+      }
     },
   };
 }
