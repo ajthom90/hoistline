@@ -22,6 +22,17 @@ export {
 } from "./policy.js";
 export { runSetup, type SetupIO } from "./setup.js";
 export {
+  GitError,
+  prepareWorktree,
+  pushBranch,
+  removeWorktree,
+  validateBranch,
+  validateJobId,
+  validateRepo,
+  type PrepareOptions,
+} from "./git.js";
+export { buildCommand, registerRunner, type RunnerCommand, type RunnerTemplate } from "./runners/index.js";
+export {
   agentSocketUrl,
   connect,
   type AgentConnection,
