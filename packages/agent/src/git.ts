@@ -1,19 +1,47 @@
 import { execFile, spawn } from "node:child_process";
-import { lstat, mkdir, mkdtemp, readdir, readFile, realpath, rm, unlink, writeFile } from "node:fs/promises";
+import { constants } from "node:fs";
+import { lstat, mkdir, mkdtemp, open, readdir, realpath, rm, unlink, writeFile } from "node:fs/promises";
 import { dirname, join, resolve, sep } from "node:path";
 import { canonicalRepo } from "./repo.js";
 
 // Everything in this module takes values from a signed job and runs git on the owner's machine, so every input is
 // treated as hostile until validated. Git always runs as a child process with an argument array (never a shell),
 // with `--` before user-derived positionals, a scrubbed environment, and `-c` overrides that disable hooks,
-// fsmonitor, replace refs, the commit-graph, submodule recursion and every transport except https.
+// fsmonitor, replace refs, the commit-graph, reflogs, submodule recursion and every transport except https.
 //
-// The runner (an unsandboxed CLI) works in a worktree that shares the mirror's git directory, so it can write the
-// mirror's config, info/attributes and hooks, and it owns the worktree's `.git` file. The agent therefore never runs
-// git through the worktree, stores no remote in the mirror, and resets the mirror before every fetch, worktree add
-// and push.
+// The runner (an unsandboxed CLI) works in a worktree that shares the mirror's git directory, so it can write
+// anything in the mirror (config, hooks, refs, metadata files, symlinks) and it owns the worktree's `.git` file. The
+// agent therefore never runs git through the worktree, stores no remote in the mirror, resets the mirror before every
+// fetch, worktree add, commit and push, never follows a symlink it did not create, and commits through its own
+// fresh index.
 
 const DEFAULT_TIMEOUT_MS = 5 * 60 * 1000;
+/** How long a killed git may take to close its pipes before the call is failed anyway. */
+const DEFAULT_KILL_GRACE_MS = 5_000;
+/** Upper bound on any small control file the agent reads (gitdir, HEAD, job ownership records). */
+const CONTROL_FILE_MAX = 4096;
+const MAX_WORKTREE_RECORDS = 10_000;
+const MAX_TRACKED_PATHS = 200_000;
+/**
+ * Per-worktree state a runner can leave in its admin dir that changes what `git commit` records: MERGE_HEAD adds
+ * parents, CHERRY_PICK_HEAD supplies the author, the message files supply text. COMMIT_EDITMSG and logs are written
+ * by commit and could be symlinks to files outside the cache.
+ */
+const COMMIT_STATE = [
+  "MERGE_HEAD",
+  "MERGE_MSG",
+  "MERGE_MODE",
+  "CHERRY_PICK_HEAD",
+  "REVERT_HEAD",
+  "REBASE_HEAD",
+  "AUTO_MERGE",
+  "SQUASH_MSG",
+  "sequencer",
+  "rebase-merge",
+  "rebase-apply",
+  "COMMIT_EDITMSG",
+  "logs",
+];
 const MAX_BUFFER = 16 * 1024 * 1024;
 const JOB_ID = /^[A-Za-z0-9][A-Za-z0-9_-]{0,63}$/;
 const BRANCH_CHARS = /^[A-Za-z0-9._/-]{1,255}$/;
@@ -116,6 +144,8 @@ export type GitRunOptions = {
   cwd?: string;
   allowFileProtocol?: boolean;
   timeoutMs?: number;
+  /** After a kill, how long to wait for git's pipes to close before failing anyway. */
+  killGraceMs?: number;
   /** Variables set on top of the scrubbed environment (the agent's own GIT_DIR / GIT_COMMON_DIR pins). */
   env?: Record<string, string>;
   /** Non-zero exit codes that are results, not failures (for example 1 from `diff --quiet`). */
@@ -139,16 +169,16 @@ export function scrubbedEnv(): NodeJS.ProcessEnv {
   return env;
 }
 
-function hooksDir(cacheDir: string): string {
-  return join(cacheDir, "empty-hooks");
-}
-
-function hardeningFlags(cacheDir: string, allowFileProtocol: boolean): string[] {
+function hardeningFlags(hooksPath: string, allowFileProtocol: boolean): string[] {
   const config = [
     "protocol.allow=never",
     ...BLOCKED_PROTOCOLS.map((p) => `protocol.${p}.allow=${p === "file" && allowFileProtocol ? "always" : "never"}`),
     "protocol.https.allow=always",
-    `core.hooksPath=${hooksDir(cacheDir)}`,
+    // Hooks run even with --no-verify (post-checkout, reference-transaction, prepare-commit-msg), so hooksPath must
+    // name a place that cannot hold any: /dev/null, or on Windows a directory created empty for this one call.
+    `core.hooksPath=${hooksPath}`,
+    // Reflogs are written through whatever is at logs/<ref>, which a runner can make a symlink.
+    "core.logAllRefUpdates=false",
     "core.fsmonitor=false",
     "core.sshCommand=false",
     "core.useReplaceRefs=false",
@@ -182,9 +212,19 @@ function killTree(pid: number | undefined): void {
 /** Runs git with the hardened flags and environment. Internal; exported for tests. */
 export async function runGit(args: string[], opts: GitRunOptions): Promise<GitResult> {
   const cacheDir = resolve(opts.cacheDir);
-  await mkdir(hooksDir(cacheDir), { recursive: true });
-  const argv = [...hardeningFlags(cacheDir, opts.allowFileProtocol === true), ...args];
+  await mkdir(cacheDir, { recursive: true });
+  // A fresh directory per call where /dev/null does not exist, so nothing planted earlier can be in it.
+  const hooks = process.platform === "win32" ? await mkdtemp(join(cacheDir, "hooks-")) : "/dev/null";
+  try {
+    return await spawnGit([...hardeningFlags(hooks, opts.allowFileProtocol === true), ...args], args, cacheDir, opts);
+  } finally {
+    if (hooks !== "/dev/null") await rm(hooks, { recursive: true, force: true });
+  }
+}
+
+function spawnGit(argv: string[], args: string[], cacheDir: string, opts: GitRunOptions): Promise<GitResult> {
   const timeoutMs = opts.timeoutMs ?? DEFAULT_TIMEOUT_MS;
+  const graceMs = opts.killGraceMs ?? DEFAULT_KILL_GRACE_MS;
   // The subcommand, for error messages: the first positional that is not the value of a global option.
   const sub =
     args.find((a, i) => !a.startsWith("-") && !["--git-dir", "--work-tree", "-c", "-C"].includes(args[i - 1] ?? "")) ??
@@ -202,10 +242,27 @@ export async function runGit(args: string[], opts: GitRunOptions): Promise<GitRe
     let stdout = "";
     let stderr = "";
     let failure: string | null = null;
+    let settled = false;
+    let grace: NodeJS.Timeout | undefined;
+    const settle = (err: GitError | null, result?: GitResult) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      clearTimeout(grace);
+      if (err) reject(err);
+      else resolvePromise(result as GitResult);
+    };
     const fail = (why: string) => {
       if (failure !== null) return;
       failure = why;
       killTree(child.pid);
+      // A descendant that left the process group (or a failed taskkill) can keep the pipes open, and then "close"
+      // never comes. Give up on it after a bounded wait, so the caller (and the repo lock) is always released.
+      grace = setTimeout(() => {
+        child.stdout.destroy();
+        child.stderr.destroy();
+        settle(new GitError(`git ${sub} failed${why}`, stderr));
+      }, graceMs);
     };
     const timer = setTimeout(() => fail(" (timed out)"), timeoutMs);
     child.stdout.setEncoding("utf8").on("data", (c: string) => {
@@ -225,38 +282,37 @@ export async function runGit(args: string[], opts: GitRunOptions): Promise<GitRe
       stderr += c;
       if (stderr.length > MAX_BUFFER) fail(" (output too large)");
     });
-    child.on("error", (err) => {
-      clearTimeout(timer);
-      reject(new GitError(`git ${sub} failed: ${err.message}`));
-    });
+    child.on("error", (err) => settle(new GitError(`git ${sub} failed: ${err.message}`)));
     child.on("close", (code) => {
-      clearTimeout(timer);
       if (failure !== null || code === null || (code !== 0 && !opts.okCodes?.includes(code))) {
         // Make sure no helper outlives a failed command.
         if (failure === null) killTree(child.pid);
-        reject(new GitError(`git ${sub} failed${failure ?? ""}`, stderr));
+        settle(new GitError(`git ${sub} failed${failure ?? ""}`, stderr));
       } else {
-        resolvePromise({ stdout, stderr, code });
+        settle(null, { stdout, stderr, code });
       }
     });
   });
 }
 
-// Per-repo async mutex: concurrent jobs on one repo must not fetch into, add worktrees to, or push from the mirror
-// at once.
-const repoLocks = new Map<string, Promise<unknown>>();
+// Async mutexes, keyed by mirror path (concurrent jobs on one repo must not fetch into, add worktrees to, commit in
+// or push from the mirror at once) and by job id across the whole cache (two repos must not claim one work dir).
+// Lock order: a job lock is always taken before a repo lock.
+const locks = new Map<string, Promise<unknown>>();
 
-async function withRepoLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
-  const previous = repoLocks.get(key) ?? Promise.resolve();
+async function withLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
+  const previous = locks.get(key) ?? Promise.resolve();
   const run = previous.then(fn, fn);
   const tail = run.catch(() => undefined);
-  repoLocks.set(key, tail);
+  locks.set(key, tail);
   try {
     return await run;
   } finally {
-    if (repoLocks.get(key) === tail) repoLocks.delete(key);
+    if (locks.get(key) === tail) locks.delete(key);
   }
 }
+
+const jobLockKey = (cache: string, id: string) => `${cache}\0job\0${id}`;
 
 async function exists(path: string): Promise<boolean> {
   try {
@@ -297,10 +353,39 @@ async function assertRealDir(path: string): Promise<void> {
   if (!(await lstatOrNull(path))?.isDirectory()) throw new Error(`refusing to use ${path}: not a plain directory`);
 }
 
-/** Reads a small control file only if it is a regular file (never through a symlink). */
-async function readRegularFile(path: string): Promise<string | null> {
+/** Creates `path` if missing (its parent must exist), then requires it to be a real directory, not a symlink. */
+async function ensureRealDir(path: string): Promise<void> {
+  await mkdir(path).catch((err: NodeJS.ErrnoException) => {
+    if (err.code !== "EEXIST") throw err;
+  });
+  await assertRealDir(path);
+}
+
+/**
+ * Reads a small control file: only a regular file (never through a symlink, never a FIFO), and only if it is at most
+ * `max` bytes. Anything else reads as null.
+ */
+async function readControlFile(path: string, max = CONTROL_FILE_MAX): Promise<string | null> {
   if (!(await lstatOrNull(path))?.isFile()) return null;
-  return readFile(path, "utf8");
+  const flags = constants.O_RDONLY | (constants.O_NOFOLLOW ?? 0) | (constants.O_NONBLOCK ?? 0);
+  const handle = await open(path, flags).catch(() => null);
+  if (handle === null) return null;
+  try {
+    const stat = await handle.stat();
+    if (!stat.isFile() || stat.size > max) return null;
+    const buf = Buffer.alloc(max + 1);
+    const { bytesRead } = await handle.read(buf, 0, max + 1, 0);
+    return bytesRead > max ? null : buf.subarray(0, bytesRead).toString("utf8");
+  } finally {
+    await handle.close();
+  }
+}
+
+/** The entries of `<mirror>/worktrees`, refusing an unreasonable number of them. */
+async function listWorktreeRecords(worktrees: string): Promise<string[]> {
+  const entries = await readdir(worktrees);
+  if (entries.length > MAX_WORKTREE_RECORDS) throw new Error(`refusing to use ${worktrees}: too many worktree records`);
+  return entries;
 }
 
 /**
@@ -327,21 +412,22 @@ export function parsePlatformConfig(text: string): PlatformConfig {
   return ordered;
 }
 
-let platformProbe: Promise<PlatformConfig> | null = null;
+const platformProbes = new Map<string, Promise<PlatformConfig>>();
 
 /**
- * How this machine's filesystem behaves, as `git init` detects it (case folding, Unicode precomposition, file modes,
- * symlinks). Probed once per process in a throwaway repository under the cache, which is removed afterwards.
+ * How the cache's filesystem behaves, as `git init` detects it (case folding, Unicode precomposition, file modes,
+ * symlinks). Probed once per cache dir in a throwaway repository under it, which is removed afterwards.
  * Internal; exported for tests.
  */
 export function probePlatformConfig(cacheDir: string): Promise<PlatformConfig> {
-  if (platformProbe === null) {
-    platformProbe = runPlatformProbe(resolve(cacheDir));
-    platformProbe.catch(() => {
-      platformProbe = null;
-    });
+  const cache = resolve(cacheDir);
+  let probe = platformProbes.get(cache);
+  if (probe === undefined) {
+    probe = runPlatformProbe(cache);
+    platformProbes.set(cache, probe);
+    probe.catch(() => platformProbes.delete(cache));
   }
-  return platformProbe;
+  return probe;
 }
 
 async function runPlatformProbe(cache: string): Promise<PlatformConfig> {
@@ -349,8 +435,9 @@ async function runPlatformProbe(cache: string): Promise<PlatformConfig> {
   await assertRealDir(cache);
   const dir = await mkdtemp(join(cache, "probe-"));
   try {
-    await runGit(["init", "--quiet", "--", dir], { cacheDir: cache });
-    const text = await readRegularFile(join(dir, ".git", "config"));
+    // An empty --template: the owner's init.templateDir could otherwise supply the very values being probed.
+    await runGit(["init", "--quiet", "--template=", "--", dir], { cacheDir: cache });
+    const text = await readControlFile(join(dir, ".git", "config"), 64 * 1024);
     if (text === null) throw new Error("could not probe the platform's git settings");
     return parsePlatformConfig(text);
   } finally {
@@ -358,9 +445,9 @@ async function runPlatformProbe(cache: string): Promise<PlatformConfig> {
   }
 }
 
-/** @internal Forgets the cached platform probe. Tests only. */
+/** @internal Forgets the cached platform probes. Tests only. */
 export function _resetPlatformProbeForTests(): void {
-  platformProbe = null;
+  platformProbes.clear();
 }
 
 /** The whole of a mirror's config: the fixed template plus the probed platform values. Internal; exported for tests. */
@@ -379,8 +466,9 @@ async function platformFlags(cacheDir: string): Promise<string[]> {
  * Undoes anything a runner may have written into the shared git directory, without ever following a symlink: the
  * config is rewritten from a fixed template (no remote, url, include, credential, http, filter or core.* overrides
  * beyond the probed platform values), the hooks directory is recreated empty, and commondir, gitdir,
- * config.worktree, every worktrees/<x>/config.worktree, info/attributes, info/exclude, refs/replace and the object
- * alternates are deleted. A targeted list, so a concurrent job's lock files survive.
+ * config.worktree, FETCH_HEAD, shallow, logs, info/attributes, info/exclude, info/grafts, refs/replace, the object
+ * alternates and every worktrees/<x>/config.worktree and worktrees/<x>/logs are deleted. A targeted list, so a
+ * concurrent job's lock files survive.
  */
 async function resetMirror(mirror: string, config: string): Promise<void> {
   await assertRealDir(dirname(mirror));
@@ -390,10 +478,12 @@ async function resetMirror(mirror: string, config: string): Promise<void> {
   const configPath = join(mirror, "config");
   await removeEntry(configPath);
   await writeFile(configPath, config, { flag: "wx" });
-  for (const name of ["commondir", "gitdir", "config.worktree"]) await removeEntry(join(mirror, name));
+  // shallow (like info/grafts) rewrites ancestry; FETCH_HEAD and logs are written through whatever is in place.
+  for (const name of ["commondir", "gitdir", "config.worktree", "FETCH_HEAD", "shallow", "logs"]) {
+    await removeEntry(join(mirror, name));
+  }
   if (await realDirOrRemove(join(mirror, "info"))) {
-    await removeEntry(join(mirror, "info", "attributes"));
-    await removeEntry(join(mirror, "info", "exclude"));
+    for (const name of ["attributes", "exclude", "grafts"]) await removeEntry(join(mirror, "info", name));
   }
   // Packed replace refs survive this; GIT_NO_REPLACE_OBJECTS and core.useReplaceRefs=false cover those.
   if ((await lstatOrNull(join(mirror, "refs")))?.isDirectory()) await removeEntry(join(mirror, "refs", "replace"));
@@ -404,9 +494,12 @@ async function resetMirror(mirror: string, config: string): Promise<void> {
   }
   const worktrees = join(mirror, "worktrees");
   if (await realDirOrRemove(worktrees)) {
-    for (const entry of await readdir(worktrees)) {
+    for (const entry of await listWorktreeRecords(worktrees)) {
       const admin = join(worktrees, entry);
-      if (await realDirOrRemove(admin)) await removeEntry(join(admin, "config.worktree"));
+      if (await realDirOrRemove(admin)) {
+        await removeEntry(join(admin, "config.worktree"));
+        await removeEntry(join(admin, "logs"));
+      }
     }
   }
   const hooks = join(mirror, "hooks");
@@ -420,23 +513,30 @@ export type PrepareOptions = {
   /** Test hook: permits the file transport. Never set outside tests. */
   allowFileProtocol?: boolean;
   timeoutMs?: number;
+  killGraceMs?: number;
 };
+
+type CallOptions = Pick<GitRunOptions, "okCodes" | "onStdout">;
+type Git = (args: string[], extra?: CallOptions) => Promise<GitResult>;
 
 /**
  * Git scoped to the mirror. GIT_DIR and GIT_COMMON_DIR are pinned in the environment because git otherwise honors a
  * `commondir` file planted in the mirror and would read another repository's config. Internal; exported for tests.
  */
-export function mirrorGit(cache: string, mirror: string, opts: PrepareOptions) {
-  return (args: string[]) =>
+export function mirrorGit(cache: string, mirror: string, opts: PrepareOptions): Git {
+  return (args, extra = {}) =>
     runGit(["--git-dir", mirror, ...args], {
       cacheDir: cache,
       allowFileProtocol: opts.allowFileProtocol,
       timeoutMs: opts.timeoutMs,
+      killGraceMs: opts.killGraceMs,
+      okCodes: extra.okCodes,
+      onStdout: extra.onStdout,
       env: { GIT_DIR: mirror, GIT_COMMON_DIR: mirror },
     });
 }
 
-async function branchExists(git: (args: string[]) => Promise<unknown>, ref: string): Promise<boolean> {
+async function branchExists(git: Git, ref: string): Promise<boolean> {
   return git(["show-ref", "--verify", "--quiet", ref]).then(
     () => true,
     () => false,
@@ -444,9 +544,36 @@ async function branchExists(git: (args: string[]) => Promise<unknown>, ref: stri
 }
 
 /**
+ * The commit a job branch points at. A runner can turn `hoistline/<id>` into a symbolic ref to another job's branch,
+ * and committing or pushing through it would act on that branch, so a symbolic ref is refused.
+ */
+async function jobBranchSha(git: Git, ref: string, verb: string): Promise<string> {
+  if ((await git(["symbolic-ref", "-q", ref], { okCodes: [1] })).code === 0) {
+    throw new Error(`refusing to ${verb}: ${ref} is a symbolic ref`);
+  }
+  const res = await git(["rev-parse", "--verify", "-q", "--end-of-options", `${ref}^{commit}`], { okCodes: [1] });
+  const sha = res.stdout.trim();
+  if (res.code !== 0 || !/^[0-9a-f]{40}$/.test(sha)) {
+    throw new Error(`refusing to ${verb}: no branch ${ref.slice("refs/heads/".length)}`);
+  }
+  return sha;
+}
+
+const jobReused = (id: string) =>
+  new Error(`job id "${id}" was already used on this machine; refusing to reuse its worktree`);
+
+/** Turns EEXIST into the job-reuse error; rethrows anything else. */
+function reuseOnExist(id: string) {
+  return (err: NodeJS.ErrnoException): never => {
+    throw err.code === "EEXIST" ? jobReused(id) : err;
+  };
+}
+
+/**
  * Prepares `<cacheDir>/work/<jobId>` as a worktree of the persistent bare mirror `<cacheDir>/repos/<owner>__<name>.git`,
- * on a new branch `hoistline/<jobId>` created from the remote's `baseBranch`. A job id that already has a worktree or
- * branch is refused.
+ * on a new branch `hoistline/<jobId>` created from the remote's `baseBranch`. A job id is claimed for one repository
+ * by an ownership record `<cacheDir>/jobs/<jobId>`; a job id that already has a record, worktree or branch is refused.
+ * On failure only what this call created is removed.
  */
 export async function prepareWorktree(
   repo: string,
@@ -466,42 +593,54 @@ export async function prepareWorktree(
   const git = mirrorGit(cache, mirror, opts);
   const config = await mirrorConfig(cache);
 
-  return withRepoLock(mirror, async () => {
-    if (!(await exists(join(mirror, "HEAD")))) {
-      await mkdir(dirname(mirror), { recursive: true });
-      await assertRealDir(dirname(mirror));
-      // Pin the formats so the fixed config template always matches the repository on disk.
-      await runGit(
-        ["-c", "init.defaultObjectFormat=sha1", "-c", "init.defaultRefFormat=files", "init", "--quiet", "--bare", "--",
-          mirror],
-        { cacheDir: cache, timeoutMs: opts.timeoutMs },
-      );
-    }
-    await resetMirror(mirror, config);
+  return withLock(jobLockKey(cache, id), () =>
+    withLock(mirror, async () => {
+      // Every directory git will create things in is checked before git runs: a symlink here would send the mirror,
+      // the worktree or a cleanup anywhere on disk.
+      for (const name of ["repos", "work", "jobs"]) await ensureRealDir(join(cache, name));
+      const mirrorStat = await lstatOrNull(mirror);
+      if (mirrorStat && !mirrorStat.isDirectory()) throw new Error(`refusing to use ${mirror}: not a plain directory`);
+      if (!(await exists(join(mirror, "HEAD")))) {
+        // Pin the formats so the fixed config template always matches the repository on disk.
+        await runGit(
+          ["-c", "init.defaultObjectFormat=sha1", "-c", "init.defaultRefFormat=files", "init", "--quiet", "--bare",
+            "--", mirror],
+          { cacheDir: cache, timeoutMs: opts.timeoutMs, killGraceMs: opts.killGraceMs },
+        );
+      }
+      await resetMirror(mirror, config);
 
-    if ((await exists(dir)) || (await branchExists(git, `refs/heads/${branch}`))) {
-      throw new Error(`job id "${id}" was already used on this machine; refusing to reuse its worktree`);
-    }
-
-    try {
-      await git(["fetch", "--quiet", "--no-tags", "--no-recurse-submodules", "--", url,
-        `+refs/heads/${base}:refs/remotes/origin/${base}`]);
-    } catch (err) {
-      const e = err as GitError;
-      throw new GitError(`could not fetch base branch "${base}" of ${canonical}`, e.stderr || e.message);
-    }
-
-    await resetMirror(mirror, config);
-    await mkdir(dirname(dir), { recursive: true });
-    try {
-      await git(["worktree", "add", "--quiet", "--no-track", "-b", branch, "--", dir, `refs/remotes/origin/${base}`]);
-    } catch (err) {
-      await rm(dir, { recursive: true, force: true });
-      await git(["worktree", "prune"]).catch(() => undefined);
-      throw err;
-    }
-    return { dir, branch };
-  });
+      const record = join(cache, "jobs", id);
+      if ((await exists(record)) || (await exists(dir)) || (await branchExists(git, `refs/heads/${branch}`))) {
+        throw jobReused(id);
+      }
+      // Exclusive create: the claim on this job id, also against another process using the same cache.
+      await writeFile(record, `${canonical}\n`, { flag: "wx" }).catch(reuseOnExist(id));
+      let createdDir = false;
+      try {
+        // A runner can make the fetch destination a symbolic ref to a job branch, which the forced fetch would move.
+        await git(["update-ref", "-d", "--no-deref", `refs/remotes/origin/${base}`]);
+        try {
+          await git(["fetch", "--quiet", "--no-tags", "--no-recurse-submodules", "--no-write-fetch-head", "--", url,
+            `+refs/heads/${base}:refs/remotes/origin/${base}`]);
+        } catch (err) {
+          const e = err as GitError;
+          throw new GitError(`could not fetch base branch "${base}" of ${canonical}`, e.stderr || e.message);
+        }
+        await resetMirror(mirror, config);
+        // Created here (not by git, which accepts an existing empty directory), so it is known to be this job's.
+        await mkdir(dir).catch(reuseOnExist(id));
+        createdDir = true;
+        await git(["worktree", "add", "--quiet", "--no-track", "-b", branch, "--", dir, `refs/remotes/origin/${base}`]);
+      } catch (err) {
+        if (createdDir) await rm(dir, { recursive: true, force: true });
+        await unlink(record).catch(() => undefined);
+        await git(["worktree", "prune"]).catch(() => undefined);
+        throw err;
+      }
+      return { dir, branch };
+    }),
+  );
 }
 
 /**
@@ -523,17 +662,19 @@ export async function pushBranch(
   const git = mirrorGit(cache, mirror, opts);
   const config = await mirrorConfig(cache);
 
-  await withRepoLock(mirror, async () => {
+  await withLock(mirror, async () => {
     if (!(await exists(join(mirror, "HEAD")))) throw new Error(`refusing to push: no branch hoistline/${id}`);
     await resetMirror(mirror, config);
-    if (!(await branchExists(git, ref))) throw new Error(`refusing to push: no branch hoistline/${id}`);
-    await git(["push", "--quiet", "--no-verify", "--no-follow-tags", "--", url, `${ref}:${ref}`]);
+    const sha = await jobBranchSha(git, ref, "push");
+    // The validated object id as the source, so nothing the ref name resolves to later can change what is pushed.
+    await git(["push", "--quiet", "--no-verify", "--no-follow-tags", "--", url, `${sha}:${ref}`]);
   });
 }
 
 /**
- * Removes `<cacheDir>/work/<jobId>` and prunes it from the repo's mirror. The result branch stays in the mirror, so
- * the job id cannot be reused. Never touches anything outside `<cacheDir>/work`.
+ * Removes `<cacheDir>/work/<jobId>` and prunes it from the repo's mirror. The result branch and the job's ownership
+ * record stay, so the job id cannot be reused. Never touches anything outside `<cacheDir>/work`, and only removes a
+ * directory whose ownership record names this repository.
  */
 export async function removeWorktree(repo: string, jobId: string, cacheDir: string): Promise<void> {
   const canonical = validateRepo(repo);
@@ -541,29 +682,35 @@ export async function removeWorktree(repo: string, jobId: string, cacheDir: stri
   const cache = resolve(cacheDir);
   const workRoot = join(cache, "work");
   const dir = join(workRoot, id);
-
-  const rootStat = await lstat(workRoot).catch(() => null);
-  if (rootStat && !rootStat.isDirectory()) {
-    // A symlinked work directory could point anywhere; never follow it.
-    throw new Error(`refusing to remove ${dir}: ${workRoot} is not a plain directory`);
-  }
-  const stat = rootStat ? await lstat(dir).catch(() => null) : null;
-  if (stat) {
-    if (!stat.isDirectory()) throw new Error(`refusing to remove ${dir}: not a plain directory`);
-    const realRoot = await realpath(workRoot);
-    if (!(await realpath(dir)).startsWith(realRoot + sep)) {
-      throw new Error(`refusing to remove ${dir}: outside ${workRoot}`);
-    }
-    await rm(dir, { recursive: true, force: true });
-  }
   const mirror = mirrorPath(cache, canonical);
-  if (await exists(join(mirror, "HEAD"))) {
-    const config = await mirrorConfig(cache);
-    await withRepoLock(mirror, async () => {
-      await resetMirror(mirror, config);
-      await mirrorGit(cache, mirror, {})(["worktree", "prune"]);
-    });
-  }
+
+  await withLock(jobLockKey(cache, id), async () => {
+    const rootStat = await lstatOrNull(workRoot);
+    if (rootStat && !rootStat.isDirectory()) {
+      // A symlinked work directory could point anywhere; never follow it.
+      throw new Error(`refusing to remove ${dir}: ${workRoot} is not a plain directory`);
+    }
+    const stat = rootStat ? await lstatOrNull(dir) : null;
+    if (stat) {
+      if (!stat.isDirectory()) throw new Error(`refusing to remove ${dir}: not a plain directory`);
+      const realRoot = await realpath(workRoot);
+      if (!(await realpath(dir)).startsWith(realRoot + sep)) {
+        throw new Error(`refusing to remove ${dir}: outside ${workRoot}`);
+      }
+      const jobs = join(cache, "jobs");
+      const owner = (await lstatOrNull(jobs))?.isDirectory() ? await readControlFile(join(jobs, id)) : null;
+      if (owner === null) throw new Error(`refusing to remove ${dir}: no record of the repository that owns it`);
+      if (owner.trim() !== canonical) throw new Error(`refusing to remove ${dir}: it belongs to another repository`);
+      await rm(dir, { recursive: true, force: true });
+    }
+    if (await exists(join(mirror, "HEAD"))) {
+      const config = await mirrorConfig(cache);
+      await withLock(mirror, async () => {
+        await resetMirror(mirror, config);
+        await mirrorGit(cache, mirror, {})(["worktree", "prune"]);
+      });
+    }
+  });
 }
 
 const COMMIT_IDENTITY = [
@@ -586,10 +733,10 @@ async function findAdminDir(mirror: string, dir: string, ref: string): Promise<s
   const worktrees = join(mirror, "worktrees");
   const matches: string[] = [];
   if ((await lstatOrNull(worktrees))?.isDirectory()) {
-    for (const entry of await readdir(worktrees)) {
+    for (const entry of await listWorktreeRecords(worktrees)) {
       const admin = join(worktrees, entry);
       if (!(await lstatOrNull(admin))?.isDirectory()) continue;
-      const gitdir = await readRegularFile(join(admin, "gitdir"));
+      const gitdir = await readControlFile(join(admin, "gitdir"));
       if (gitdir !== null && expected.has(gitdir.trim())) matches.push(admin);
     }
   }
@@ -597,12 +744,10 @@ async function findAdminDir(mirror: string, dir: string, ref: string): Promise<s
     throw new Error(`refusing to commit: expected one worktree record for ${dir}, found ${matches.length}`);
   }
   const admin = matches[0] as string;
-  const head = await readRegularFile(join(admin, "HEAD"));
+  const head = await readControlFile(join(admin, "HEAD"));
   if (head?.trim() !== `ref: ${ref}`) throw new Error(`refusing to commit: the worktree is not on ${ref}`);
   return admin;
 }
-
-type WorktreeGit = (args: string[], extra?: Partial<GitRunOptions>) => Promise<GitResult>;
 
 /** Feeds NUL-terminated records from streamed output to `onRecord`. */
 function nulRecords(onRecord: (record: string) => void): { push: (chunk: string) => void; end: () => void } {
@@ -627,33 +772,49 @@ function nestedRepoError(path: string): GitError {
 }
 
 /**
- * The first directory below `root` (relative, `/`-separated) that holds a `.git` entry, never following symlinks.
- * Gives up (null) after 200,000 entries; it only runs after `add --all` has already failed.
+ * Directories below `root` (relative, `/`-separated) that hold a `.git` entry, never following symlinks. Stops after
+ * 200,000 entries or 100 candidates; it only runs after `add --all` has already failed.
  */
-async function findNestedRepo(root: string): Promise<string | null> {
+async function findNestedRepos(root: string): Promise<string[]> {
+  const found: string[] = [];
   const stack = [""];
   let seen = 0;
-  while (stack.length > 0) {
+  while (stack.length > 0 && found.length < 100) {
     const rel = stack.pop() as string;
     const entries = await readdir(join(root, rel), { withFileTypes: true }).catch(() => []);
     for (const entry of entries) {
-      if (++seen > 200_000) return null;
+      if (++seen > 200_000) return found;
       const child = rel === "" ? entry.name : `${rel}/${entry.name}`;
       if (entry.name === ".git") {
-        if (rel !== "") return rel;
+        if (rel !== "") found.push(rel);
       } else if (entry.isDirectory()) {
         stack.push(child);
       }
     }
   }
-  return null;
+  return found;
+}
+
+/**
+ * Explains a failed `add --all`: git refuses outright to add a nested repository that has no commit yet, so the
+ * first nested repository that is not git-ignored is named. Otherwise (an ignored one cannot be the cause) the
+ * original error, with git's message, is rethrown.
+ */
+async function explainAddFailure(git: Git, root: string, err: unknown): Promise<never> {
+  for (const candidate of await findNestedRepos(root)) {
+    const res = await git(["check-ignore", "-q", "--", candidate], { okCodes: [1] }).catch(() => null);
+    if (res === null) break;
+    if (res.code === 1) throw nestedRepoError(candidate);
+  }
+  throw err;
 }
 
 /**
  * Refuses a staged gitlink (mode 160000) that is not already one at HEAD: `add --all` records a nested repository
- * that has commits as an embedded repository, which would push a dangling submodule pointer. The index is left as is.
+ * that has commits as an embedded repository, which would push a dangling submodule pointer. Submodule ignore
+ * settings (`.gitmodules` `ignore = all`) must not hide it.
  */
-async function refuseNewGitlinks(git: WorktreeGit): Promise<void> {
+async function refuseNewGitlinks(git: Git): Promise<void> {
   let header: string | null = null;
   let found: string | null = null;
   const records = nulRecords((record) => {
@@ -666,7 +827,9 @@ async function refuseNewGitlinks(git: WorktreeGit): Promise<void> {
     if (found === null && newMode === "160000" && oldMode !== "160000") found = record;
     header = null;
   });
-  await git(["diff", "--cached", "--raw", "-z", "--no-renames", "--no-ext-diff"], { onStdout: records.push });
+  await git(["diff", "--cached", "--raw", "-z", "--no-renames", "--no-ext-diff", "--ignore-submodules=none"], {
+    onStdout: records.push,
+  });
   records.end();
   if (found !== null) throw nestedRepoError(found);
 }
@@ -678,10 +841,18 @@ type DirListing = { exact: Map<string, boolean>; folded: Map<string, string[]> }
  * still matches the file. Finds tracked paths whose on-disk spelling differs only in case and restages them under
  * the on-disk name, so the commit records a single rename. Never follows symlinks.
  */
-async function stageCaseRenames(git: WorktreeGit, root: string): Promise<void> {
+async function stageCaseRenames(git: Git, root: string): Promise<void> {
   const tracked: string[] = [];
-  const records = nulRecords((p) => tracked.push(p));
-  await git(["ls-files", "-z"], { onStdout: records.push });
+  // Staged entries, "<mode> <object> <stage>\t<path>": gitlinks (160000) are never restaged under another name.
+  const records = nulRecords((record) => {
+    const tab = record.indexOf("\t");
+    if (tab < 0 || record.startsWith("160000 ")) return;
+    if (tracked.length >= MAX_TRACKED_PATHS) {
+      throw new Error(`more than ${MAX_TRACKED_PATHS} tracked paths to check for case-only renames`);
+    }
+    tracked.push(record.slice(tab + 1));
+  });
+  await git(["ls-files", "-s", "-z"], { onStdout: records.push });
   records.end();
 
   const listings = new Map<string, DirListing>();
@@ -748,9 +919,11 @@ async function stageCaseRenames(git: WorktreeGit, root: string): Promise<void> {
 
 /**
  * Commits everything in `<cacheDir>/work/<jobId>` (tracked, modified and untracked files) onto `hoistline/<jobId>`.
- * Git runs against the mirror's own record of the worktree, with no hooks, filters from planted config or signing.
- * Returns `{ committed: false }` when there is nothing to commit (a runner that committed itself leaves its commits
- * on the branch).
+ * Git runs against the mirror's own record of the worktree, with no hooks, filters from planted config or signing,
+ * and through a fresh index read from the branch's commit, so nothing the runner left in the worktree's own index
+ * (staged entries, assume-unchanged or skip-worktree flags) or admin dir (MERGE_HEAD, CHERRY_PICK_HEAD, message
+ * files) shapes the commit. Returns `{ committed: false }` when there is nothing to commit (a runner that committed
+ * itself leaves its commits on the branch).
  */
 export async function commitWorktree(
   repo: string,
@@ -770,38 +943,48 @@ export async function commitWorktree(
   const platform = await probePlatformConfig(cache);
   const platformArgs = await platformFlags(cache);
 
-  return withRepoLock(mirror, async () => {
+  return withLock(mirror, async () => {
     if (!(await exists(join(mirror, "HEAD")))) throw new Error(`refusing to commit: no mirror for ${canonical}`);
     await resetMirror(mirror, config);
     await assertRealDir(join(cache, "work")).catch(() => {
       throw new Error(`refusing to commit: ${join(cache, "work")} is not a plain directory`);
     });
     if (!(await lstatOrNull(dir))?.isDirectory()) throw new Error(`refusing to commit: no worktree at ${dir}`);
+    const mgit = mirrorGit(cache, mirror, opts);
+    const head = await jobBranchSha(mgit, ref, "commit");
     const admin = await findAdminDir(mirror, dir, ref);
-    const git: WorktreeGit = (args, extra = {}) =>
-      runGit(["--git-dir", admin, "--work-tree", dir, ...COMMIT_IDENTITY, ...platformArgs, ...args], {
-        cacheDir: cache,
-        allowFileProtocol: opts.allowFileProtocol,
-        timeoutMs: opts.timeoutMs,
-        env: { GIT_DIR: admin, GIT_COMMON_DIR: mirror, GIT_WORK_TREE: dir },
-        ...extra,
-      });
+    for (const name of COMMIT_STATE) await removeEntry(join(admin, name));
 
+    const indexDir = await mkdtemp(join(cache, "index-"));
     try {
-      await git(["add", "--all"]);
-    } catch (err) {
-      // git refuses outright to add a nested repository that has no commit yet; find it to say which.
-      const nested = await findNestedRepo(dir);
-      if (nested !== null) throw nestedRepoError(nested);
-      throw err;
+      const git: Git = (args, extra = {}) =>
+        runGit(["--git-dir", admin, "--work-tree", dir, ...COMMIT_IDENTITY, ...platformArgs, ...args], {
+          cacheDir: cache,
+          allowFileProtocol: opts.allowFileProtocol,
+          timeoutMs: opts.timeoutMs,
+          killGraceMs: opts.killGraceMs,
+          okCodes: extra.okCodes,
+          onStdout: extra.onStdout,
+          env: { GIT_DIR: admin, GIT_COMMON_DIR: mirror, GIT_WORK_TREE: dir, GIT_INDEX_FILE: join(indexDir, "index") },
+        });
+      await git(["read-tree", head]);
+      await git(["add", "--all"]).catch((err: unknown) => explainAddFailure(git, dir, err));
+      await refuseNewGitlinks(git);
+      if (platform.ignorecase === "true") {
+        await stageCaseRenames(git, dir);
+        await refuseNewGitlinks(git);
+      }
+      // Exit code only: listing the staged paths could exceed any output buffer.
+      const { code } = await git(
+        ["diff", "--cached", "--quiet", "--no-ext-diff", "--no-textconv", "--ignore-submodules=none"],
+        { okCodes: [1] },
+      );
+      if (code === 0) return { committed: false };
+      await git(["commit", "--quiet", "--no-verify", "-m", message]);
+      const sha = (await mgit(["rev-parse", "--verify", "--end-of-options", ref])).stdout.trim();
+      return { committed: true, sha };
+    } finally {
+      await rm(indexDir, { recursive: true, force: true });
     }
-    await refuseNewGitlinks(git);
-    if (platform.ignorecase === "true") await stageCaseRenames(git, dir);
-    // Exit code only: listing the staged paths could exceed any output buffer.
-    const { code } = await git(["diff", "--cached", "--quiet", "--no-ext-diff", "--no-textconv"], { okCodes: [1] });
-    if (code === 0) return { committed: false };
-    await git(["commit", "--quiet", "--no-verify", "-m", message]);
-    const sha = (await mirrorGit(cache, mirror, opts)(["rev-parse", "--verify", "--end-of-options", ref])).stdout.trim();
-    return { committed: true, sha };
   });
 }

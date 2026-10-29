@@ -1,7 +1,10 @@
 import { execFile, execFileSync } from "node:child_process";
 import {
   chmodSync,
+  closeSync,
   existsSync,
+  ftruncateSync,
+  openSync,
   lstatSync,
   mkdirSync,
   mkdtempSync,
@@ -530,7 +533,7 @@ describe("the platform config probe", () => {
     expect(parsePlatformConfig(hostile)).toEqual({ ignorecase: "true", precomposeunicode: "true", filemode: "true" });
   });
 
-  it("probes once per process in a throwaway repo under the cache and cleans it up", async () => {
+  it("probes once per cache dir in a throwaway repo under the cache and cleans it up", async () => {
     _resetPlatformProbeForTests();
     const cache = temp();
     const probed = await probePlatformConfig(cache);
@@ -539,15 +542,52 @@ describe("the platform config probe", () => {
       expect(["true", "false"]).toContain(v);
     }
     if (CASE_INSENSITIVE) expect(probed.ignorecase).toBe("true");
-    expect(readdirSync(cache).filter((e) => e.startsWith("probe"))).toEqual([]);
-    // Cached: a second cache dir is not probed again.
+    expect(readdirSync(cache)).toEqual([]);
+    // Cached per cache dir: the same dir is not probed again, another dir gets its own probe.
+    expect(await probePlatformConfig(cache)).toBe(probed);
     const other = temp();
-    expect(await probePlatformConfig(other)).toBe(probed);
+    const otherProbe = await probePlatformConfig(other);
+    expect(otherProbe).not.toBe(probed);
+    expect(otherProbe).toEqual(probed);
     expect(readdirSync(other)).toEqual([]);
     const lines = Object.entries(probed).map(([k, v]) => `\t${k} = ${v}\n`);
     expect(await mirrorConfig(cache)).toBe(MIRROR_CONFIG + lines.join(""));
   });
+
+  it("is not steered by the owner's init.templateDir", async () => {
+    const home = temp();
+    const template = join(home, "template");
+    mkdirSync(template);
+    writeFileSync(join(template, "config"), "[core]\n\tsymlinks = false\n\tfilemode = false\n");
+    writeFileSync(join(home, ".gitconfig"), `[init]\n\ttemplateDir = ${template}\n`);
+    const homeEnv = { ...FIXTURE_ENV, HOME: home, GIT_CONFIG_GLOBAL: join(home, ".gitconfig") };
+    // Control: a plain `git init` with that global config takes the template's values.
+    const control = join(temp(), "control");
+    fx(["init", "-q", control], undefined, homeEnv);
+    expect(readFileSync(join(control, ".git", "config"), "utf8")).toMatch(/symlinks = false/);
+
+    _resetPlatformProbeForTests();
+    const cache = temp();
+    const probed = await withHome(home, () => probePlatformConfig(cache));
+    expect(probed.symlinks).toBeUndefined();
+    expect(probed.filemode).toBe("true");
+  });
 });
+
+/** Runs `fn` with the owner's HOME (and so their global git config) pointed at `home`. */
+async function withHome<T>(home: string, fn: () => Promise<T>): Promise<T> {
+  const saved = { HOME: process.env.HOME, XDG_CONFIG_HOME: process.env.XDG_CONFIG_HOME };
+  process.env.HOME = home;
+  delete process.env.XDG_CONFIG_HOME;
+  try {
+    return await fn();
+  } finally {
+    for (const [k, v] of Object.entries(saved)) {
+      if (v === undefined) delete process.env[k];
+      else process.env[k] = v;
+    }
+  }
+}
 
 describe("runGit protocol policy", () => {
   it("blocks an ext:: remote even when the owner's global config allows it", async () => {
@@ -1205,4 +1245,448 @@ describe("commitWorktree", () => {
     expect((err as Error).message).toBe(nestedMessage("empty"));
     expect(shaIn(mirrorOf(cache), "refs/heads/hoistline/c11")).toBe(remoteSha("refs/heads/main"));
   });
+});
+
+// ---------------------------------------------------------------------------------------------------------------
+// Round 4: findings from an independent review, each reproduced with a control run first.
+
+/** The mirror's admin record for worktree `dir`, found by its gitdir file. */
+function adminDir(mirror: string, dir: string): string {
+  const expected = [join(dir, ".git"), join(realpathSync(dir), ".git")];
+  for (const entry of readdirSync(join(mirror, "worktrees"))) {
+    const gitdir = join(mirror, "worktrees", entry, "gitdir");
+    if (existsSync(gitdir) && expected.includes(readFileSync(gitdir, "utf8").trim())) {
+      return join(mirror, "worktrees", entry);
+    }
+  }
+  throw new Error(`no admin dir for ${dir}`);
+}
+
+/** Plain git's commit in a worktree (no hooks), with optional extra `-c` flags. */
+const plainCommit = (dir: string, msg: string, extra: string[] = []) =>
+  fx(["-c", "core.hooksPath=/dev/null", ...extra, "commit", "-q", "-m", msg], dir);
+
+describe("round 4: hooks", () => {
+  it("runs no hook planted in the old empty-hooks directory or under a relative hooks path", async () => {
+    const cache = temp();
+    const ws = await prepareWorktree("o/n", "main", "h1", cache, file);
+    const mirror = mirrorOf(cache);
+    const marker = join(temp(), "hook-ran");
+    const plant = (dir: string) => {
+      mkdirSync(dir, { recursive: true });
+      for (const hook of ["prepare-commit-msg", "post-checkout", "reference-transaction", "post-commit", "pre-push"]) {
+        writeFileSync(join(dir, hook), `#!/bin/sh\necho ${hook} >> "${marker}"\n`);
+        chmodSync(join(dir, hook), 0o755);
+      }
+    };
+    const old = join(cache, "empty-hooks");
+    plant(old);
+    // Control: plain git with hooksPath at the old directory runs prepare-commit-msg, even with --no-verify.
+    const control = join(temp(), "control");
+    fx(["--git-dir", mirror, "worktree", "add", "-q", "-b", "control", control, "refs/remotes/origin/main"]);
+    fx(["-c", `core.hooksPath=${old}`, "commit", "-q", "--no-verify", "--allow-empty", "-m", "c"], control);
+    expect(readFileSync(marker, "utf8")).toMatch(/prepare-commit-msg/);
+    rmSync(marker);
+    // Control: a relative hooksPath resolves against git's working directory.
+    plant(join(control, "rel-hooks"));
+    fx(["-c", "core.hooksPath=rel-hooks", "commit", "-q", "--allow-empty", "-m", "c"], control);
+    expect(existsSync(marker)).toBe(true);
+    rmSync(marker);
+
+    writeFileSync(join(ws.dir, "x.txt"), "x\n");
+    expect((await commitWorktree("o/n", "h1", cache, file)).committed).toBe(true);
+    await pushBranch("o/n", "h1", cache, file);
+    await prepareWorktree("o/n", "main", "h2", cache, file);
+    await removeWorktree("o/n", "h2", cache);
+    expect(existsSync(marker)).toBe(false);
+    if (process.platform !== "win32") {
+      expect((await runGit(["config", "--get", "core.hooksPath"], { cacheDir: cache })).stdout.trim()).toBe("/dev/null");
+    }
+  });
+});
+
+describe("round 4: git metadata symlinks", () => {
+  it("never writes through FETCH_HEAD, COMMIT_EDITMSG or reflog symlinks", async () => {
+    const cache = temp();
+    const ws = await prepareWorktree("o/n", "main", "m1", cache, file);
+    const mirror = mirrorOf(cache);
+    const victim = (name: string) => {
+      const p = join(temp(), name);
+      writeFileSync(p, "precious\n");
+      return p;
+    };
+    const linkLog = (admin: string, target: string) => {
+      mkdirSync(join(admin, "logs"), { recursive: true });
+      rmSync(join(admin, "logs", "HEAD"), { force: true });
+      symlinkSync(target, join(admin, "logs", "HEAD"));
+    };
+    // Controls: plain git writes through each link.
+    const fetchCopy = victim("fetch");
+    rmSync(join(mirror, "FETCH_HEAD"), { force: true });
+    symlinkSync(fetchCopy, join(mirror, "FETCH_HEAD"));
+    fx(["--git-dir", mirror, "fetch", "-q", "--", remote, "+refs/heads/main:refs/remotes/origin/main"]);
+    expect(readFileSync(fetchCopy, "utf8")).not.toBe("precious\n");
+    rmSync(join(mirror, "FETCH_HEAD"));
+    const control = await prepareWorktree("o/n", "main", "m1ctl", cache, file);
+    const controlAdmin = adminDir(mirror, control.dir);
+    const msgCopy = victim("msg");
+    const logCopy = victim("log");
+    symlinkSync(msgCopy, join(controlAdmin, "COMMIT_EDITMSG"));
+    linkLog(controlAdmin, logCopy);
+    fx(["-c", "core.hooksPath=/dev/null", "-c", "core.logAllRefUpdates=true", "commit", "-q", "--allow-empty", "-m", "c"],
+      control.dir);
+    expect(readFileSync(msgCopy, "utf8")).toBe("c\n");
+    expect(readFileSync(logCopy, "utf8")).not.toBe("precious\n");
+
+    const admin = adminDir(mirror, ws.dir);
+    const fetchV = victim("fetch2");
+    const msgV = victim("msg2");
+    const logV = victim("log2");
+    rmSync(join(mirror, "FETCH_HEAD"), { force: true });
+    symlinkSync(fetchV, join(mirror, "FETCH_HEAD"));
+    symlinkSync(msgV, join(admin, "COMMIT_EDITMSG"));
+    linkLog(admin, logV);
+    // The runner turns reflogs on in the shared config; the reset rewrites it, but git's default could too.
+    fx(["config", "core.logAllRefUpdates", "always"], ws.dir);
+    writeFileSync(join(ws.dir, "x.txt"), "x\n");
+    expect((await commitWorktree("o/n", "m1", cache, file)).committed).toBe(true);
+    rmSync(join(mirror, "FETCH_HEAD"), { force: true });
+    symlinkSync(fetchV, join(mirror, "FETCH_HEAD"));
+    await prepareWorktree("o/n", "main", "m2", cache, file);
+    for (const v of [fetchV, msgV, logV]) expect(readFileSync(v, "utf8")).toBe("precious\n");
+  });
+});
+
+describe("round 4: cache directories", () => {
+  it("refuses a symlinked work directory before creating anything through it", async () => {
+    const cache = temp();
+    const outside = temp();
+    symlinkSync(outside, join(cache, "work"));
+    await expect(prepareWorktree("o/n", "main", "d1", cache, file)).rejects.toThrow(/not a plain directory/);
+    expect(readdirSync(outside)).toEqual([]);
+  });
+
+  it("refuses a symlinked repos directory or mirror path before git init", async () => {
+    for (const where of ["repos", "mirror"]) {
+      const cache = temp();
+      const outside = temp();
+      if (where === "repos") {
+        symlinkSync(outside, join(cache, "repos"));
+      } else {
+        mkdirSync(join(cache, "repos"));
+        symlinkSync(outside, mirrorOf(cache));
+      }
+      await expect(prepareWorktree("o/n", "main", "d2", cache, file)).rejects.toThrow(/not a plain directory/);
+      expect(readdirSync(outside)).toEqual([]);
+    }
+  });
+
+  it("never deletes a job directory it did not create", async () => {
+    const cache = temp();
+    await prepareWorktree("o/n", "main", "d3a", cache, file);
+    // Guard (passes before and after): a pre-existing job dir is refused, never deleted.
+    mkdirSync(join(cache, "work", "d3"));
+    writeFileSync(join(cache, "work", "d3", "keep"), "k");
+    await expect(prepareWorktree("o/n", "main", "d3", cache, file)).rejects.toThrow(/already used/);
+    expect(readFileSync(join(cache, "work", "d3", "keep"), "utf8")).toBe("k");
+  });
+});
+
+describe("round 4: symbolic refs", () => {
+  it("refuses to commit or push a job branch that is a symbolic ref to another job's branch", async () => {
+    const cache = temp();
+    const mirror = mirrorOf(cache);
+    const a = await prepareWorktree("o/n", "main", "sa", cache, file);
+    const b = await prepareWorktree("o/n", "main", "sb", cache, file);
+    const bHead = runnerCommit(b.dir, "b.txt");
+    // Control: plain git commits through a symbolic job branch into its target.
+    const c = await prepareWorktree("o/n", "main", "sc", cache, file);
+    const d = await prepareWorktree("o/n", "main", "sd", cache, file);
+    const dHead = runnerCommit(d.dir, "d.txt");
+    fx(["--git-dir", mirror, "symbolic-ref", "refs/heads/hoistline/sc", "refs/heads/hoistline/sd"]);
+    writeFileSync(join(c.dir, "c.txt"), "c\n");
+    fx(["add", "c.txt"], c.dir);
+    plainCommit(c.dir, "c");
+    expect(shaIn(mirror, "refs/heads/hoistline/sd")).not.toBe(dHead);
+
+    fx(["--git-dir", mirror, "symbolic-ref", "refs/heads/hoistline/sa", "refs/heads/hoistline/sb"]);
+    writeFileSync(join(a.dir, "a.txt"), "a\n");
+    await expect(commitWorktree("o/n", "sa", cache, file)).rejects.toThrow(/symbolic ref/);
+    await expect(pushBranch("o/n", "sa", cache, file)).rejects.toThrow(/symbolic ref/);
+    expect(shaIn(mirror, "refs/heads/hoistline/sb")).toBe(bHead);
+    expect(remoteSha("refs/heads/hoistline/sa")).toBeNull();
+  });
+
+  it("does not let a symbolic fetch destination move another job's branch", async () => {
+    const setup = async () => {
+      const cache = temp();
+      const mirror = mirrorOf(cache);
+      const x = await prepareWorktree("o/n", "main", "fx", cache, file);
+      const head = runnerCommit(x.dir, "x.txt");
+      fx(["--git-dir", mirror, "symbolic-ref", "refs/remotes/origin/main", "refs/heads/hoistline/fx"]);
+      return { cache, mirror, head };
+    };
+    // Control: a plain fetch into the symbolic destination force-moves hoistline/fx.
+    const ctl = await setup();
+    fx(["--git-dir", ctl.mirror, "fetch", "-q", "--", remote, "+refs/heads/main:refs/remotes/origin/main"]);
+    expect(shaIn(ctl.mirror, "refs/heads/hoistline/fx")).toBe(remoteSha("refs/heads/main"));
+
+    const s = await setup();
+    const ws = await prepareWorktree("o/n", "main", "fy", s.cache, file);
+    expect(shaIn(s.mirror, "refs/heads/hoistline/fx")).toBe(s.head);
+    expect(() => fx(["--git-dir", s.mirror, "symbolic-ref", "-q", "refs/remotes/origin/main"])).toThrow();
+    expect(readFileSync(join(ws.dir, "README"), "utf8")).toBe("main\n");
+  });
+});
+
+describe("round 4: job ids across repositories", () => {
+  it("lets exactly one of two repos claim a job id, and never deletes the winner's worktree", async () => {
+    const cache = temp();
+    const results = await Promise.allSettled([
+      prepareWorktree("o/a", "main", "same", cache, file),
+      prepareWorktree("o/b", "main", "same", cache, file),
+    ]);
+    expect(results.filter((r) => r.status === "fulfilled")).toHaveLength(1);
+    const lost = results.find((r) => r.status === "rejected") as PromiseRejectedResult;
+    expect(String(lost.reason)).toMatch(/job id "same" was already used/);
+    const dir = join(cache, "work", "same");
+    expect(readFileSync(join(dir, "README"), "utf8")).toBe("main\n");
+    expect(existsSync(join(dir, ".git"))).toBe(true);
+
+    const [winner, loser] = results[0]?.status === "fulfilled" ? ["o/a", "o/b"] : ["o/b", "o/a"];
+    await expect(removeWorktree(loser as string, "same", cache)).rejects.toThrow(/belongs to another repository/);
+    expect(existsSync(join(dir, "README"))).toBe(true);
+    await removeWorktree(winner as string, "same", cache);
+    expect(existsSync(dir)).toBe(false);
+  });
+});
+
+describe("round 4: submodules", () => {
+  it("refuses a nested repository hidden by .gitmodules ignore = all", async () => {
+    const cache = temp();
+    const ws = await prepareWorktree("o/n", "main", "sm1", cache, file);
+    const lib = join(ws.dir, "lib");
+    mkdirSync(lib);
+    fx(["init", "-q", "-b", "main", lib]);
+    runnerCommit(lib, "code.c");
+    writeFileSync(join(ws.dir, ".gitmodules"), '[submodule "lib"]\n\tpath = lib\n\turl = ./lib\n\tignore = all\n');
+    // Control: plain git stages the gitlink, but its default staged diff does not show it.
+    const env = { ...FIXTURE_ENV, GIT_INDEX_FILE: join(temp(), "index") };
+    fx(["read-tree", "HEAD"], ws.dir, env);
+    fx(["add", "--all"], ws.dir, env);
+    expect(fx(["ls-files", "-s", "lib"], ws.dir, env)).toMatch(/^160000 /);
+    expect(fx(["diff", "--cached", "--raw"], ws.dir, env)).not.toMatch(/\tlib/);
+
+    const err = await commitWorktree("o/n", "sm1", cache, file).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(GitError);
+    expect((err as Error).message).toBe(
+      "nested repository at lib cannot be committed; remove its .git directory or add it to .gitignore",
+    );
+    expect(shaIn(mirrorOf(cache), "refs/heads/hoistline/sm1")).toBe(remoteSha("refs/heads/main"));
+  });
+});
+
+describe("round 4: commit state the runner leaves behind", () => {
+  it("does not turn the commit into a merge with a planted MERGE_HEAD", async () => {
+    const cache = temp();
+    const mirror = mirrorOf(cache);
+    const other = await prepareWorktree("o/n", "main", "mo", cache, file);
+    const otherHead = runnerCommit(other.dir, "other.txt");
+    const parents = (id: string) =>
+      fx(["--git-dir", mirror, "log", "-1", "--format=%P", `refs/heads/hoistline/${id}`]).trim().split(" ");
+    // Control: plain git pulls another job's commit into the branch (as the only parent here, because it descends
+    // from HEAD and commit reduces the parents).
+    const ctl = await prepareWorktree("o/n", "main", "mctl", cache, file);
+    writeFileSync(join(adminDir(mirror, ctl.dir), "MERGE_HEAD"), `${otherHead}\n`);
+    writeFileSync(join(ctl.dir, "c.txt"), "c\n");
+    fx(["add", "c.txt"], ctl.dir);
+    plainCommit(ctl.dir, "c");
+    expect(parents("mctl")).toContain(otherHead);
+
+    const ws = await prepareWorktree("o/n", "main", "mm", cache, file);
+    const admin = adminDir(mirror, ws.dir);
+    writeFileSync(join(admin, "MERGE_HEAD"), `${otherHead}\n`);
+    writeFileSync(join(admin, "MERGE_MSG"), "merge\n");
+    writeFileSync(join(ws.dir, "w.txt"), "w\n");
+    expect((await commitWorktree("o/n", "mm", cache, file)).committed).toBe(true);
+    expect(parents("mm")).toEqual([remoteSha("refs/heads/main")]);
+    expect(existsSync(join(admin, "MERGE_HEAD"))).toBe(false);
+  });
+
+  it("does not take the author from a planted CHERRY_PICK_HEAD", async () => {
+    const cache = temp();
+    const mirror = mirrorOf(cache);
+    const other = await prepareWorktree("o/n", "main", "co", cache, file);
+    writeFileSync(join(other.dir, "o.txt"), "o\n");
+    fx(["add", "o.txt"], other.dir);
+    plainCommit(other.dir, "o", ["-c", "user.name=Other", "-c", "user.email=other@example.com"]);
+    const otherHead = shaIn(mirror, "refs/heads/hoistline/co") as string;
+    const author = (id: string) =>
+      fx(["--git-dir", mirror, "log", "-1", "--format=%an", `refs/heads/hoistline/${id}`]).trim();
+    expect(author("co")).toBe("Other");
+    // Control: plain git takes the author from CHERRY_PICK_HEAD.
+    const ctl = await prepareWorktree("o/n", "main", "cctl", cache, file);
+    writeFileSync(join(adminDir(mirror, ctl.dir), "CHERRY_PICK_HEAD"), `${otherHead}\n`);
+    writeFileSync(join(ctl.dir, "c.txt"), "c\n");
+    fx(["add", "c.txt"], ctl.dir);
+    plainCommit(ctl.dir, "c");
+    expect(author("cctl")).toBe("Other");
+
+    const ws = await prepareWorktree("o/n", "main", "cc", cache, file);
+    writeFileSync(join(adminDir(mirror, ws.dir), "CHERRY_PICK_HEAD"), `${otherHead}\n`);
+    writeFileSync(join(ws.dir, "w.txt"), "w\n");
+    await commitWorktree("o/n", "cc", cache, file);
+    expect(author("cc")).toBe("Hoistline");
+  });
+
+  it("commits edits hidden by assume-unchanged and skip-worktree index flags", async () => {
+    const cache = temp();
+    const ws = await prepareWorktree("o/n", "main", "ix", cache, file);
+    runnerCommit(ws.dir, "other.txt");
+    fx(["update-index", "--assume-unchanged", "README"], ws.dir);
+    fx(["update-index", "--skip-worktree", "other.txt"], ws.dir);
+    writeFileSync(join(ws.dir, "README"), "edited\n");
+    writeFileSync(join(ws.dir, "other.txt"), "edited too\n");
+    // Control: plain git stages nothing.
+    fx(["add", "--all"], ws.dir);
+    fx(["diff", "--cached", "--quiet"], ws.dir);
+
+    expect((await commitWorktree("o/n", "ix", cache, file)).committed).toBe(true);
+    const show = (p: string) => fx(["--git-dir", mirrorOf(cache), "show", `refs/heads/hoistline/ix:${p}`]);
+    expect(show("README")).toBe("edited\n");
+    expect(show("other.txt")).toBe("edited too\n");
+  });
+});
+
+describe("round 4: ancestry metadata", () => {
+  it("deletes info/grafts and shallow, which rewrite ancestry", async () => {
+    const cache = temp();
+    await prepareWorktree("o/n", "dev", "g1", cache, file);
+    const mirror = mirrorOf(cache);
+    const dev = remoteSha("refs/heads/dev") as string;
+    const count = () => fx(["--git-dir", mirror, "rev-list", "--count", "refs/remotes/origin/dev"]).trim();
+    expect(count()).toBe("2");
+    // Controls: each file cuts dev's history to one commit.
+    mkdirSync(join(mirror, "info"), { recursive: true });
+    writeFileSync(join(mirror, "info", "grafts"), `${dev}\n`);
+    expect(count()).toBe("1");
+    rmSync(join(mirror, "info", "grafts"));
+    writeFileSync(join(mirror, "shallow"), `${dev}\n`);
+    expect(count()).toBe("1");
+    writeFileSync(join(mirror, "info", "grafts"), `${dev}\n`);
+
+    await prepareWorktree("o/n", "dev", "g2", cache, file);
+    expect(existsSync(join(mirror, "info", "grafts"))).toBe(false);
+    expect(existsSync(join(mirror, "shallow"))).toBe(false);
+    expect(count()).toBe("2");
+  });
+});
+
+const escapees: string[] = [];
+afterAll(() => {
+  for (const pidFile of escapees) {
+    try {
+      process.kill(Number(readFileSync(pidFile, "utf8")), "SIGKILL");
+    } catch {
+      // Already gone, or never started.
+    }
+  }
+});
+
+describe("round 4: a git call whose descendant escapes the process group", () => {
+  it.skipIf(process.platform === "win32")(
+    "still rejects after the timeout plus a bounded cleanup deadline, and releases the repo lock",
+    async () => {
+      const cache = temp();
+      const ws = await prepareWorktree("o/n", "main", "t1", cache, file);
+      // The owner's global config defines a clean filter that starts a descendant in a new session holding git's
+      // stderr, then hangs.
+      const home = temp();
+      const pidFile = join(home, "pid");
+      escapees.push(pidFile);
+      const script = join(home, "escape.cjs");
+      writeFileSync(
+        script,
+        `const { spawn } = require("node:child_process");
+const c = spawn(process.execPath, ["-e", "setTimeout(() => {}, 30000)"], { detached: true, stdio: ["ignore", "ignore", "inherit"] });
+require("node:fs").writeFileSync(${JSON.stringify(pidFile)}, String(c.pid));
+c.unref();
+setInterval(() => {}, 1000);
+`,
+      );
+      writeFileSync(join(home, ".gitconfig"), `[filter "esc"]\n\tclean = \\"${process.execPath}\\" ${script}\n`);
+      writeFileSync(join(ws.dir, ".gitattributes"), "* filter=esc\n");
+      writeFileSync(join(ws.dir, "f.txt"), "f\n");
+
+      const started = Date.now();
+      const err = await withHome(home, () =>
+        commitWorktree("o/n", "t1", cache, { ...file, timeoutMs: 1000, killGraceMs: 500 }),
+      ).catch((e: unknown) => e);
+      expect(err).toBeInstanceOf(GitError);
+      expect((err as Error).message).toMatch(/timed out/);
+      expect(Date.now() - started).toBeLessThan(5000);
+      expect(existsSync(pidFile)).toBe(true);
+
+      // The repo lock was released: the next operation on the repo runs.
+      rmSync(join(ws.dir, ".gitattributes"));
+      expect((await commitWorktree("o/n", "t1", cache, file)).committed).toBe(true);
+    },
+    20_000,
+  );
+});
+
+describe("round 4: bounded control-file reads", () => {
+  it("does not read an oversized worktrees/*/gitdir file", async () => {
+    const cache = temp();
+    const ws = await prepareWorktree("o/n", "main", "b1", cache, file);
+    const big = join(mirrorOf(cache), "worktrees", "zz-big");
+    mkdirSync(big);
+    // A 3 GiB sparse file: reading it whole fails (and would allocate); a bounded read does not.
+    const fd = openSync(join(big, "gitdir"), "w");
+    ftruncateSync(fd, 3 * 1024 ** 3);
+    closeSync(fd);
+    writeFileSync(join(ws.dir, "b.txt"), "b\n");
+    const started = Date.now();
+    expect((await commitWorktree("o/n", "b1", cache, file)).committed).toBe(true);
+    expect(Date.now() - started).toBeLessThan(5000);
+  });
+
+  it("refuses more than 10,000 worktree records", async () => {
+    const cache = temp();
+    const ws = await prepareWorktree("o/n", "main", "b2", cache, file);
+    for (let i = 0; i < 10_001; i++) mkdirSync(join(mirrorOf(cache), "worktrees", `x${i}`));
+    writeFileSync(join(ws.dir, "b.txt"), "b\n");
+    await expect(commitWorktree("o/n", "b2", cache, file)).rejects.toThrow(/too many worktree records/);
+  });
+});
+
+describe("round 4: the no-commit nested repository fallback", () => {
+  it.skipIf(process.getuid?.() === 0)(
+    "reports the original add error when the only nested repository is git-ignored",
+    async () => {
+      const cache = temp();
+      const ws = await prepareWorktree("o/n", "main", "nf", cache, file);
+      const inner = join(ws.dir, "ign", "inner");
+      mkdirSync(inner, { recursive: true });
+      fx(["init", "-q", inner]);
+      writeFileSync(join(inner, "f"), "f");
+      writeFileSync(join(ws.dir, ".gitignore"), "ign/\n");
+      const secret = join(ws.dir, "secret.txt");
+      writeFileSync(secret, "s\n");
+      chmodSync(secret, 0o000);
+      try {
+        // Control: plain git's add fails on the unreadable file.
+        const env = { ...FIXTURE_ENV, GIT_INDEX_FILE: join(temp(), "index") };
+        expect(() => fx(["add", "--all"], ws.dir, env)).toThrow(/Permission denied/);
+
+        const err = await commitWorktree("o/n", "nf", cache, file).catch((e: unknown) => e);
+        expect(err).toBeInstanceOf(GitError);
+        expect((err as Error).message).toMatch(/git add failed/);
+        expect((err as Error).message).toMatch(/Permission denied/);
+        expect((err as Error).message).not.toMatch(/nested repository/);
+      } finally {
+        chmodSync(secret, 0o644);
+      }
+    },
+  );
 });

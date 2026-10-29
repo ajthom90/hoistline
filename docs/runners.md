@@ -52,49 +52,83 @@ Every job goes through four steps in this order, all keyed by the canonical repo
    and the default message is `hoistline: job <jobId>`.
 4. `pushBranch(repo, jobId, cacheDir)` pushes `hoistline/<jobId>` to the same branch on GitHub.
 
-`removeWorktree(repo, jobId, cacheDir)` deletes the worktree afterwards. The branch stays in the mirror, so a job id
-can never be reused.
+`removeWorktree(repo, jobId, cacheDir)` deletes the worktree afterwards. The branch and the job's ownership record
+stay, so a job id can never be reused.
 
-The worktree shares the mirror's git directory, so a runner can write the mirror's config, `info/attributes` and
-hooks, and it owns the worktree's `.git` file. The agent defends against that as follows:
+The worktree shares the mirror's git directory, so a runner can write anything in the mirror (config, hooks, refs,
+metadata files, symlinks), and it owns the worktree's `.git` file. The agent defends against that as follows:
 
 - It never runs git through the worktree's `.git` file. Mirror operations use `--git-dir=<mirror>`, with `GIT_DIR`
   and `GIT_COMMON_DIR` pinned to the mirror in the environment, so a planted `commondir` cannot redirect git to
   another repository. The push goes from the mirror.
+- Cache layout: before `git init`, `worktree add` or any cleanup, `<cacheDir>`, `<cacheDir>/repos`,
+  `<cacheDir>/work`, `<cacheDir>/jobs` and the mirror path (if present) must be real directories, not symlinks.
+- Job ids: a job id is claimed for one repository by an ownership record `<cacheDir>/jobs/<jobId>` (the canonical
+  repo), created exclusively. A per-job-id lock across the whole cache is taken before the per-repo lock, so two
+  repos preparing the same job id at once cannot both get it. The agent creates `<cacheDir>/work/<jobId>` itself
+  (refusing one that exists) before `worktree add`, and a failed prepare removes only the record and directory that
+  call created. `removeWorktree` removes a directory only when the ownership record names the same repository.
 - The commit finds the worktree's record `<mirror>/worktrees/<name>` by its `gitdir` file and runs with
   `GIT_DIR=<that record>`, `GIT_COMMON_DIR=<mirror>` and `GIT_WORK_TREE=<worktree>`. It requires exactly one record
   whose HEAD is `hoistline/<jobId>`.
+- Symbolic refs: commit and push refuse a `hoistline/<jobId>` that is a symbolic ref (`git symbolic-ref -q` must
+  fail), so a runner cannot redirect them to another job's branch. The push sends the validated object id
+  (`<sha>:refs/heads/hoistline/<jobId>`). Before the fetch, `refs/remotes/origin/<base>` is deleted with
+  `update-ref -d --no-deref`, so a symbolic fetch destination cannot move another branch.
 - Before every fetch, `worktree add`, commit, push and prune, the mirror is reset, without ever following a
   symlink:
   - Its `config` is unlinked and written fresh from a fixed template: `[core]`, `repositoryformatversion = 0`,
     `bare = true`, plus the platform values described below, nothing else.
   - `hooks` is removed and recreated as an empty real directory.
-  - These are deleted: `commondir`, `gitdir`, `config.worktree`, every `worktrees/*/config.worktree`,
-    `info/attributes`, `info/exclude`, `refs/replace`, `objects/info/alternates` and
-    `objects/info/http-alternates`.
+  - These are deleted: `commondir`, `gitdir`, `config.worktree`, `FETCH_HEAD`, `shallow`, `logs`,
+    `info/attributes`, `info/exclude`, `info/grafts`, `refs/replace`, `objects/info/alternates`,
+    `objects/info/http-alternates`, and every `worktrees/*/config.worktree` and `worktrees/*/logs`. (`shallow` and
+    `info/grafts` rewrite commit ancestry; `FETCH_HEAD` and reflogs are written through whatever is in place.)
   - A symlink found in place of `info`, `objects/info`, `worktrees` or a `worktrees/<entry>` is removed, never
-    followed. `refs/replace` is only deleted when `refs` is a real directory.
-- Platform values: once per process the agent runs `git init` in a throwaway directory under the cache, keeps only
-  `core.ignorecase`, `core.precomposeunicode`, `core.filemode` and `core.symlinks` (each only if present, and only
-  as `true` or `false`), and deletes the directory. Those values go into the mirror template and are passed as `-c`
-  to the commit, so a case-only rename on macOS is not committed as a second file.
+    followed. `refs/replace` is only deleted when `refs` is a real directory. More than 10,000 entries in
+    `worktrees` is refused.
+- The fetch runs with `--no-write-fetch-head`, and every git call with `-c core.logAllRefUpdates=false`. That flag
+  alone does not stop git appending to a reflog file that already exists, which is why `logs` is deleted.
+- Platform values: once per cache directory the agent runs `git init --template=` (so the owner's
+  `init.templateDir` cannot supply them) in a throwaway directory under the cache, keeps only `core.ignorecase`,
+  `core.precomposeunicode`, `core.filemode` and `core.symlinks` (each only if present, and only as `true` or
+  `false`), and deletes the directory. Those values go into the mirror template and are passed as `-c` to the
+  commit, so a case-only rename on macOS is not committed as a second file.
 - Replacement objects are off for every git call: `GIT_NO_REPLACE_OBJECTS=1` in the environment and
   `-c core.useReplaceRefs=false`, which also covers replace refs packed into `packed-refs` that the reset cannot see.
   The commit-graph file is ignored (`-c core.commitGraph=false`).
-- The commit checks for staged changes by exit code (`git diff --cached --quiet`), so a large change set cannot
-  overflow an output buffer. It refuses to commit a nested repository (a new gitlink, mode 160000, or a nested
-  repository with no commits): it throws `nested repository at <path> cannot be committed; remove its .git
-  directory or add it to .gitignore` and leaves the index as is.
-- On a case-insensitive filesystem `git add --all` cannot see a case-only rename (the index entry still matches the
-  file), so the commit restages tracked paths whose on-disk spelling differs only in case under the on-disk name.
-  The commit then records a single rename.
+- Control files the agent reads itself (`worktrees/*/gitdir`, the record's `HEAD`, ownership records) are read only
+  when they are regular files of at most 4 KiB, never through a symlink.
+- The commit flow:
+  1. Check the branch is not symbolic and resolve its commit; find the worktree record.
+  2. Delete the record's operation state, without following symlinks: `MERGE_HEAD`, `MERGE_MSG`, `MERGE_MODE`,
+     `CHERRY_PICK_HEAD`, `REVERT_HEAD`, `REBASE_HEAD`, `AUTO_MERGE`, `SQUASH_MSG`, `sequencer/`, `rebase-merge/`,
+     `rebase-apply/`, `COMMIT_EDITMSG` and `logs/`. (A planted `MERGE_HEAD` pulls another job's commit into the
+     branch; `CHERRY_PICK_HEAD` sets the author.)
+  3. Build a fresh index: a temporary `GIT_INDEX_FILE` under the cache, filled by `git read-tree <branch commit>`.
+     The runner's own index, with any staged entries or `assume-unchanged` / `skip-worktree` flags, is never used.
+  4. `git add --all` into it. If that fails, the agent names the first nested repository that is not git-ignored
+     (`git check-ignore`); if there is none, it rethrows git's own error.
+  5. Refuse a new gitlink (mode 160000, a nested repository with commits), with `--ignore-submodules=none` so a
+     `.gitmodules` `ignore = all` cannot hide it. The error is `nested repository at <path> cannot be committed;
+     remove its .git directory or add it to .gitignore`.
+  6. On a case-insensitive filesystem, `git add --all` cannot see a case-only rename (the index entry still matches
+     the file), so tracked paths whose on-disk spelling differs only in case are restaged under the on-disk name
+     (gitlinks excluded; more than 200,000 tracked paths is refused). The gitlink check then runs again.
+  7. Check for staged changes by exit code (`git diff --cached --quiet --ignore-submodules=none`), so a large change
+     set cannot overflow an output buffer, then commit and delete the temporary index.
 - No remote is stored. The URL `https://github.com/<owner>/<name>.git`, derived only from the canonical repo, is
   passed explicitly to every fetch and push.
-- Every git call also gets `-c` overrides: hooks pointed at an empty directory, fsmonitor off, submodule recursion
-  off, fsck on transfer, and every transport except https disabled. Each git call runs with a scrubbed environment.
-  The push never forces and never pushes tags.
+- Every git call also gets `-c` overrides: fsmonitor off, submodule recursion off, fsck on transfer, and every
+  transport except https disabled. Each git call runs with a scrubbed environment. The push never forces and never
+  pushes tags.
+- Hooks: `core.hooksPath=/dev/null` on macOS and Linux, which cannot hold a hook. On Windows, each git call gets a
+  directory created empty for it under the cache and removed afterwards. Hooks such as `post-checkout`,
+  `reference-transaction` and `prepare-commit-msg` run even with `--no-verify`, so this is the only switch.
 - Network calls also abort a transfer that stays below 1 byte/s for 60 s. They have an overall timeout (5 minutes
   by default) that kills git's whole process tree: the process group on macOS and Linux, `taskkill /T` on Windows.
+  A descendant that left the process group can keep git's output pipes open; after the kill the agent waits at
+  most 5 seconds more, then closes the pipes and fails the call, so the repo lock is always released.
 
 **Accepted residual risk, stated plainly.** Restricted mode checks the repo, runner and model before the job
 starts. It does not sandbox the runner. Runners run as the owner, so a runner can do whatever that CLI can do as the
@@ -105,7 +139,11 @@ owner's user. In particular:
   helpers) and cannot control.
 - It can push or otherwise use the owner's credentials directly.
 - A runner still running during another job's git operation can race the mirror: it can write between the reset
-  and the git call that follows it.
+  (or a check such as the symbolic-ref check) and the git call that follows it. The same applies to files git
+  writes during a call, such as `COMMIT_EDITMSG`, if a symlink is planted after they were deleted.
+- A process the runner started can keep running after a timed-out git call; the agent stops waiting for it but
+  cannot kill it once it has left git's process group.
+- File names are not Unicode-normalized by the agent beyond what git does.
 - A runner can write into the shared object store and its metadata: corrupt or substitute packs, loose objects,
   pack indexes or the commit-graph file. Ignoring the commit-graph and replace refs removes the easy routes, but
   only a per-job git directory (no shared object store) would close this. That is not adopted in v1.
