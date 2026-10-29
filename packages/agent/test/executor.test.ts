@@ -17,7 +17,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import { canonicalJson, signJob, type AgentToHub, type JobSpec, type SignedJob } from "@hoistline/protocol";
-import { createExecutor, execute, type ExecutorDeps } from "../src/executor.js";
+import { createExecutor, execute, executeInternal, type ExecutorDeps } from "../src/executor.js";
 import { commitWorktree, prepareWorktree } from "../src/git.js";
 import { museTemplate, registerRunner, type PolicyConfig } from "../src/index.js";
 import { Outbox } from "../src/outbox.js";
@@ -987,8 +987,9 @@ describe("cancellation", () => {
 
   it("stops before publishing when cancelled while committing", async () => {
     const controller = new AbortController();
-    const h = harness({
-      signal: controller.signal,
+    const h = harness({ signal: controller.signal });
+    const signed = sign({ write: { "unpublished.txt": "x" } });
+    await executeInternal(signed, h.deps, {
       git: {
         commitWorktree: async (...args: Parameters<typeof commitWorktree>) => {
           controller.abort();
@@ -996,8 +997,6 @@ describe("cancellation", () => {
         },
       },
     });
-    const signed = sign({ write: { "unpublished.txt": "x" } });
-    await execute(signed, h.deps);
     expect(h.result()).toMatchObject({ status: "cancelled" });
     expect(remoteBranchSha(`hoistline/${signed.spec.jobId}`)).toBeNull();
     expect(existsSync(join(h.cacheDir, "work", signed.spec.jobId))).toBe(false);
@@ -1013,6 +1012,27 @@ describe("cancellation", () => {
     controller.abort();
     await waitFor(() => h.results().length === 1, "result");
     expect(h.results()[0]).toMatchObject({ jobId: signed.spec.jobId, status: "cancelled" });
+    await ex.close();
+  });
+});
+
+describe("git overrides", () => {
+  it("are never taken from the public deps of execute or createExecutor", async () => {
+    const hostile = {
+      prepareWorktree: async () => {
+        throw new Error("overridden git");
+      },
+    };
+    const h = harness({ git: hostile } as unknown as Partial<ExecutorDeps>);
+    const direct = sign({ write: { "real-git.txt": "1" } });
+    await execute(direct, h.deps);
+    expect(h.result()).toMatchObject({ status: "succeeded", branch: `hoistline/${direct.spec.jobId}` });
+
+    const ex = createExecutor({ ...h.deps, git: hostile } as unknown as Parameters<typeof createExecutor>[0]);
+    const queued = sign({ write: { "real-git.txt": "2" } });
+    assign(ex, queued);
+    await waitFor(() => h.results().length === 2, "result");
+    expect(h.results()[1]).toMatchObject({ status: "succeeded", branch: `hoistline/${queued.spec.jobId}` });
     await ex.close();
   });
 });

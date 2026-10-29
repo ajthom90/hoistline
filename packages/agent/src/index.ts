@@ -61,7 +61,6 @@ export {
   type CreateExecutorOptions,
   type Executor,
   type ExecutorDeps,
-  type GitOps,
 } from "./executor.js";
 export { Outbox, type JobResult, type OutboxOptions } from "./outbox.js";
 export { claimJob, claimJobSync } from "./seen-jobs.js";

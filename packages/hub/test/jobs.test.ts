@@ -655,6 +655,34 @@ describe("late results after the hub gave up", () => {
     expect(jobs.status(alice.id, job.id)).toBe("succeeded");
   });
 
+  it("never lets an agent set the hub's give-up reasons, so its result cannot be replaced again", () => {
+    const jobs = makeJobs();
+    gateway.connect(laptop.id);
+    const job = jobs.delegate(alice.id, req(laptop.id));
+    gateway.drop(laptop.id);
+    timers.advance(60_000);
+    expect(jobs.result(alice.id, job.id)).toMatchObject({ status: "failed", reason: "agent_disconnected" });
+    gateway.connect(laptop.id, [job.id]);
+    gateway.agent(laptop.id, { type: "job.result", jobId: job.id, status: "failed", reason: " Agent_Disconnected " });
+    expect(jobs.result(alice.id, job.id)).toMatchObject({
+      status: "failed",
+      reason: "agent_reported_Agent_Disconnected",
+    });
+    // A second replacement attempt is dropped, and still acknowledged.
+    gateway.sent.length = 0;
+    gateway.agent(laptop.id, { type: "job.result", jobId: job.id, status: "succeeded", branch: `hoistline/${job.id}` });
+    expect(jobs.result(alice.id, job.id)).toMatchObject({ status: "failed", reason: "agent_reported_Agent_Disconnected" });
+    expect(gateway.sent).toEqual([[laptop.id, { type: "job.ack", jobId: job.id }]]);
+
+    // The same for lost_on_agent, on a running job.
+    const other = jobs.delegate(alice.id, req(laptop.id));
+    gateway.agent(laptop.id, { type: "job.event", jobId: other.id, stream: "status", data: "running" });
+    gateway.agent(laptop.id, { type: "job.result", jobId: other.id, status: "failed", reason: "lost_on_agent" });
+    expect(jobs.result(alice.id, other.id)).toMatchObject({ status: "failed", reason: "agent_reported_lost_on_agent" });
+    gateway.agent(laptop.id, { type: "job.result", jobId: other.id, status: "succeeded" });
+    expect(jobs.status(alice.id, other.id)).toBe("failed");
+  });
+
   it("replaces lost_on_agent, validating the branch as usual", () => {
     const jobs = makeJobs();
     gateway.connect(laptop.id);

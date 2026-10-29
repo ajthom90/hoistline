@@ -132,16 +132,24 @@ type Agent = {
   executor: Executor;
   /** runningJobs of every hello sent. */
   hellos: string[][];
+  /** Every message from the hub, in order, with whether its job's outbox entry existed when it arrived. */
+  received: { msg: Parameters<Executor["onMessage"]>[0]; outboxHad: boolean }[];
   /** Opens a new connection for the same executor (the previous one must be closed). */
   reconnect(): AgentConnection;
 };
 
 function startAgent(
   identity: AgentIdentity,
-  opts: { policy?: PolicyConfig; requestApproval?: (req: ApprovalRequest) => Promise<boolean> } = {},
+  opts: {
+    policy?: PolicyConfig;
+    requestApproval?: (req: ApprovalRequest) => Promise<boolean>;
+    /** Record job.cancel messages but keep them from the executor, so only an ack can discard an outbox entry. */
+    withholdCancels?: boolean;
+  } = {},
 ): Agent {
   let current: AgentConnection | undefined = undefined;
   const hellos: string[][] = [];
+  const received: Agent["received"] = [];
   const executor = createExecutor({
     machineId: identity.machineId,
     hubPublicKey: identity.hubPublicKey,
@@ -163,7 +171,12 @@ function startAgent(
           hellos.push(runningJobs);
           return { agentVersion: "0.0.0", runners: ["muse"], runningJobs, servers: [] };
         },
-        onMessage: (msg) => executor.onMessage(msg),
+        onMessage: (msg) => {
+          const jobId = (msg as { jobId?: unknown }).jobId;
+          received.push({ msg, outboxHad: typeof jobId === "string" && existsSync(outboxFile(jobId)) });
+          if (opts.withholdCancels && msg.type === "job.cancel") return;
+          executor.onMessage(msg);
+        },
         // Unacknowledged results go out again after every welcome.
         onConnected: () => executor.flushOutbox(),
       },
@@ -175,6 +188,7 @@ function startAgent(
     conn: open(),
     executor,
     hellos,
+    received,
     reconnect: () => (agent.conn = open()),
   };
   perTest.push(async () => {
@@ -285,7 +299,7 @@ describe("end to end", () => {
 
   it("replaces agent_disconnected with the real outcome when the result arrives after the grace", async () => {
     const hub = await startHub({ graceMs: 300 });
-    const { identity, agent } = await pairedAgent(hub);
+    const { identity, agent } = await pairedAgent(hub, { withholdCancels: true });
     const gate = join(dir, "gate");
     const job = delegate(hub, "laptop", { write: { "late.txt": "late\n" }, gate });
     await waitFor(() => hub.jobs.status(hub.owner.id, job.id) === "running", "job running");
@@ -296,9 +310,19 @@ describe("end to end", () => {
     writeFileSync(gate, "");
     await waitFor(() => existsSync(outboxFile(job.id)), "result stored in the outbox");
 
+    const seenBefore = agent.received.length;
     agent.reconnect();
     await waitFor(() => hub.jobs.status(hub.owner.id, job.id) === "succeeded", "late result upgrades the job");
     expect(hub.jobs.result(hub.owner.id, job.id)).toMatchObject({ branch: `hoistline/${job.id}` });
+    // Reconcile also sends a job.cancel for this id (it is no longer active on the hub), and that would discard the
+    // entry too. This agent withholds cancels from its executor, so only the ack can remove the entry: the ack must
+    // arrive while the entry is still there, and the entry must be gone afterwards.
+    const forJob = () =>
+      agent.received.slice(seenBefore).filter((r) => (r.msg as { jobId?: string }).jobId === job.id);
+    await waitFor(() => forJob().some((r) => r.msg.type === "job.ack"), "the hub's ack");
+    expect(forJob().filter((r) => r.msg.type === "job.ack")).toEqual([
+      { msg: { type: "job.ack", jobId: job.id }, outboxHad: true },
+    ]);
     await waitFor(() => !existsSync(outboxFile(job.id)), "ack removes the outbox entry");
     expect(hub.gateway.isOnline(identity.machineId)).toBe(true);
   });

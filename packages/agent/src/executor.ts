@@ -70,9 +70,14 @@ export type ExecutorDeps = {
   onOutputLimitBytes?: number;
   setTimeout?: Timers["setTimeout"];
   clearTimeout?: Timers["clearTimeout"];
-  /** Replaces git operations. For tests. */
-  git?: Partial<GitOps>;
 };
+
+/**
+ * Test-only knobs, accepted only by the internal entry points (executeInternal, createExecutorInternal), which the
+ * package does not export: production code can never swap out the hardened git functions, even by spreading a config
+ * object into the deps.
+ */
+export type InternalOptions = { git?: Partial<GitOps> };
 
 const DEFAULT_APPROVAL_TIMEOUT_MS = 3600_000;
 const RESULT_TAIL_BYTES = 64 * 1024;
@@ -84,6 +89,7 @@ type Admitted = { jobId: string; userId: string; spec: JobSpec };
 
 type RunContext = {
   deps: ExecutorDeps;
+  git: GitOps;
   signal: AbortSignal;
   /** Sends events; never throws. */
   send: (msg: AgentToHub) => void;
@@ -120,8 +126,8 @@ function safeSend(deps: ExecutorDeps): (msg: AgentToHub) => void {
   };
 }
 
-function gitOf(deps: ExecutorDeps): GitOps {
-  return { prepareWorktree, commitWorktree, pushBranch, removeWorktree, ...deps.git };
+function gitOf(internal: InternalOptions): GitOps {
+  return { prepareWorktree, commitWorktree, pushBranch, removeWorktree, ...internal.git };
 }
 
 /** sha256 hex of the fields that define what a job does. */
@@ -186,12 +192,18 @@ function admit(signed: SignedJob, deps: ExecutorDeps, send: (msg: AgentToHub) =>
  * policy (and approval), a fresh worktree, the runner, then commit and push of `hoistline/<jobId>`. The worktree is
  * always removed. Never throws.
  */
-export async function execute(signed: SignedJob, deps: ExecutorDeps): Promise<void> {
+export function execute(signed: SignedJob, deps: ExecutorDeps): Promise<void> {
+  return executeInternal(signed, deps);
+}
+
+/** execute with test-only options. Internal: not exported from the package. */
+export async function executeInternal(signed: SignedJob, deps: ExecutorDeps, internal: InternalOptions = {}): Promise<void> {
   try {
     const send = safeSend(deps);
     const job = admit(signed, deps, send);
     if (!job) return;
-    await runAdmitted(job, { deps, signal: deps.signal ?? new AbortController().signal, send, finish: send });
+    const signal = deps.signal ?? new AbortController().signal;
+    await runAdmitted(job, { deps, git: gitOf(internal), signal, send, finish: send });
   } catch {
     // runAdmitted reports every failure; this only guards the promise.
   }
@@ -252,7 +264,7 @@ async function decideAndRun(job: Admitted, ctx: RunContext): Promise<Outcome> {
     outcome = { status: "failed", reason: sanitizeReason(err, deps.cacheDir) };
   } finally {
     try {
-      await gitOf(deps).removeWorktree(repo, jobId, deps.cacheDir);
+      await ctx.git.removeWorktree(repo, jobId, deps.cacheDir);
     } catch {
       // Left for the orphan sweep; never changes the job's outcome.
     }
@@ -298,8 +310,7 @@ async function runInWorktree(
   ctx: RunContext,
   out: { tail: OutputTail; capped: boolean },
 ): Promise<Outcome> {
-  const { deps, signal } = ctx;
-  const git = gitOf(deps);
+  const { deps, signal, git } = ctx;
   const { jobId, repo } = spec;
   const ws = await git.prepareWorktree(repo, spec.baseBranch, jobId, deps.cacheDir, deps.prepareOptions);
   if (signal.aborted) return cancelled(signal);
@@ -402,7 +413,13 @@ type Entry = Admitted & {
  * there until the hub acknowledges it. A second job.assign for a job this executor holds is ignored.
  */
 export function createExecutor(opts: CreateExecutorOptions): Executor {
+  return createExecutorInternal(opts);
+}
+
+/** createExecutor with test-only options. Internal: not exported from the package. */
+export function createExecutorInternal(opts: CreateExecutorOptions, internal: InternalOptions = {}): Executor {
   const deps: ExecutorDeps = opts;
+  const git = gitOf(internal);
   const max = Math.max(1, opts.maxConcurrentJobs ?? 2);
   const maxQueued = Math.max(0, opts.maxQueuedJobs ?? 200);
   const now = deps.now ?? Date.now;
@@ -511,6 +528,7 @@ export function createExecutor(opts: CreateExecutorOptions): Executor {
   function start(entry: Entry): void {
     entry.done = runAdmitted(entry, {
       deps,
+      git,
       signal: entry.signal,
       send,
       finish: deliver,

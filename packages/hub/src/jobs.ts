@@ -103,8 +103,14 @@ const UNSAFE_CHARS = new RegExp(
 );
 
 /** Agent-supplied reason text: unsafe characters stripped, at most 500 characters. */
+/** Reasons only the hub may set: a job failed with one of them can still be replaced by the agent's real result. */
+const HUB_GIVE_UP_REASONS = new Set(["agent_disconnected", "lost_on_agent"]);
+
+/** An agent-supplied reason, made safe to store; never one of the hub's give-up reasons. */
 function cleanReason(reason: string): string {
-  const text = reason.replace(UNSAFE_CHARS, "");
+  let text = reason.replace(UNSAFE_CHARS, "");
+  const trimmed = text.trim();
+  if (HUB_GIVE_UP_REASONS.has(trimmed.toLowerCase())) text = `agent_reported_${trimmed}`;
   if (text.length <= MAX_REASON) return text;
   // Never end on half of a surrogate pair.
   return text.slice(0, MAX_REASON).replace(/[\ud800-\udbff]$/, "");
