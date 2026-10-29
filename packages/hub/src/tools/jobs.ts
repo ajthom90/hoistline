@@ -5,6 +5,7 @@ import { RunnerName } from "@hoistline/protocol";
 import { z } from "zod";
 import {
   AmbiguousMachineError,
+  describeReason,
   MachineOfflineError,
   NotFoundError,
   OUTPUT_TAIL_BYTES,
@@ -70,6 +71,12 @@ export function wrapUntrusted(content: string, genToken: () => string = newToken
     content,
     `--- end untrusted runner output ${token} ---`,
   ].join("\n");
+}
+
+/** The reason line, with plain wording appended for known reason codes. */
+function reasonLine(reason: string): string {
+  const description = describeReason(reason);
+  return description === undefined ? `reason: ${reason}` : `reason: ${reason} (${description})`;
 }
 
 /** The result branch is only ever hoistline/<jobId>; anything else is dropped. */
@@ -148,7 +155,7 @@ export function registerJobTools(server: McpServer, jobs: Jobs, user: User): voi
         if (r.reason !== undefined) data.reasonInText = true;
         const lines = [`Task ${r.jobId}: ${r.status}`];
         if (branch !== undefined) lines.push(`branch: ${branch}`);
-        if (r.reason !== undefined) lines.push(wrapUntrusted(`reason: ${r.reason}`));
+        if (r.reason !== undefined) lines.push(wrapUntrusted(reasonLine(r.reason)));
         return { content: [{ type: "text", text: lines.join("\n") }], structuredContent: data };
       }),
   );
@@ -191,7 +198,7 @@ export function registerJobTools(server: McpServer, jobs: Jobs, user: User): voi
         const head = [`Task ${r.jobId}: ${r.status}`];
         if (r.exitCode !== undefined) head.push(`exit code: ${r.exitCode}`);
         if (branch !== undefined) head.push(`branch: ${branch}`);
-        const untrusted = [...(r.reason !== undefined ? [`reason: ${r.reason}`] : []), `output:\n${tail.text}`];
+        const untrusted = [...(r.reason !== undefined ? [reasonLine(r.reason)] : []), `output:\n${tail.text}`];
         const text = [head.join(", "), wrapUntrusted(untrusted.join("\n"))];
         if (truncated) text.push("Output was truncated to the last 64 KiB; the full log stays on the machine.");
         return { content: [{ type: "text", text: text.join("\n") }], structuredContent: data };

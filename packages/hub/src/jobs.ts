@@ -102,7 +102,16 @@ const UNSAFE_CHARS = new RegExp(
   "gu",
 );
 
-/** Agent-supplied reason text: unsafe characters stripped, at most 500 characters. */
+const REASON_DESCRIPTIONS: Record<string, string> = {
+  approval_unavailable: "the machine could not record the approval request (approval queue unavailable)",
+  approval_denied: "the machine's owner denied this job",
+};
+
+/** Plain wording for a known reason code (exact match only), or undefined. */
+export function describeReason(reason: string): string | undefined {
+  return Object.hasOwn(REASON_DESCRIPTIONS, reason) ? REASON_DESCRIPTIONS[reason] : undefined;
+}
+
 /** Reasons only the hub may set: a job failed with one of them can still be replaced by the agent's real result. */
 const HUB_GIVE_UP_REASONS = new Set(["agent_disconnected", "lost_on_agent"]);
 

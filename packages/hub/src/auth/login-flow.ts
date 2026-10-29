@@ -43,14 +43,28 @@ export interface LoginFlowOptions {
    * (e.g. to record the hub user and its current login). If it throws, the login is denied.
    */
   onLogin?: (user: UserIdentity) => void | Promise<void>;
+  /**
+   * Completes a web UI login (started with startUi) for an allowed user, after onLogin: creates the session and
+   * answers the browser. Without it, UI logins are not offered.
+   */
+  onUiLogin?: (user: UserIdentity, res: Response) => void | Promise<void>;
 }
+
+/** A web UI login in progress: no client, no consent step; bound to the browser by its own nonce cookie. */
+interface PendingUiLogin {
+  browserNonce: string;
+  expiresAt: number;
+}
+
+/** Binds an in-progress web UI login to the browser that started it (separate from the OAuth login cookie). */
+const UI_LOGIN_COOKIE = "hl_ui_login";
 
 const now = () => Math.floor(Date.now() / 1000);
 const random = () => randomBytes(32).toString("base64url");
 
 const HTML_ESCAPES: Record<string, string> = { "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" };
 
-function escapeHtml(text: string): string {
+export function escapeHtml(text: string): string {
   return text.replace(/[&<>"']/g, (c) => HTML_ESCAPES[c]!);
 }
 
@@ -75,6 +89,7 @@ const str = (v: unknown) => (typeof v === "string" ? v : undefined);
  */
 export class LoginFlow {
   private readonly logins = new Map<string, PendingLogin>();
+  private readonly uiLogins = new Map<string, PendingUiLogin>();
   private readonly signer: CookieSigner;
   private readonly secure: boolean;
   private readonly allowed?: Set<string>;
@@ -83,6 +98,25 @@ export class LoginFlow {
     this.signer = new CookieSigner(options.cookieSecret);
     this.secure = options.publicUrl.protocol === "https:";
     if (options.allowedUsers?.length) this.allowed = new Set(parseAllowedUsers(options.allowedUsers));
+  }
+
+  /** Whether a user with these typed identifiers passes the allowlist (always true when none is configured). */
+  isAllowed(identifiers: readonly string[]): boolean {
+    return !this.allowed || identifiers.some((id) => this.allowed!.has(id));
+  }
+
+  /**
+   * GET /ui/login: starts a web UI login with the upstream identity provider. The state is random (32 bytes), lives
+   * 10 minutes, is single use and is bound to this browser by a nonce cookie, like an OAuth login.
+   */
+  async startUi(res: Response): Promise<void> {
+    if (!this.options.onUiLogin) throw new Error("web UI login is not configured");
+    const state = random();
+    const pending: PendingUiLogin = { browserNonce: random(), expiresAt: now() + LOGIN_TTL };
+    this.prune();
+    this.uiLogins.set(state, pending);
+    res.append("Set-Cookie", this.cookie(UI_LOGIN_COOKIE, pending.browserNonce, LOGIN_TTL));
+    res.redirect(302, await this.options.identity.authorizationUrl(state));
   }
 
   /** The provider handed to the SDK auth router: the store, with `authorize` starting this flow. */
@@ -139,7 +173,7 @@ export class LoginFlow {
     const state = str(body.state) ?? "";
     const pending = this.liveLogin(state);
     const csrf = str(body.csrf);
-    if (!pending || !csrf || !safeEqual(csrf, pending.csrf) || !this.fromSameBrowser(req, pending)) {
+    if (!pending || !csrf || !safeEqual(csrf, pending.csrf) || !this.fromSameBrowser(req, pending, LOGIN_COOKIE)) {
       res.status(400).type("text/plain").send("Invalid or expired consent request. Start again from your MCP client.");
       return;
     }
@@ -158,37 +192,67 @@ export class LoginFlow {
   /** GET /oauth/callback from the upstream identity provider. */
   async callback(req: Request, res: Response): Promise<void> {
     const state = str(req.query.state) ?? "";
+    if (state && this.uiLogins.has(state)) return this.uiCallback(req, res, state);
     const pending = this.liveLogin(state);
-    if (!pending || !pending.approved || !this.fromSameBrowser(req, pending)) {
+    if (!pending || !pending.approved || !this.fromSameBrowser(req, pending, LOGIN_COOKIE)) {
       res.status(400).type("text/plain").send("Login expired or invalid. Start again from your MCP client.");
       return;
     }
     this.logins.delete(state);
     res.append("Set-Cookie", this.cookie(LOGIN_COOKIE, "", 0));
-    const denied = (description: string) =>
-      res.redirect(302, clientRedirect(pending.params, { error: "access_denied", error_description: description }));
+    const result = await this.identify(req);
+    if ("denied" in result) {
+      res.redirect(302, clientRedirect(pending.params, { error: "access_denied", error_description: result.denied }));
+      return;
+    }
+    const hubCode = await this.options.store.issueAuthorizationCode(pending.client.client_id, pending.params, result.user);
+    res.redirect(302, clientRedirect(pending.params, { code: hubCode }));
+  }
 
+  /** The callback for a web UI login: the same checks as OAuth, then onUiLogin answers; a denial is a plain page. */
+  private async uiCallback(req: Request, res: Response, state: string): Promise<void> {
+    const pending = this.uiLogins.get(state)!;
+    if (pending.expiresAt <= now() || !this.fromSameBrowser(req, pending, UI_LOGIN_COOKIE)) {
+      res.status(400).type("text/plain").send("Login expired or invalid. Start again at /ui/login.");
+      return;
+    }
+    this.uiLogins.delete(state);
+    res.append("Set-Cookie", this.cookie(UI_LOGIN_COOKIE, "", 0));
+    const result = await this.identify(req);
+    if ("denied" in result) {
+      res
+        .status(403)
+        .type("html")
+        .set({ "Cache-Control": "no-store", "Content-Security-Policy": "default-src 'none'", "X-Frame-Options": "DENY" })
+        .send(
+          `<!doctype html>\n<html lang="en"><head><meta charset="utf-8"><title>Access denied</title></head>` +
+            `<body><h1>Access denied</h1><p>${escapeHtml(result.denied)}</p></body></html>\n`,
+        );
+      return;
+    }
+    await this.options.onUiLogin!(result.user, res);
+  }
+
+  /** Resolves the provider's code to an allowed, recorded user, or says why the login is denied. */
+  private async identify(req: Request): Promise<{ user: UserIdentity } | { denied: string }> {
     const code = str(req.query.code);
     const error = str(req.query.error);
-    if (error || !code) return denied(`Login was not completed: ${error ?? "no code"}`);
+    if (error || !code) return { denied: `Login was not completed: ${error ?? "no code"}` };
     let user: UserIdentity;
     try {
       user = await this.options.identity.resolveCode(code);
     } catch (err) {
-      return denied(`Login failed: ${err instanceof Error ? err.message : String(err)}`);
+      return { denied: `Login failed: ${err instanceof Error ? err.message : String(err)}` };
     }
-    if (this.allowed && !user.identifiers.some((id) => this.allowed!.has(id))) {
-      return denied(`${user.name} is not allowed to use this hub`);
-    }
+    if (!this.isAllowed(user.identifiers)) return { denied: `${user.name} is not allowed to use this hub` };
     if (this.options.onLogin) {
       try {
         await this.options.onLogin(user);
       } catch {
-        return denied("Login failed: the hub could not record this user");
+        return { denied: "Login failed: the hub could not record this user" };
       }
     }
-    const hubCode = await this.options.store.issueAuthorizationCode(pending.client.client_id, pending.params, user);
-    res.redirect(302, clientRedirect(pending.params, { code: hubCode }));
+    return { user };
   }
 
   private liveLogin(state: string): PendingLogin | undefined {
@@ -196,8 +260,8 @@ export class LoginFlow {
     return pending && pending.expiresAt > now() ? pending : undefined;
   }
 
-  private fromSameBrowser(req: Request, pending: PendingLogin): boolean {
-    const nonce = parseCookies(req.headers.cookie).get(LOGIN_COOKIE);
+  private fromSameBrowser(req: Request, pending: { browserNonce: string }, cookie: string): boolean {
+    const nonce = parseCookies(req.headers.cookie).get(cookie);
     return nonce !== undefined && safeEqual(nonce, pending.browserNonce);
   }
 
@@ -219,6 +283,7 @@ export class LoginFlow {
 
   private prune(): void {
     for (const [state, login] of this.logins) if (login.expiresAt <= now()) this.logins.delete(state);
+    for (const [state, login] of this.uiLogins) if (login.expiresAt <= now()) this.uiLogins.delete(state);
   }
 
   private consentPage(state: string, pending: PendingLogin): string {

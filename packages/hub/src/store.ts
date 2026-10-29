@@ -145,9 +145,10 @@ export class Store {
    * Finds or creates the user for an identity-provider subject. `provider` is "github" (subject = numeric id)
    * or "oidc:<issuer>". The login is display-only. Only GitHub logins are unique, so for GitHub another
    * subject still holding the same login is stale and has its login cleared; other providers' logins are never
-   * cleared or treated as unique.
+   * cleared or treated as unique. `identifiers` (typed allowlist values from an interactive login) are saved when
+   * given, so personal access tokens can be re-checked against the allowlist.
    */
-  upsertUser(identity: { provider: string; subject: string; login: string }): User {
+  upsertUser(identity: { provider: string; subject: string; login: string; identifiers?: string[] }): User {
     const { provider, subject, login } = identity;
     return this.db.transaction(() => {
       const existing = this.db
@@ -164,6 +165,11 @@ export class Store {
             "INSERT INTO users (id, provider, subject, login, created_at) VALUES (@id, @provider, @subject, @login, @created_at)",
           )
           .run(record);
+      }
+      if (identity.identifiers) {
+        this.db
+          .prepare("UPDATE users SET identifiers = ? WHERE id = ?")
+          .run(JSON.stringify(identity.identifiers), record.id);
       }
       if (provider === "github" && login) {
         this.db
@@ -245,6 +251,27 @@ export class Store {
     return row ? toUser(row) : null;
   }
 
+  /**
+   * The typed allowlist identifiers saved at the user's last interactive login (see upsertUser), or null when none
+   * were saved yet.
+   */
+  getUserIdentifiers(userId: string): string[] | null {
+    const row = this.db.prepare("SELECT identifiers FROM users WHERE id = ?").get(userId) as
+      | { identifiers: string | null }
+      | undefined;
+    if (!row?.identifiers) return null;
+    const parsed: unknown = JSON.parse(row.identifiers);
+    return Array.isArray(parsed) ? parsed.filter((v): v is string => typeof v === "string") : null;
+  }
+
+  /** Users of one provider whose display login is exactly `login` (logins are not unique outside GitHub). */
+  usersByLogin(provider: string, login: string): User[] {
+    const rows = this.db
+      .prepare("SELECT * FROM users WHERE provider = ? AND login = ? AND login != '' ORDER BY created_at, id")
+      .all(provider, login) as UserRecord[];
+    return rows.map(toUser);
+  }
+
   getUser(userId: string): User | null {
     const row = this.db.prepare("SELECT * FROM users WHERE id = ?").get(userId) as UserRecord | undefined;
     return row ? toUser(row) : null;
@@ -267,11 +294,28 @@ export class Store {
     return toUser(user);
   }
 
-  /** Revokes a share. `target` takes the same forms as shareMachine but resolves only among current sharees. */
-  unshareMachine(ownerId: string, machineId: string, target: string): void {
+  /**
+   * Revokes a share. `target` takes the same forms as shareMachine but resolves only among current sharees. Returns
+   * the user whose share was revoked.
+   */
+  unshareMachine(ownerId: string, machineId: string, target: string): User {
     this.requireOwned(ownerId, machineId);
     const user = this.resolveTarget(target, machineId);
     this.db.prepare("DELETE FROM machine_shares WHERE machine_id = ? AND user_id = ?").run(machineId, user.id);
+    return toUser(user);
+  }
+
+  /**
+   * Deletes a machine the caller owns, with its key, its shares and every job row on it (the jobs table references
+   * the machine). Cancel its active jobs and disconnect its agent first. Throws if the machine is not the owner's.
+   */
+  deleteMachine(ownerId: string, machineId: string): void {
+    this.requireOwned(ownerId, machineId);
+    this.db.transaction(() => {
+      this.db.prepare("DELETE FROM jobs WHERE machine_id = ?").run(machineId);
+      this.db.prepare("DELETE FROM machine_shares WHERE machine_id = ?").run(machineId);
+      this.db.prepare("DELETE FROM machines WHERE id = ?").run(machineId);
+    })();
   }
 
   /** Users holding a share on the machine (owner only). */
@@ -454,6 +498,22 @@ export class Store {
       | JobRecord
       | undefined;
     return row ? toJob(row) : null;
+  }
+
+  /**
+   * For the web UI: jobs the user submitted plus every job on a machine the user owns, newest first, each with the
+   * requester's display login and the machine's name.
+   */
+  jobsForOwnerOrSubmitter(userId: string, limit = 200): (JobRow & { requesterLogin: string; machineName: string })[] {
+    const rows = this.db
+      .prepare(
+        `SELECT j.*, u.login AS requester_login, m.name AS machine_name
+         FROM jobs j JOIN users u ON u.id = j.user_id JOIN machines m ON m.id = j.machine_id
+         WHERE j.user_id = @userId OR m.owner_id = @userId
+         ORDER BY j.created_at DESC, j.id LIMIT @limit`,
+      )
+      .all({ userId, limit }) as (JobRecord & { requester_login: string; machine_name: string })[];
+    return rows.map((r) => ({ ...toJob(r), requesterLogin: r.requester_login, machineName: r.machine_name }));
   }
 
   /** Applies the patch (id, userId and createdAt are immutable) and bumps updatedAt unless the patch sets it. */

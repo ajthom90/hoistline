@@ -421,7 +421,9 @@ describe("migrations", () => {
 
     const store = open(path);
     const names = store.db.prepare("SELECT name FROM schema_migrations ORDER BY name").all();
-    expect(names).toEqual([{ name: "001_init.sql" }, { name: "002_job_result_columns.sql" }]);
+    expect(names).toEqual([{ name: "001_init.sql" }, { name: "002_job_result_columns.sql" }, { name: "003_ui.sql" }]);
+    // Users from before 003 have no saved allowlist identifiers until they log in again.
+    expect(store.getUserIdentifiers("u1")).toBeNull();
     expect(store.getJobById("old")).toMatchObject({ status: "running", output: "out" });
     expect(store.getJobById("old")!.outputTruncated).toBeUndefined();
     expect(store.transitionJob("old", ["running"], { status: "failed", exitCode: 3, outputTruncated: true })).toBe(true);

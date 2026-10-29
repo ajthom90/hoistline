@@ -215,4 +215,74 @@ describe("agent CLI end to end", () => {
     expect(hub.jobs.result(hub.owner.id, waiting.id)).toMatchObject({ status: "cancelled", reason: "agent_shutdown" });
     expect(spawned).toHaveLength(1);
   });
+
+  it("holds a shared user's job under the owner's ask policy until the owner approves it on the agent", async () => {
+    const hub = await startHub();
+    const bob = hub.store.upsertUser({ provider: "github", subject: "2", login: "bob" });
+    const home = join(dir, "agent-home");
+    let out = "";
+    const io: CliIO = {
+      stdout: (s) => (out += s),
+      stderr: () => {},
+      stdin: [],
+      isTTY: false,
+      env: { HOISTLINE_AGENT_HOME: home },
+    };
+    const cli = (...argv: string[]) => main(argv, io);
+    expect(await cli("pair", hub.url, hub.store.createPairingCode(hub.owner.id), "--name", "laptop")).toBe(0);
+    const identity = loadIdentity(join(home, "identity.json"));
+    hub.store.shareMachine(hub.owner.id, identity.machineId, "github:bob");
+    savePolicy(join(home, "policy.json"), {
+      mode: "restricted",
+      repos: ["someone/else"],
+      runners: ["muse"],
+      onViolation: "ask",
+    });
+
+    const spawned: string[] = [];
+    let signal: ((sig: "SIGINT" | "SIGTERM") => void) | undefined;
+    const running = main(["run", "--cache-dir", join(dir, "cache")], io, {
+      registerRunners: () =>
+        registerRunner("muse", {
+          file: process.execPath,
+          args: (spec, ctx) => {
+            spawned.push(process.execPath);
+            return [script, ctx.cwd!, spec.prompt];
+          },
+        }),
+      prepareOptions: { remoteFor: () => remote, allowFileProtocol: true },
+      approvalPollIntervalMs: 20,
+      onSignal: (handler) => {
+        signal = handler;
+        return () => {};
+      },
+    });
+    cleanups.push(async () => {
+      signal?.("SIGINT");
+      await running;
+    });
+    await waitFor(() => hub.gateway.isOnline(identity.machineId), "agent online");
+
+    const job = hub.jobs.delegate(bob.id, {
+      machine: identity.machineId,
+      runner: "muse",
+      repo: "https://github.com/Owner/Name.git",
+      branch: "main",
+      prompt: JSON.stringify({ write: { "shared.txt": "from bob\n" } }),
+    });
+    await waitFor(() => hub.jobs.status(bob.id, job.id) === "awaiting_approval", "awaiting approval on the hub");
+    const pendingDir = join(home, "approvals", "pending");
+    await waitFor(() => existsSync(pendingDir) && readdirSync(pendingDir).includes(`${job.id}.json`), "pending approval");
+    await new Promise((r) => setTimeout(r, 200));
+    expect(hub.jobs.status(bob.id, job.id)).toBe("awaiting_approval");
+    expect(spawned).toEqual([]);
+
+    out = "";
+    expect(await cli("approvals", "show", job.id)).toBe(0);
+    const hash = /spec hash:\s+([0-9a-f]{64})/.exec(out)![1]!;
+    expect(await cli("approvals", "approve", job.id, "--yes", "--hash", hash)).toBe(0);
+    await waitFor(() => hub.jobs.status(bob.id, job.id) === "succeeded", "approved job to succeed");
+    expect(spawned).toEqual([process.execPath]);
+    expect(fx(["show", `refs/heads/hoistline/${job.id}:shared.txt`], remote)).toBe("from bob\n");
+  });
 });

@@ -7,6 +7,7 @@ import { metadataHandler } from "@modelcontextprotocol/sdk/server/auth/handlers/
 import { requireBearerAuth } from "@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js";
 import { InvalidTokenError } from "@modelcontextprotocol/sdk/server/auth/errors.js";
 import type { OAuthTokenVerifier } from "@modelcontextprotocol/sdk/server/auth/provider.js";
+import type { AuthInfo } from "@modelcontextprotocol/sdk/server/auth/types.js";
 import {
   GithubIdentityProvider,
   OidcIdentityProvider,
@@ -25,6 +26,9 @@ import { pairRouter } from "./pairing.js";
 import type { Store, User } from "./store.js";
 import { registerJobTools } from "./tools/jobs.js";
 import { registerMachineTools } from "./tools/machines.js";
+import { AccessTokens, PAT_PREFIX } from "./tokens.js";
+import { uiLoginHandler, uiRouter } from "./ui.js";
+import { UiSessions } from "./ui/session.js";
 
 export type { FetchFn, GithubOAuthConfig, OidcConfig } from "./auth/identity.js";
 export type { HubOAuthProvider } from "./auth/in-memory-provider.js";
@@ -65,11 +69,19 @@ interface ToolContext {
   user: User;
 }
 
-/** Creates the hub user for a freshly fetched identity, or updates its display login. */
+/** Creates the hub user for a freshly fetched identity, or updates its display login and allowlist identifiers. */
 function recordUser(store: Store, user: UserIdentity): void {
   const key = userKey(user);
   if (!key) throw new Error("identity has no stable key");
-  store.upsertUser({ ...key, login: user.name });
+  store.upsertUser({ ...key, login: user.name, identifiers: user.identifiers });
+}
+
+/** The identity a personal access token acts as, in the same shape OAuth tokens carry in AuthInfo.extra.user. */
+function identityOf(user: User, identifiers: string[]): UserIdentity {
+  if (user.provider.startsWith("oidc:")) {
+    return { provider: "oidc", issuer: user.provider.slice("oidc:".length), subject: user.subject, name: user.login, identifiers };
+  }
+  return { provider: "github", subject: user.subject, name: user.login, identifiers };
 }
 
 function buildMcpServer(ctx?: ToolContext): McpServer {
@@ -91,6 +103,12 @@ export function createApp(deps: AppDeps): express.Express {
     ? new OidcIdentityProvider(deps.oidc, callbackUrl, deps.fetch)
     : new GithubIdentityProvider(deps.github, callbackUrl, deps.fetch);
   const store = deps.oauthProvider ?? new InMemoryOAuthProvider();
+  // The web UI needs the whole hub: database, agent connections and jobs.
+  const ui =
+    deps.store && deps.gateway && deps.jobs
+      ? { store: deps.store, gateway: deps.gateway, jobs: deps.jobs, sessions: new UiSessions(deps.store) }
+      : undefined;
+  const tokens = deps.store ? new AccessTokens(deps.store) : undefined;
   const login = new LoginFlow({
     identity,
     store,
@@ -100,6 +118,7 @@ export function createApp(deps: AppDeps): express.Express {
     // The only place users are created or their display login updated: the identity was just fetched from the
     // provider, so the login is current. Using a token never writes users (its saved login can be stale).
     onLogin: deps.store ? (user) => recordUser(deps.store!, user) : undefined,
+    onUiLogin: ui ? uiLoginHandler(ui.store, ui.sessions, deps.publicUrl) : undefined,
   });
   const provider = login.provider();
 
@@ -133,9 +152,39 @@ export function createApp(deps: AppDeps): express.Express {
     }
   });
 
+  if (ui && tokens) {
+    app.use(
+      uiRouter({
+        ...ui,
+        tokens,
+        login,
+        publicUrl: deps.publicUrl.replace(/\/+$/, ""),
+        oidcProvider: deps.oidc ? `oidc:${deps.oidc.issuer}` : undefined,
+      }),
+    );
+  }
+
+  /**
+   * A personal access token: valid while live and while its user still passes the allowlist (checked against the
+   * identifiers saved at the user's last interactive login; none saved fails closed). Never writes users.
+   */
+  const verifyPat = (token: string): AuthInfo => {
+    const found = tokens!.verify(token, (user) => login.isAllowed(deps.store!.getUserIdentifiers(user.id) ?? []));
+    if (!found) throw new InvalidTokenError("Invalid or expired access token");
+    const identifiers = deps.store!.getUserIdentifiers(found.user.id) ?? [];
+    return {
+      token,
+      clientId: `pat:${found.tokenId}`,
+      scopes: [],
+      expiresAt: Math.floor(found.expiresAt / 1000),
+      extra: { user: identityOf(found.user, identifiers), hubUser: found.user },
+    };
+  };
+
   // With a store, a token is valid only while its identity maps to an existing hub user (read-only lookup).
   const verifier: OAuthTokenVerifier = {
     verifyAccessToken: async (token) => {
+      if (tokens && token.startsWith(PAT_PREFIX)) return verifyPat(token);
       const info = await provider.verifyAccessToken(token);
       if (!machines) return info;
       const identity = info.extra?.user as UserIdentity | undefined;
