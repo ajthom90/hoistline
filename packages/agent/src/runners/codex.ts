@@ -1,0 +1,22 @@
+import { requireWorktree, wrapPrompt } from "./prompt.js";
+import type { RunnerTemplate } from "./template.js";
+
+/**
+ * Codex CLI, headless: `codex exec`, its own sandbox in workspace-write mode rooted at the worktree, the wrapped
+ * prompt read from stdin (`-`). See the invocations table in docs/runners.md for each flag.
+ */
+export const codexTemplate: RunnerTemplate = {
+  file: "codex",
+  args: (spec, ctx) => [
+    "exec",
+    "--json",
+    "--ignore-user-config",
+    "--sandbox",
+    "workspace-write",
+    "-C",
+    requireWorktree("codex", ctx),
+    ...(spec.model !== undefined ? ["--model", spec.model] : []),
+    "-",
+  ],
+  stdin: (spec) => wrapPrompt(spec.prompt),
+};

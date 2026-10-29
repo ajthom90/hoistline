@@ -1,15 +1,18 @@
 import type { JobSpec, RunnerName } from "@hoistline/protocol";
 
+/** Where the job runs. `cwd` is the worktree; it is absent when a command is built without one (tests). */
+export type RunnerContext = { cwd?: string };
+
 /**
  * A runner adapter: how to turn a job into one child process. `args` and `stdin` receive a spec whose `model` is
- * already validated and whose `command` is stripped unless the runner is `build-test`. Adapters must pass the
- * prompt via stdin when the CLI supports it, else as a single positional after `--`, and never inside a flag
- * (see docs/runners.md).
+ * already validated and whose `command` is stripped unless the runner is `build-test`, plus the context the job
+ * runs in. Adapters must pass the prompt via stdin when the CLI supports it, else as a single positional after
+ * `--`, and never inside a flag (see docs/runners.md).
  */
 export type RunnerTemplate = {
   file: string;
-  args: (spec: JobSpec) => string[];
-  stdin?: (spec: JobSpec) => string;
+  args: (spec: JobSpec, ctx: RunnerContext) => string[];
+  stdin?: (spec: JobSpec, ctx: RunnerContext) => string;
 };
 
 export type RunnerCommand = { file: string; args: string[]; stdin?: string };
@@ -29,16 +32,21 @@ export function _resetRunnersForTests(): void {
 }
 
 /** Builds the argument array (and optional stdin) for a job. Never builds a shell string. */
-export function buildCommand(spec: JobSpec): RunnerCommand {
+export function buildCommand(spec: JobSpec, ctx: RunnerContext = {}): RunnerCommand {
   const template = registry.get(spec.runner);
   if (!template) throw new Error(`runner_not_implemented: ${spec.runner}`);
   if (spec.model !== undefined && (typeof spec.model !== "string" || !MODEL.test(spec.model))) {
     throw new Error(`invalid model ${JSON.stringify(spec.model)}`);
   }
+  // build-test is the one runner that executes a shell string, so it must have one.
+  if (spec.runner === "build-test" && (typeof spec.command !== "string" || spec.command.length === 0)) {
+    throw new Error("build-test requires a command");
+  }
   const safe: JobSpec = { ...spec };
   if (spec.runner !== "build-test") delete safe.command;
+  const context: RunnerContext = { ...ctx };
 
-  const args = template.args(safe);
+  const args = template.args(safe, context);
   if (!Array.isArray(args) || !args.every((a) => typeof a === "string")) {
     throw new Error(`runner ${spec.runner} produced a non-string argument`);
   }
@@ -46,6 +54,6 @@ export function buildCommand(spec: JobSpec): RunnerCommand {
     throw new Error(`runner ${spec.runner} has no executable`);
   }
   const command: RunnerCommand = { file: template.file, args: [...args] };
-  if (template.stdin) command.stdin = template.stdin(safe);
+  if (template.stdin) command.stdin = template.stdin(safe, context);
   return command;
 }

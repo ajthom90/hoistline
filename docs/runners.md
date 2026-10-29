@@ -11,13 +11,16 @@ An adapter is a `RunnerTemplate`:
 ```ts
 type RunnerTemplate = {
   file: string;                          // the executable
-  args: (spec: JobSpec) => string[];     // the argument array
-  stdin?: (spec: JobSpec) => string;     // optional text written to the child's stdin
+  args: (spec: JobSpec, ctx: RunnerContext) => string[];  // the argument array
+  stdin?: (spec: JobSpec, ctx: RunnerContext) => string;  // optional text written to the child's stdin
 };
+type RunnerContext = { cwd?: string };   // the worktree the job runs in
 ```
 
-Adapters are registered with `registerRunner(name, template)`. `buildCommand(spec)` turns a signed job into
-`{ file, args, stdin? }`. A runner that has no registered adapter fails with `runner_not_implemented`.
+Adapters are registered with `registerRunner(name, template)`. `buildCommand(spec, ctx?)` turns a signed job into
+`{ file, args, stdin? }`. A runner that has no registered adapter fails with `runner_not_implemented`. `ctx.cwd` is
+the absolute worktree path; Muse and Codex put it in their own workspace flag and refuse to build without it.
+`registerBuiltinRunners()` registers `muse`, `codex` and `build-test` (idempotent; Cursor and Grok come in Task 13).
 
 ## Rules every adapter must follow
 
@@ -25,7 +28,9 @@ Job fields come from a signed job but are still untrusted text. These rules keep
 runner does:
 
 1. **Arrays only, never a shell.** The child is started with `execFile`/`spawn` and an argument array. No adapter
-   builds a command string, and nothing runs through `sh -c`, `cmd /c` or `shell: true`.
+   builds a command string, and nothing runs through `sh -c`, `cmd /c` or `shell: true`. The one exception is the
+   `build-test` runner, whose whole purpose is to run the job's `command` string: it passes that string as one
+   argument to `sh -c` (Windows: `cmd.exe /d /s /c`). That is why a policy must list `build-test` explicitly.
 2. **The prompt goes in via stdin when the CLI supports it.** If the CLI cannot read the prompt from stdin, the
    prompt is one positional argument placed **after a `--`**, so a prompt that starts with `-` can never be read as
    a flag.
@@ -35,7 +40,8 @@ runner does:
 4. **Model names are validated before the adapter sees them.** `buildCommand` rejects any `model` that does not
    match `^[A-Za-z0-9][A-Za-z0-9._:/-]{0,99}$`, so a model can never look like a flag or carry shell syntax. Pass
    it as the value of the CLI's model flag in its own array element (for example `["--model", spec.model]`).
-5. **`command` is for `build-test` only.** `buildCommand` strips `spec.command` before calling any other adapter.
+5. **`command` is for `build-test` only.** `buildCommand` strips `spec.command` before calling any other adapter,
+   and refuses a `build-test` job whose `command` is missing or empty (`build-test requires a command`).
 6. **No guessed flags.** Each row in the table below records the exact non-interactive invocation, taken from that
    CLI's own `--help` or documentation at the time the adapter was written.
 
@@ -171,12 +177,96 @@ shared mirror carrying over from one job into the next. It does not protect agai
 - Never add the shared mirror (`<cacheDir>/repos/...`) to a CLI sandbox's writable roots. Note that a worktree's git
   metadata lives in the mirror, so a sandbox that lets the runner commit already has write access to it.
 
+## Running a job: `runJob`
+
+`runJob(spec, dir, onOutput, signal, opts?)` in `packages/agent/src/runners/run.ts` builds the command with
+`buildCommand(spec, { cwd: dir })` and runs it:
+
+- `spawn` with `shell: false` and `cwd = dir`. On macOS and Linux the runner is `detached`, so it leads its own
+  process group.
+- Stdin gets the template's `stdin` text (if any) and is then closed, so no CLI waits on a terminal.
+- Environment: the owner's own (the CLIs need their logins and credentials) minus every variable whose name starts
+  with `GIT_` or `HOISTLINE_` (compared case-insensitively). The agent's git pinning or an inherited `GIT_DIR` never
+  reaches the runner, and nothing in it can steer the runner's git.
+- Output goes to `onOutput(chunk, "stdout" | "stderr")` as it arrives, in pieces of at most 16 KiB of UTF-8, never
+  splitting a character. If `onOutput` throws, the exception is caught and counted (`outputErrors` in the result)
+  and the job carries on, so a bad callback cannot crash or hang a job.
+- Abort (`signal`) and the maximum runtime (`opts.timeoutMs`, default 60 minutes) take the same path: SIGTERM to
+  the whole process group, then SIGKILL to the group after `opts.termGraceMs` (default 2 s), even if the leader has
+  already exited. On Windows: `taskkill /T /F`.
+- After the runner exits, the agent waits at most `opts.killGraceMs` (default 5 s) for the output pipes to close,
+  then closes them itself, so a descendant that left the process group and holds the pipes cannot hang the job.
+- Result: `{ exitCode, timedOut?, aborted?, outputErrors? }`. `exitCode` is the exit code, or 128 + the signal
+  number when the runner was killed by a signal (143 for SIGTERM, 137 for SIGKILL). A timeout gives exit code 124
+  and `timedOut: true`; an abort gives `aborted: true`. A nonzero exit is a value, never an exception. A signal that
+  is already aborted when `runJob` is called spawns nothing and gives `{ exitCode: 130, aborted: true }`.
+- Errors: a CLI that is not on `PATH` throws `RunnerNotInstalledError` (`runner_not_installed: <file>`). A `dir`
+  that is not a directory, or any other failure to start (for example `E2BIG`, see Muse below), throws a plain
+  `Error`.
+
+## Prompt preamble
+
+Muse and Codex never see the user's prompt alone. Their adapters send `RUNNER_PREAMBLE + PROMPT_DELIMITER + prompt`
+(constants in `packages/agent/src/runners/prompt.ts`). The preamble tells the CLI to work only inside the current
+directory, not to run `git commit`, `git push`, `git config` or `git remote`, not to modify git configuration or
+files outside the working directory, and to leave its changes uncommitted (the agent commits afterwards). The
+delimiter is `\n\n===== TASK =====\n\n`; the user's prompt follows it byte for byte. This is an instruction to a
+model, not a control: the sandbox notes below and the hardening above are what actually limit a runner.
+`build-test` gets no preamble.
+
 ## Invocations
 
 | Runner | Added by | Executable | Exact non-interactive invocation | Prompt via | Model flag |
 | --- | --- | --- | --- | --- | --- |
-| Muse | Task 8 | _to be filled in by Task 8_ | _to be filled in by Task 8_ | | |
-| Codex | Task 8 | _to be filled in by Task 8_ | _to be filled in by Task 8_ | | |
+| Muse | Task 8 | `muse` (Muse Code 1.4.14) | `muse exec --json --approval-mode never --disable-request-user-input --workspace <worktree> [--model <model>] -- <preamble + prompt>` | one positional after `--` (no stdin form) | `--model <model>` |
+| Codex | Task 8 | `codex` (codex-cli 0.161.0) | `codex exec --json --ignore-user-config --sandbox workspace-write -C <worktree> [--model <model>] -` | stdin (`-`) | `--model <model>` |
 | Cursor | Task 13 | _to be filled in by Task 13_ | _to be filled in by Task 13_ | | |
 | Grok | Task 13 | _to be filled in by Task 13_ | _to be filled in by Task 13_ | | |
-| build-test | _later task_ | _to be filled in_ | _to be filled in_ | | n/a |
+| build-test | Task 8 | `sh` (Windows: `cmd.exe`) | `sh -c <command>` (Windows: `cmd.exe /d /s /c <command>`) | none; `command` is the one argument after `-c` | n/a |
+
+Sources: `muse --help`, `muse exec --help`, `codex --help` and `codex exec --help` on the owner's machine
+(2026-10-29), and the owner's `muse-build` and `codex-build` skills. No model call was made to check them.
+
+**Muse.** `muse exec` runs one prompt headless. It takes the prompt as a positional or `--prompt-file`; it has no
+stdin form (`--api-key-stdin` reads a key, not the prompt), so the prompt is the one positional after `--`.
+`--prompt-file` was not used: it would mean writing the prompt to a file, and the owner's skill notes the file
+belongs inside the workspace, where the runner can rewrite it and it would be committed.
+
+- `--json`: machine-readable JSONL events on stdout (the owner's convention; the final `run.terminal.completed`
+  record carries the summary and `run.usage` the tokens), for later tasks to parse.
+- `--approval-mode never`: a headless run must not wait on an approval prompt. The help states approval and the
+  sandbox are both on by default; this flag changes only approvals. The OS sandbox stays on with its default network
+  mode (`proxy-only`). This is the owner's own headless setting.
+- `--disable-request-user-input`: withholds the ask-the-user tool, so a run cannot block on a question nobody sees.
+- `--workspace <worktree>`: roots Muse's policy-gated workspace tools at the worktree (it is also the `cwd`).
+- Not used: `--yolo`, `--disable-sandbox`, `--disable-approval` (each turns safety off, and a safer documented
+  mode exists); `--trust-workspace` (it loads the repository's own skills and rules, which are untrusted repo
+  content; the owner's skill uses it for their own repos, but a job can name any allowed repo); `-w`/`--worktree`
+  (the agent already made the worktree).
+- `--` is assumed to end option parsing as in every clap-based CLI; the help does not mention it and it was not
+  run.
+- Limit: Linux caps one argument at 128 KiB (`MAX_ARG_STRLEN`). A 100,000-character prompt of multi-byte text
+  plus the preamble can exceed that; the spawn then fails with `E2BIG` and `runJob` throws a plain error (not
+  `runner_not_installed`). macOS has no per-argument cap below its total limit.
+
+**Codex.** `codex exec` reads the prompt from stdin when the prompt argument is `-` (documented in its help), so
+the wrapped prompt goes on stdin and nothing from the job reaches the argument list except the validated model.
+
+- `--json`: JSONL events on stdout (the owner's convention).
+- `--sandbox workspace-write`: Codex's own sandbox, writable only in the workspace. The help also lists `read-only`
+  and `danger-full-access`; `--dangerously-bypass-approvals-and-sandbox` is never used.
+- `-C <worktree>`: the sandbox's working root is the worktree. No `--add-dir`: the shared mirror and every other
+  directory stay outside the writable roots. A worktree's `.git` is a file pointing into the mirror, so Codex can
+  edit files but not commit, which is what the agent wants.
+- Network: not enabled. Workspace-write has network access off unless configured, and nothing here turns it on.
+- `--ignore-user-config`: does not load `~/.codex/config.toml` (auth still uses `CODEX_HOME`), so the owner's
+  interactive settings (extra writable roots, network access, MCP servers with auto-approval, a different default
+  sandbox or model) cannot widen a job's sandbox. Consequence: without `--model` the job uses Codex's built-in
+  default model, not the owner's configured one.
+- Not used: `--skip-git-repo-check` (the worktree is a git checkout; not verified against a worktree whose `.git`
+  is a file, so a later task should confirm with a real run), `--approve-for-me`, `--worktree`, `--add-dir`.
+
+**build-test.** `command` reaches the shell as exactly one argument (`["sh", ["-c", command]]`, Windows
+`["cmd.exe", ["/d", "/s", "/c", command]]`) in the worktree, with the same environment, output, abort and timeout
+handling as every runner. On Windows, Node quotes that argument for `CreateProcess` and `cmd.exe` has its own
+quoting rules, so a command with embedded quotes needs checking there (not tested on Windows).

@@ -32,7 +32,24 @@ export {
   validateRepo,
   type PrepareOptions,
 } from "./git.js";
-export { buildCommand, registerRunner, type RunnerCommand, type RunnerTemplate } from "./runners/index.js";
+export {
+  PROMPT_DELIMITER,
+  RUNNER_PREAMBLE,
+  RunnerNotInstalledError,
+  buildCommand,
+  buildTestTemplate,
+  codexTemplate,
+  museTemplate,
+  registerBuiltinRunners,
+  registerRunner,
+  runJob,
+  type OutputStream,
+  type RunJobOptions,
+  type RunJobResult,
+  type RunnerCommand,
+  type RunnerContext,
+  type RunnerTemplate,
+} from "./runners/index.js";
 export {
   agentSocketUrl,
   connect,
