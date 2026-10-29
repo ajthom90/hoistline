@@ -33,6 +33,8 @@ export async function pairMachine(
   const { privateKey, publicKey } = generateKeyPairSync("ed25519");
   const res = await fetchFn(new URL("/pair", base).href, {
     method: "POST",
+    // Never follow a redirect: the code and the answer (the hub's signing key) must come from this hub URL.
+    redirect: "error",
     headers: { "content-type": "application/json", accept: "application/json" },
     body: JSON.stringify({ code, name, publicKey: encodePublicKey(publicKey) }),
   });

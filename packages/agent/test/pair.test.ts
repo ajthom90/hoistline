@@ -1,5 +1,7 @@
 import { createPublicKey, generateKeyPairSync, sign, verify } from "node:crypto";
-import { mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, readdirSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { createServer } from "node:http";
+import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -64,6 +66,28 @@ describe("pairMachine", () => {
     await expect(pairMachine("https://hub.example.com", "c", "laptop", { fetch: hub.fetch })).rejects.toThrow();
   });
 
+  it("does not follow a redirect from /pair", async () => {
+    const hits: string[] = [];
+    const server = createServer((req, res) => {
+      hits.push(`${req.method} ${req.url}`);
+      if (req.url === "/pair") {
+        res.writeHead(307, { location: "/elsewhere" }).end();
+      } else {
+        res.writeHead(200, { "content-type": "application/json" });
+        res.end(JSON.stringify({ machineId: MACHINE_ID, hubPublicKey: hubPublicKeyDer }));
+      }
+    });
+    await new Promise<void>((r) => server.listen(0, "127.0.0.1", r));
+    try {
+      const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
+      await expect(pairMachine(url, "c", "laptop")).rejects.toThrow();
+      expect(hits).toEqual(["POST /pair"]);
+    } finally {
+      server.closeAllConnections();
+      await new Promise((r) => server.close(r));
+    }
+  });
+
   it("requires https except for loopback hubs", async () => {
     const hub = stubHub();
     await expect(pairMachine("http://hub.example.com", "c", "laptop", { fetch: hub.fetch })).rejects.toThrow(/https/);
@@ -100,6 +124,15 @@ describe("identity files", () => {
     saveIdentity(path, await identity());
     if (process.platform !== "win32") expect(statSync(path).mode & 0o777).toBe(0o600);
     expect(JSON.parse(readFileSync(path, "utf8")).machineId).toBe(MACHINE_ID);
+  });
+
+  it("tightens an existing directory to 0700", async () => {
+    const home = join(dir, "existing");
+    mkdirSync(home, { mode: 0o755 });
+    chmodSync(home, 0o755);
+    saveIdentity(join(home, "identity.json"), await identity());
+    if (process.platform !== "win32") expect(statSync(home).mode & 0o777).toBe(0o700);
+    expect(readdirSync(home)).toEqual(["identity.json"]); // no temp file left behind
   });
 
   it("rejects a malformed identity file", () => {

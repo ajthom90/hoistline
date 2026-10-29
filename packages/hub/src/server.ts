@@ -5,6 +5,8 @@ import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/
 import { getOAuthProtectedResourceMetadataUrl, mcpAuthRouter } from "@modelcontextprotocol/sdk/server/auth/router.js";
 import { metadataHandler } from "@modelcontextprotocol/sdk/server/auth/handlers/metadata.js";
 import { requireBearerAuth } from "@modelcontextprotocol/sdk/server/auth/middleware/bearerAuth.js";
+import { InvalidTokenError } from "@modelcontextprotocol/sdk/server/auth/errors.js";
+import type { OAuthTokenVerifier } from "@modelcontextprotocol/sdk/server/auth/provider.js";
 import {
   GithubIdentityProvider,
   OidcIdentityProvider,
@@ -57,6 +59,13 @@ interface ToolContext {
   user: User;
 }
 
+/** Creates the hub user for a freshly fetched identity, or updates its display login. */
+function recordUser(store: Store, user: UserIdentity): void {
+  const key = userKey(user);
+  if (!key) throw new Error("identity has no stable key");
+  store.upsertUser({ ...key, login: user.name });
+}
+
 function buildMcpServer(ctx?: ToolContext): McpServer {
   const server = new McpServer({ name: "hoistline", version: "0.0.0" });
   server.registerTool("ping", { description: "Check that the Hoistline hub is reachable." }, async () => ({
@@ -79,6 +88,9 @@ export function createApp(deps: AppDeps): express.Express {
     publicUrl,
     cookieSecret: deps.cookieSecret ?? randomBytes(32).toString("base64url"),
     allowedUsers: deps.allowedUsers,
+    // The only place users are created or their display login updated: the identity was just fetched from the
+    // provider, so the login is current. Using a token never writes users (its saved login can be stale).
+    onLogin: deps.store ? (user) => recordUser(deps.store!, user) : undefined,
   });
   const provider = login.provider();
 
@@ -112,24 +124,28 @@ export function createApp(deps: AppDeps): express.Express {
     }
   });
 
+  // With a store, a token is valid only while its identity maps to an existing hub user (read-only lookup).
+  const verifier: OAuthTokenVerifier = {
+    verifyAccessToken: async (token) => {
+      const info = await provider.verifyAccessToken(token);
+      if (!machines) return info;
+      const identity = info.extra?.user as UserIdentity | undefined;
+      const key = identity && userKey(identity);
+      const user = key ? machines.store.getUserByKey(key.provider, key.subject) : null;
+      if (!user) throw new InvalidTokenError("Invalid or expired access token");
+      return { ...info, extra: { ...info.extra, hubUser: user } };
+    },
+  };
   const bearer = requireBearerAuth({
-    verifier: provider,
+    verifier,
     resourceMetadataUrl: getOAuthProtectedResourceMetadataUrl(publicUrl),
   });
 
   // Stateless Streamable HTTP: a fresh server and transport per request.
   app.post("/mcp", bearer, express.json(), async (req, res, next) => {
-    let ctx: ToolContext | undefined;
-    if (machines) {
-      // Tools act as the hub user the token was issued to, keyed on provider and subject, never on a login.
-      const identity = req.auth?.extra?.user as UserIdentity | undefined;
-      const key = identity && userKey(identity);
-      if (!identity || !key) {
-        res.status(401).json({ error: "invalid_token", error_description: "Unrecognized identity" });
-        return;
-      }
-      ctx = { ...machines, user: machines.store.upsertUser({ ...key, login: identity.name }) };
-    }
+    // Tools act as the hub user the token was issued to (resolved by provider and subject, never by login).
+    const hubUser = req.auth?.extra?.hubUser as User | undefined;
+    const ctx: ToolContext | undefined = machines && hubUser ? { ...machines, user: hubUser } : undefined;
     const server = buildMcpServer(ctx);
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
     res.on("close", () => {

@@ -1,4 +1,4 @@
-import { createPrivateKey, createPublicKey, type KeyObject } from "node:crypto";
+import { createPrivateKey, createPublicKey, randomBytes, type KeyObject } from "node:crypto";
 import { chmodSync, mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
@@ -55,9 +55,11 @@ export function saveIdentity(path: string, identity: AgentIdentity): void {
     privateKey: identity.privateKey.export({ format: "pem", type: "pkcs8" }).toString(),
     hubPublicKey: encodePublicKey(identity.hubPublicKey),
   };
-  mkdirSync(dirname(path), { recursive: true, mode: 0o700 });
+  const dir = dirname(path);
+  mkdirSync(dir, { recursive: true, mode: 0o700 });
+  chmodSync(dir, 0o700); // also when the directory already existed
   // Write a private temp file and rename it over the target, so an existing file's looser mode never applies.
-  const tmp = `${path}.${process.pid}.tmp`;
+  const tmp = `${path}.${randomBytes(8).toString("hex")}.tmp`;
   try {
     writeFileSync(tmp, `${JSON.stringify(file, null, 2)}\n`, { mode: 0o600, flag: "wx" });
     chmodSync(tmp, 0o600);

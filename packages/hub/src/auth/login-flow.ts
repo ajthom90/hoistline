@@ -38,6 +38,11 @@ export interface LoginFlowOptions {
   cookieSecret: string;
   /** When set, only these users may sign in (matched case-insensitively against the identity's identifiers). */
   allowedUsers?: string[];
+  /**
+   * Called with the freshly fetched identity of an allowed user before the authorization code is issued
+   * (e.g. to record the hub user and its current login). If it throws, the login is denied.
+   */
+  onLogin?: (user: UserIdentity) => void | Promise<void>;
 }
 
 const now = () => Math.floor(Date.now() / 1000);
@@ -174,6 +179,13 @@ export class LoginFlow {
     }
     if (this.allowed && !user.identifiers.some((id) => this.allowed!.has(id))) {
       return denied(`${user.name} is not allowed to use this hub`);
+    }
+    if (this.options.onLogin) {
+      try {
+        await this.options.onLogin(user);
+      } catch {
+        return denied("Login failed: the hub could not record this user");
+      }
     }
     const hubCode = await this.options.store.issueAuthorizationCode(pending.client.client_id, pending.params, user);
     res.redirect(302, clientRedirect(pending.params, { code: hubCode }));

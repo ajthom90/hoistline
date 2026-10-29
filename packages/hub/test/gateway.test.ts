@@ -1,7 +1,7 @@
-import { createPublicKey, generateKeyPairSync, sign, type KeyObject } from "node:crypto";
+import { createPublicKey, generateKeyPairSync, randomBytes, sign, type KeyObject } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { createServer, type Server } from "node:http";
-import type { AddressInfo } from "node:net";
+import { connect as connectTcp, type AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
@@ -231,6 +231,38 @@ describe("POST /pair", () => {
     expect((await postPair(hub, { code, name: "x".repeat(100), publicKey })).status).toBe(200);
   });
 
+  it("answers malformed JSON, an oversized body or a wrong content type with a JSON 400", async () => {
+    const hub = await startHub();
+    const post = (body: string, type = "application/json") =>
+      fetch(`${hub.url}/pair`, { method: "POST", headers: { "content-type": type }, body });
+    const publicKey = publicKeyOf(generateKeyPairSync("ed25519").publicKey);
+    const code = hub.store.createPairingCode(hub.alice.id);
+    for (const res of [
+      await post("{not json"),
+      await post(JSON.stringify({ code, name: "a", publicKey, pad: "x".repeat(10_000) })),
+      await post(JSON.stringify({ code, name: "a", publicKey }), "text/plain"),
+    ]) {
+      expect(res.status).toBe(400);
+      expect(res.headers.get("content-type")).toContain("application/json");
+      expect(await res.json()).toEqual({ error: "invalid_request" });
+    }
+    // None of these consumed the code.
+    expect((await postPair(hub, { code, name: "a", publicKey })).status).toBe(200);
+  });
+
+  it("accepts printable names only, trimmed", async () => {
+    const hub = await startHub();
+    const publicKey = publicKeyOf(generateKeyPairSync("ed25519").publicKey);
+    const code = hub.store.createPairingCode(hub.alice.id);
+    for (const name of ["   ", "lap\ntop", "lap\u0000top", "evil‮txt.exe", "a⁦b", "x​y"]) {
+      expect((await postPair(hub, { code, name, publicKey })).status, JSON.stringify(name)).toBe(400);
+    }
+    const res = await postPair(hub, { code, name: "  Büro-Laptop 2  ", publicKey });
+    expect(res.status).toBe(200);
+    const { machineId } = (await res.json()) as { machineId: string };
+    expect(hub.store.getMachine(hub.alice.id, machineId)!.name).toBe("Büro-Laptop 2");
+  });
+
   it("allows 10 attempts per minute per client IP, then answers 429", async () => {
     const hub = await startHub();
     const body = { code: "AAAA-BBBB-CCCC", name: "a", publicKey: "x" };
@@ -306,6 +338,25 @@ describe("agent handshake", () => {
     await late.closed();
     expect(late.closeCode).toBe(4400);
     await waitFor(() => !hub.gateway.isOnline(identity.machineId), "offline");
+  });
+
+  it("drops a peer that ignores the close frame after a failed handshake", async () => {
+    const hub = await startHub({ handshakeTimeoutMs: 50 });
+    const { port } = new URL(hub.url);
+    const socket = connectTcp(Number(port), "127.0.0.1");
+    cleanups.push(() => void socket.destroy());
+    let closedAt: number | undefined;
+    socket.on("close", () => (closedAt = Date.now()));
+    socket.on("error", () => {});
+    socket.on("data", () => {}); // read, but never answer the close frame
+    await new Promise<void>((r) => socket.once("connect", () => r()));
+    const started = Date.now();
+    socket.write(
+      "GET /agent HTTP/1.1\r\nHost: 127.0.0.1\r\nUpgrade: websocket\r\nConnection: Upgrade\r\n" +
+        `Sec-WebSocket-Key: ${randomBytes(16).toString("base64")}\r\nSec-WebSocket-Version: 13\r\n\r\n`,
+    );
+    await waitFor(() => closedAt !== undefined, "terminate", 3000);
+    expect(closedAt! - started).toBeLessThan(2500);
   });
 
   it("replaces an older connection for the same machine", async () => {
@@ -402,6 +453,27 @@ describe("agent connection", () => {
     expect(fromAgents[0]).toEqual([identity.machineId, { type: "job.event", jobId: "job-1", stream: "stdout", data: "hi" }]);
   });
 
+  it("closes only the affected socket with 1011 when a job-message listener throws", async () => {
+    const hub = await startHub();
+    const failing = await pairAs(hub, hub.alice, "failing");
+    const healthy = await pairAs(hub, hub.alice, "healthy");
+    const delivered: string[] = [];
+    hub.gateway.onJobMessage((machineId) => {
+      if (machineId === failing.machineId) throw new Error("listener bug");
+      delivered.push(machineId);
+    });
+    const a = await authenticated(hub, failing);
+    const b = await authenticated(hub, healthy);
+    const event = JSON.stringify({ type: "job.event", jobId: "j", stream: "stdout", data: "x" });
+    a.ws.send(event);
+    await a.closed();
+    expect(a.closeCode).toBe(1011);
+    b.ws.send(event);
+    await waitFor(() => delivered.length === 1, "delivery to the healthy machine");
+    expect(hub.gateway.isOnline(healthy.machineId)).toBe(true);
+    expect(b.closeCode).toBeUndefined();
+  });
+
   it("refuses to send a job to an offline, unknown or mismatched machine", async () => {
     const hub = await startHub();
     const identity = await pairAs(hub, hub.alice);
@@ -440,14 +512,52 @@ describe("list_machines", () => {
     ]);
   });
 
+  function addToken(token: string, identity: UserIdentity): void {
+    IDENTITIES[token] = identity;
+    cleanups.push(() => void delete IDENTITIES[token]);
+  }
+
   it("maps the token identity to the hub user, never to a login string", async () => {
     const hub = await startHub();
     await pairAs(hub, hub.alice, "alice-laptop");
-    // A different GitHub account that has taken the login "alice" sees nothing of the original alice's.
-    IDENTITIES["token-impostor"] = { provider: "github", subject: "99", name: "alice", identifiers: [] };
-    cleanups.push(() => void delete IDENTITIES["token-impostor"]);
+    // A different, signed-in GitHub account whose token carries the login "alice" sees nothing of alice's.
+    hub.store.upsertUser({ provider: "github", subject: "99", login: "someone" });
+    addToken("token-impostor", { provider: "github", subject: "99", name: "alice", identifiers: [] });
     expect((await listMachines(hub, "token-impostor")).machines).toEqual([]);
     expect(hub.store.machinesFor(hub.alice.id)).toHaveLength(1);
+  });
+
+  it("never writes a token's saved (possibly stale) login back to the users table", async () => {
+    const hub = await startHub();
+    // Mallory once held the GitHub login "bob" and renamed; her old token still says "bob".
+    const mallory = hub.store.upsertUser({ provider: "github", subject: "3", login: "mallory" });
+    addToken("token-mallory-old", { provider: "github", subject: "3", name: "bob", identifiers: [] });
+    expect((await listMachines(hub, "token-mallory-old")).machines).toEqual([]);
+    expect(hub.store.getUser(hub.bob.id)!.login).toBe("bob");
+    expect(hub.store.getUser(mallory.id)!.login).toBe("mallory");
+    expect(hub.store.getUser(hub.alice.id)!.login).toBe("alice");
+    // A share to github:bob still reaches the real bob.
+    const machine = await pairAs(hub, hub.alice);
+    expect(hub.store.shareMachine(hub.alice.id, machine.machineId, "github:bob").id).toBe(hub.bob.id);
+  });
+
+  it("answers 401 for a token whose user has no hub row, and creates none", async () => {
+    const hub = await startHub();
+    addToken("token-ghost", { provider: "github", subject: "77", name: "ghost", identifiers: [] });
+    const res = await fetch(`${hub.url}/mcp`, {
+      method: "POST",
+      headers: {
+        authorization: "Bearer token-ghost",
+        "content-type": "application/json",
+        accept: "application/json, text/event-stream",
+      },
+      body: JSON.stringify({ jsonrpc: "2.0", id: 1, method: "tools/list" }),
+    });
+    expect(res.status).toBe(401);
+    const challenge = res.headers.get("www-authenticate") ?? "";
+    expect(challenge).toContain('error="invalid_token"');
+    expect(challenge).toContain(`resource_metadata="${hub.url}/.well-known/oauth-protected-resource"`);
+    expect(hub.store.getUserByKey("github", "77")).toBeNull();
   });
 
   it("keys OIDC users on issuer and subject", () => {

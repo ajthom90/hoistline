@@ -1,12 +1,17 @@
 import { createHash, randomBytes } from "node:crypto";
+import { mkdtempSync, rmSync } from "node:fs";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { StreamableHTTPClientTransport } from "@modelcontextprotocol/sdk/client/streamableHttp.js";
 import type { OAuthClientInformationFull, OAuthTokenRevocationRequest } from "@modelcontextprotocol/sdk/shared/auth.js";
 import { InMemoryOAuthProvider } from "../src/auth/in-memory-provider.js";
+import { Gateway } from "../src/gateway.js";
 import { createApp, type AppDeps } from "../src/server.js";
+import { Store } from "../src/store.js";
 
 const CLIENT_REDIRECT = "http://localhost:9999/callback";
 
@@ -699,5 +704,65 @@ describe("token endpoint", () => {
     expect(stolen.status).toBe(400);
     expect(stolen.body.error).toBe("invalid_grant");
     expect((await token(hub, { ...form, client_id: clientA })).status).toBe(200);
+  });
+});
+
+describe("hub users from login", () => {
+  let dir: string;
+  let store: Store | undefined;
+  let gateway: Gateway | undefined;
+  beforeEach(() => {
+    dir = mkdtempSync(join(tmpdir(), "hoistline-login-"));
+  });
+  afterEach(() => {
+    gateway?.close();
+    store?.close();
+    gateway = undefined;
+    store = undefined;
+    rmSync(dir, { recursive: true, force: true });
+  });
+
+  async function hubWithStore(user: { id: number; login: string }) {
+    const s = new Store(join(dir, "hub.db"));
+    store = s;
+    gateway = new Gateway(s, s.getOrCreateSigningKey());
+    const hub = await startHub({ fetch: githubStub(user).fetch, store: s, gateway });
+    return { hub, store: s };
+  }
+
+  async function callListMachines(hub: string, accessToken: unknown) {
+    const client = new Client({ name: "test", version: "0.0.0" });
+    await client.connect(
+      new StreamableHTTPClientTransport(new URL(`${hub}/mcp`), {
+        requestInit: { headers: { authorization: `Bearer ${String(accessToken)}` } },
+      }),
+    );
+    try {
+      return (await client.callTool({ name: "list_machines", arguments: {} })).structuredContent as {
+        machines: { name: string; owner: string; shared: boolean }[];
+      };
+    } finally {
+      await client.close();
+    }
+  }
+
+  it("creates the hub user at login, and the token then works for list_machines", async () => {
+    const { hub, store } = await hubWithStore({ id: 42, login: "octocat" });
+    const { tokens } = await githubLogin(hub);
+    const user = store.getUserByKey("github", "42");
+    expect(user?.login).toBe("octocat");
+    store.redeemPairingCode(store.createPairingCode(user!.id), "laptop", "pk");
+    expect((await callListMachines(hub, tokens.access_token)).machines).toEqual([
+      expect.objectContaining({ name: "laptop", owner: "octocat", shared: false }),
+    ]);
+  });
+
+  it("updates the stored login on a fresh login after a rename and clears the stale holder", async () => {
+    const { hub, store } = await hubWithStore({ id: 42, login: "octocat" });
+    const renamed = store.upsertUser({ provider: "github", subject: "42", login: "old-name" });
+    const stale = store.upsertUser({ provider: "github", subject: "7", login: "octocat" });
+    await githubLogin(hub);
+    expect(store.getUser(renamed.id)!.login).toBe("octocat");
+    expect(store.getUser(stale.id)!.login).toBe("");
   });
 });

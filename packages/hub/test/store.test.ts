@@ -128,6 +128,10 @@ describe("machines and sharing", () => {
     expect(store.getMachineById("nope")).toBeNull();
     expect(store.getUser(alice.id)?.login).toBe("Alice");
     expect(store.getUser("nope")).toBeNull();
+    expect(store.getUserByKey("github", "1")?.id).toBe(alice.id);
+    expect(store.getUserByKey("github", "999")).toBeNull();
+    expect(store.getUserByKey("oidc:https://x", "1")).toBeNull();
+    expect(store.getUserByKey("github", "999")).toBeNull(); // still not created
   });
 
   it("only the owner can share or unshare", () => {

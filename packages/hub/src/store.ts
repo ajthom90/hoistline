@@ -214,6 +214,14 @@ export class Store {
     return row ? toMachine(row) : null;
   }
 
+  /** Read-only lookup by identity-provider key (see upsertUser); never creates or updates. */
+  getUserByKey(provider: string, subject: string): User | null {
+    const row = this.db.prepare("SELECT * FROM users WHERE provider = ? AND subject = ?").get(provider, subject) as
+      | UserRecord
+      | undefined;
+    return row ? toUser(row) : null;
+  }
+
   getUser(userId: string): User | null {
     const row = this.db.prepare("SELECT * FROM users WHERE id = ?").get(userId) as UserRecord | undefined;
     return row ? toUser(row) : null;

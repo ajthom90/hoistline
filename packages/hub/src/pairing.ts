@@ -25,7 +25,13 @@ const PublicKey = z
 const PairRequest = z
   .object({
     code: z.string().min(1).max(100),
-    name: z.string().min(1).max(100),
+    // Printable only: no control, format (including bidi overrides), private-use or unassigned characters.
+    name: z
+      .string()
+      .trim()
+      .min(1)
+      .max(100)
+      .refine((name) => !/\p{C}/u.test(name)),
     publicKey: PublicKey,
   })
   .strict();
@@ -66,28 +72,34 @@ export class RateLimiter {
 export function pairRouter(store: Store, hubPublicKey: KeyObject): express.Router {
   const limiter = new RateLimiter(PAIR_ATTEMPTS_PER_WINDOW, PAIR_WINDOW_MS, store.now);
   const encodedHubKey = hubPublicKey.export({ format: "der", type: "spki" }).toString("base64url");
+  const rateLimit: express.RequestHandler = (req, res, next) => {
+    if (limiter.attempt(req.ip ?? "unknown")) return next();
+    res.status(429).json({ error: "too_many_requests" });
+  };
+  const pair: express.RequestHandler = (req, res) => {
+    // Validate before redeeming: redemption consumes the code.
+    const body = PairRequest.safeParse(req.body);
+    if (!body.success) {
+      res.status(400).json({ error: "invalid_request" });
+      return;
+    }
+    const machine = store.redeemPairingCode(body.data.code, body.data.name, body.data.publicKey);
+    if (!machine) {
+      res.status(400).json({ error: "invalid_pairing_code" });
+      return;
+    }
+    res.json({ machineId: machine.id, hubPublicKey: encodedHubKey });
+  };
   const router = express.Router();
-  router.post(
-    PAIR_PATH,
-    (req, res, next) => {
-      if (limiter.attempt(req.ip ?? "unknown")) return next();
-      res.status(429).json({ error: "too_many_requests" });
-    },
-    express.json({ limit: "4kb" }),
-    (req, res) => {
-      // Validate before redeeming: redemption consumes the code.
-      const body = PairRequest.safeParse(req.body);
-      if (!body.success) {
-        res.status(400).json({ error: "invalid_request" });
-        return;
-      }
-      const machine = store.redeemPairingCode(body.data.code, body.data.name, body.data.publicKey);
-      if (!machine) {
-        res.status(400).json({ error: "invalid_pairing_code" });
-        return;
-      }
-      res.json({ machineId: machine.id, hubPublicKey: encodedHubKey });
-    },
-  );
+  router.post(PAIR_PATH, rateLimit, express.json({ limit: "4kb" }), pair, badBody);
   return router;
 }
+
+/**
+ * Body-parser failures (malformed JSON, oversized body) get a plain JSON 400, never an HTML error page.
+ * Express recognizes error handlers by their four parameters.
+ */
+const badBody: express.ErrorRequestHandler = (err, _req, res, next) => {
+  if (res.headersSent) return next(err);
+  res.status(400).json({ error: "invalid_request" });
+};

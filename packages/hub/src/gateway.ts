@@ -12,6 +12,9 @@ export const CLOSE_AUTH_FAILED = 4401;
 export const CLOSE_HANDSHAKE_TIMEOUT = 4408;
 export const CLOSE_PROTOCOL_ERROR = 4400;
 export const CLOSE_REPLACED = 4409;
+export const CLOSE_INTERNAL_ERROR = 1011;
+/** How long a peer gets to answer our close frame before the socket is terminated. */
+const CLOSE_GRACE_MS = 1000;
 
 const MAX_PAYLOAD = 8 * 1024 * 1024;
 const ED25519_SIGNATURE_BYTES = 64;
@@ -140,17 +143,21 @@ export class Gateway {
   private handshake(ws: WebSocket): void {
     ws.on("error", () => {});
     const nonce = randomBytes(32).toString("base64url");
-    const timer = setTimeout(() => ws.close(CLOSE_HANDSHAKE_TIMEOUT), this.handshakeTimeoutMs);
+    const timer = setTimeout(() => closeHard(ws, CLOSE_HANDSHAKE_TIMEOUT), this.handshakeTimeoutMs);
     ws.once("close", () => clearTimeout(timer));
     ws.once("message", (data, isBinary) => {
       clearTimeout(timer);
       const hello = parseFrame(data, isBinary);
       const machineId = hello?.type === "hello" ? this.authenticate(hello, nonce) : undefined;
       if (!machineId || hello?.type !== "hello") {
-        ws.close(CLOSE_AUTH_FAILED);
+        closeHard(ws, CLOSE_AUTH_FAILED);
         return;
       }
-      this.register(machineId, ws, hello);
+      try {
+        this.register(machineId, ws, hello);
+      } catch {
+        closeHard(ws, CLOSE_INTERNAL_ERROR);
+      }
     });
     ws.send(JSON.stringify({ type: "challenge", nonce } satisfies HubToAgent));
   }
@@ -180,11 +187,12 @@ export class Gateway {
       runningJobs: hello.runningJobs,
       servers: hello.servers,
     };
+    // Throws (and the caller closes the socket) before the connection is registered if the store fails.
+    this.store.markMachineSeen(machineId);
     const previous = this.connections.get(machineId);
     const conn: Connection = { ws, info, lastPong: this.now() };
     this.connections.set(machineId, conn);
-    previous?.ws.close(CLOSE_REPLACED);
-    this.store.markMachineSeen(machineId);
+    if (previous) closeHard(previous.ws, CLOSE_REPLACED);
 
     ws.on("pong", () => {
       conn.lastPong = this.now();
@@ -192,10 +200,15 @@ export class Gateway {
     ws.on("message", (data, isBinary) => {
       const msg = parseFrame(data, isBinary);
       if (!msg || msg.type === "hello") {
-        ws.close(CLOSE_PROTOCOL_ERROR);
+        closeHard(ws, CLOSE_PROTOCOL_ERROR);
         return;
       }
-      for (const listener of this.listeners) listener(machineId, msg);
+      try {
+        for (const listener of this.listeners) listener(machineId, msg);
+      } catch {
+        // A failing listener costs this machine its connection, never the hub its process.
+        closeHard(ws, CLOSE_INTERNAL_ERROR);
+      }
     });
     ws.on("close", () => {
       if (this.connections.get(machineId) === conn) this.connections.delete(machineId);
@@ -214,6 +227,14 @@ export class Gateway {
       }
     }
   }
+}
+
+/** Sends a close frame, then drops the TCP connection if the peer has not completed the close in time. */
+function closeHard(ws: WebSocket, code: number): void {
+  ws.close(code);
+  const timer = setTimeout(() => ws.terminate(), CLOSE_GRACE_MS);
+  timer.unref();
+  ws.once("close", () => clearTimeout(timer));
 }
 
 function parseFrame(data: RawData, isBinary: boolean): AgentToHub | undefined {
