@@ -520,14 +520,14 @@ async function run(args: string[], ctx: Ctx): Promise<number> {
     log(`approval queue: ${escapeForTerminal(message(e))}`);
   }
 
-  let conn: AgentConnection | undefined;
+  const link: { conn?: AgentConnection } = {};
   const executor = (deps.createExecutor ?? createExecutor)({
     machineId: identity.machineId,
     hubPublicKey: identity.hubPublicKey,
     cacheDir,
     send: (msg) => {
-      if (!conn) throw new Error("not connected to the hub");
-      conn.send(msg);
+      if (!link.conn) throw new Error("not connected to the hub");
+      link.conn.send(msg);
     },
     // Read per job, so policy edits apply without a restart. Missing or invalid: deny all.
     loadPolicy: () => loadEffectivePolicy(policyPath),
@@ -540,7 +540,7 @@ async function run(args: string[], ctx: Ctx): Promise<number> {
     ...(deps.prepareOptions ? { prepareOptions: deps.prepareOptions } : {}),
   });
 
-  conn = (deps.connect ?? connect)(identity, {
+  const connection = (deps.connect ?? connect)(identity, {
     hello: () => ({
       agentVersion: AGENT_VERSION,
       runners: registeredRunners(),
@@ -561,6 +561,7 @@ async function run(args: string[], ctx: Ctx): Promise<number> {
       );
     },
   });
+  link.conn = connection;
   log(
     `hoistline-agent ${AGENT_VERSION}: machine ${escapeForTerminal(identity.machineId)}, ` +
       `hub ${escapeForTerminal(identity.hubUrl)}, policy ${policyStateLine(readPolicyState(policyPath))}`,
@@ -569,7 +570,6 @@ async function run(args: string[], ctx: Ctx): Promise<number> {
   const setT = deps.setTimeout ?? ((fn: () => void, ms: number) => setTimeout(fn, ms));
   const clearT = deps.clearTimeout ?? ((h: unknown) => clearTimeout(h as NodeJS.Timeout));
   const onSignal = deps.onSignal ?? defaultOnSignal;
-  const connection = conn;
   return await new Promise<number>((resolveExit) => {
     let stopping = false;
     let timer: unknown;
