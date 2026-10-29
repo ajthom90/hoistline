@@ -96,6 +96,9 @@ describe("usage", () => {
     const r = await run(["help"]);
     expect(r.code).toBe(0);
     for (const cmd of ["pair", "setup", "policy show", "run", "approvals", "status", "version"]) expect(r.out).toContain(cmd);
+    expect(r.out).toContain("--yes --hash <full spec hash>");
+    expect(r.out).toMatch(/full 64-character spec hash/);
+    expect(r.out).not.toMatch(/prefix/);
   });
 
   it("prints the version", async () => {
@@ -321,7 +324,9 @@ describe("approvals list and show", () => {
     // Only the printed newlines remain: no ESC, BEL, CR, bidi or zero-width characters.
     expect(r.out).not.toMatch(/[\u0000-\u0009\u000b-\u001f\u007f-\u009f​-‏‪-‮⁦-⁩]/);
     expect(r.out).toContain("\\u{001B}[2J");
-    expect(r.out).toContain("\\u{202E}evil\\u{200B}\\nline two\\u{000D}");
+    // Each line of the prompt is printed on its own line behind a fixed gutter.
+    expect(r.out).toContain("\n  | please\\u{001B}[2J");
+    expect(r.out).toContain("\\u{202E}evil\\u{200B}\n  | line two\\u{000D}\n");
     expect(r.out).toContain("user\\u{202E}1");
     expect(r.out).toContain("reason\\u{001B}[31m red");
     expect(r.out).toContain(req.specHash);
@@ -346,7 +351,22 @@ describe("approvals list and show", () => {
     const req = request({ runner: "build-test", command: "npm test" });
     await park(req);
     const r = await run(["approvals", "show", req.jobId]);
-    expect(r.out).toContain("npm test");
+    expect(r.out).toContain("command:\n  | npm test\n");
+  });
+
+  it("shows a literal backslash-n differently from a real newline", async () => {
+    const literal = request({ runner: "build-test", command: "echo a\\nrm -rf x", prompt: "one\\ntwo" });
+    const real = request({ runner: "build-test", command: "echo a\nrm -rf x", prompt: "one\ntwo" });
+    await park(literal);
+    await park(real);
+    const a = await run(["approvals", "show", literal.jobId]);
+    const b = await run(["approvals", "show", real.jobId]);
+    const body = (out: string) => out.slice(out.indexOf("command:"));
+    expect(body(a.out)).toContain("command:\n  | echo a\\\\nrm -rf x\n");
+    expect(body(a.out)).toContain(":\n  | one\\\\ntwo\n");
+    expect(body(b.out)).toContain("command:\n  | echo a\n  | rm -rf x\n");
+    expect(body(b.out)).toContain(":\n  | one\n  | two\n");
+    expect(body(a.out)).not.toBe(body(b.out));
   });
 
   it("exits 1 for an unknown or invalid job id", async () => {
@@ -382,23 +402,27 @@ describe("approvals approve and deny", () => {
     expect(await result).toBe(false);
   });
 
-  it("refuses non-interactive approval without both --yes and a matching --hash of at least 12 hex chars", async () => {
+  it("refuses non-interactive approval without both --yes and the request's full --hash", async () => {
     const req = request();
     const { result } = await park(req);
+    const wrong = (req.specHash[0] === "0" ? "1" : "0") + req.specHash.slice(1);
     const attempts: [string[], number][] = [
       [[], 2], // not a terminal, no flags
       [["--yes"], 2],
-      [["--hash", req.specHash.slice(0, 12)], 2],
-      [["--yes", "--hash", req.specHash.slice(0, 11)], 2],
-      [["--yes", "--hash", "zz" + req.specHash.slice(2, 14)], 2],
-      [["--yes", "--hash", (req.specHash[0] === "0" ? "1" : "0") + req.specHash.slice(1, 16)], 1],
+      [["--hash", req.specHash], 2],
+      [["--yes", "--hash", req.specHash.slice(0, 12)], 2],
+      [["--yes", "--hash", req.specHash.slice(0, 63)], 2],
+      [["--yes", "--hash", req.specHash + "0"], 2],
+      [["--yes", "--hash", "zz" + req.specHash.slice(2)], 2],
+      [["--yes", "--hash", wrong], 1],
     ];
     for (const [flags, code] of attempts) {
       const r = await run(["approvals", "approve", req.jobId, ...flags], { lines: [req.jobId] });
       expect([flags, r.code]).toEqual([flags, code]);
+      if (code === 2 && flags.length === 3) expect(r.err).toMatch(/full 64-character spec hash/);
       expect(existsSync(join(home, "approvals", "decisions", `${req.jobId}.json`))).toBe(false);
     }
-    const ok = await run(["approvals", "approve", req.jobId, "--yes", "--hash", req.specHash.slice(0, 12).toUpperCase()]);
+    const ok = await run(["approvals", "approve", req.jobId, "--yes", "--hash", req.specHash.toUpperCase()]);
     expect(ok.code).toBe(0);
     expect(await result).toBe(true);
   });
@@ -455,6 +479,9 @@ describe("run", () => {
       close: () => {
         calls.push("executor.close");
         return opts.closeHangs ? new Promise<void>(() => {}) : Promise.resolve();
+      },
+      forceStop: () => {
+        calls.push("executor.forceStop");
       },
     };
     const deps: CliDeps = {
@@ -601,8 +628,54 @@ describe("run", () => {
     const g = fakes({ closeHangs: true, shutdownTimeoutMs: 60_000 });
     const second = await started(g);
     g.trigger("SIGINT");
-    g.trigger("SIGINT");
+    expect(g.calls).not.toContain("executor.forceStop");
+    g.trigger("SIGTERM");
+    // The force stop happens synchronously, before the exit code is resolved.
+    expect(g.calls).toContain("executor.forceStop");
     expect(await second.done).toBe(130);
+  });
+
+  for (const code of [4400, 4401, 4409]) {
+    it(`exits 1 after an orderly shutdown when the hub closes the connection with ${code}`, async () => {
+      writeIdentity();
+      const f = fakes();
+      const { done, err } = await started(f);
+      f.handlers().onDisconnected!({ code, willReconnect: code === 4400 });
+      expect(await done).toBe(1);
+      expect(err()).toContain(`code ${code}`);
+      const i = f.calls.indexOf("executor.close");
+      expect(i).toBeGreaterThan(-1);
+      expect(f.calls.indexOf("connection.close")).toBeGreaterThan(i);
+      expect(f.calls).toContain("signals.off");
+      expect(f.calls).not.toContain("executor.forceStop");
+    });
+  }
+
+  it("exits 1 within the bound when the hub refuses the connection and shutdown hangs; 130 on a signal then", async () => {
+    writeIdentity();
+    const f = fakes({ closeHangs: true, shutdownTimeoutMs: 100 });
+    const { done } = await started(f);
+    f.handlers().onDisconnected!({ code: 4401, willReconnect: false });
+    expect(await done).toBe(1);
+
+    const g = fakes({ closeHangs: true, shutdownTimeoutMs: 60_000 });
+    const second = await started(g);
+    g.handlers().onDisconnected!({ code: 4409, willReconnect: false });
+    g.trigger("SIGINT");
+    expect(g.calls).toContain("executor.forceStop");
+    expect(await second.done).toBe(130);
+  });
+
+  it("keeps running through other disconnects", async () => {
+    writeIdentity();
+    const f = fakes();
+    const { done } = await started(f);
+    f.handlers().onDisconnected!({ code: 1006, willReconnect: true });
+    f.handlers().onDisconnected!({ code: 1001, willReconnect: true });
+    await new Promise((r) => setTimeout(r, 50));
+    expect(f.calls).not.toContain("executor.close");
+    f.trigger("SIGINT");
+    expect(await done).toBe(0);
   });
 
   it("never logs secrets or the private key", async () => {

@@ -52,7 +52,11 @@ export const EXIT_INTERRUPTED = 130;
 
 const DEFAULT_SHUTDOWN_TIMEOUT_MS = 5000;
 const DEFAULT_PROMPT_MAX = 20_000;
-const MIN_HASH_PREFIX = 12;
+const FULL_HASH = /^[0-9a-fA-F]{64}$/;
+/** Close codes with which the hub refuses or replaces this connection: `run` shuts down and exits 1. */
+const REFUSED_CLOSE_CODES = new Set([4400, 4401, 4409]);
+/** Printed before each line of a multi-line value, so where a line starts is never in doubt. */
+const GUTTER = "  | ";
 
 export const AGENT_VERSION: string = (createRequire(import.meta.url)("../package.json") as { version: string }).version;
 
@@ -65,7 +69,7 @@ usage:
   hoistline-agent run [--cache-dir <dir>] [--max-concurrent <n>]
   hoistline-agent approvals [list]
   hoistline-agent approvals show <jobId> [--max <chars>]
-  hoistline-agent approvals approve <jobId> [--yes --hash <spec hash prefix>] [--max <chars>]
+  hoistline-agent approvals approve <jobId> [--yes --hash <full spec hash>] [--max <chars>]
   hoistline-agent approvals deny <jobId>
   hoistline-agent status
   hoistline-agent version
@@ -73,7 +77,7 @@ usage:
 
 Files live in $HOISTLINE_AGENT_HOME (default ~/.hoistline).
 approvals approve asks you to type the job id; without a terminal it needs both --yes and
---hash with at least ${MIN_HASH_PREFIX} hex characters of the request's spec hash.
+--hash with the request's full 64-character spec hash (as approvals show prints it).
 `;
 
 class UsageError extends Error {}
@@ -337,6 +341,11 @@ function parseMax(value: string | boolean | undefined): number {
   return Number(value);
 }
 
+/** Untrusted multi-line text as printed lines: split on real newlines, each escaped and behind the gutter. */
+function gutterLines(text: string): string[] {
+  return text.split("\n").map((line) => GUTTER + escapeForTerminal(line));
+}
+
 function showLines(p: PendingApproval, now: number, max: number): string[] {
   const e = escapeForTerminal;
   const lines = [
@@ -348,11 +357,14 @@ function showLines(p: PendingApproval, now: number, max: number): string[] {
     `runner:      ${e(p.spec.runner)}`,
     `model:       ${p.spec.model === undefined ? "(runner default)" : e(p.spec.model)}`,
   ];
-  if (p.spec.command !== undefined) lines.push(`command:     ${e(p.spec.command)}`);
+  if (p.spec.command !== undefined) {
+    lines.push("command:");
+    lines.push(...gutterLines(p.spec.command));
+  }
   lines.push(`spec hash:   ${p.specHash}`);
   const chars = [...p.spec.prompt];
   lines.push(`prompt (${chars.length} chars):`);
-  lines.push(e(chars.slice(0, max).join("")));
+  lines.push(...gutterLines(chars.slice(0, max).join("")));
   if (chars.length > max) {
     lines.push(`[truncated ${chars.length - max} chars; the approval covers the full prompt]`);
   }
@@ -419,7 +431,7 @@ async function approvals(args: string[], ctx: Ctx): Promise<number> {
 }
 
 async function approve(args: string[], ctx: Ctx, now: number): Promise<number> {
-  const usage = "approvals approve <jobId> [--yes --hash <spec hash prefix>] [--max <chars>]";
+  const usage = "approvals approve <jobId> [--yes --hash <full spec hash>] [--max <chars>]";
   const { values, positionals } = parse(
     args,
     { yes: { type: "boolean" }, hash: { type: "string" }, max: { type: "string" } },
@@ -428,23 +440,25 @@ async function approve(args: string[], ctx: Ctx, now: number): Promise<number> {
   const max = parseMax(values.max);
   const jobId = positionals[0]!;
   const nonInteractive = values.yes !== undefined || values.hash !== undefined;
-  let prefix: string | undefined;
+  let hash: string | undefined;
   if (nonInteractive) {
     if (values.yes !== true || typeof values.hash !== "string") {
-      throw new UsageError("approving without a prompt needs both --yes and --hash <spec hash prefix>");
+      throw new UsageError("approving without a prompt needs both --yes and --hash <full spec hash>");
     }
-    if (!new RegExp(`^[0-9a-fA-F]{${MIN_HASH_PREFIX},64}$`).test(values.hash)) {
-      throw new UsageError(`--hash must be ${MIN_HASH_PREFIX} to 64 hex characters of the request's spec hash`);
+    if (!FULL_HASH.test(values.hash)) {
+      throw new UsageError(
+        "--hash must be the request's full 64-character spec hash (as approvals show prints it); prefixes are not accepted",
+      );
     }
-    prefix = values.hash.toLowerCase();
+    hash = values.hash.toLowerCase();
   } else if (!ctx.io.isTTY) {
-    throw new UsageError("not a terminal: approve with --yes --hash <spec hash prefix>, or run this in a terminal");
+    throw new UsageError("not a terminal: approve with --yes --hash <full spec hash>, or run this in a terminal");
   }
 
   const queue = queueFor(ctx);
   const p = requirePending(queue, jobId);
-  if (prefix !== undefined) {
-    if (!p.specHash.startsWith(prefix)) {
+  if (hash !== undefined) {
+    if (hash !== p.specHash) {
       ctx.err(`hoistline-agent: --hash does not match the pending request for job ${escapeForTerminal(jobId)}; not approved`);
       return EXIT_ERROR;
     }
@@ -520,7 +534,13 @@ async function run(args: string[], ctx: Ctx): Promise<number> {
     log(`approval queue: ${escapeForTerminal(message(e))}`);
   }
 
-  const link: { conn?: AgentConnection } = {};
+  const link: {
+    conn?: AgentConnection;
+    /** Starts the orderly shutdown; set once `run` waits for its end. */
+    stop?: (why: string, code: number) => void;
+    /** A refusal that came before `stop` was set. */
+    refused?: string;
+  } = {};
   const executor = (deps.createExecutor ?? createExecutor)({
     machineId: identity.machineId,
     hubPublicKey: identity.hubPublicKey,
@@ -554,6 +574,13 @@ async function run(args: string[], ctx: Ctx): Promise<number> {
     },
     onMessage: (msg) => executor.onMessage(msg),
     onDisconnected: ({ code, willReconnect }) => {
+      if (REFUSED_CLOSE_CODES.has(code)) {
+        // Refused (unknown or revoked machine, protocol error) or replaced by another agent with this identity.
+        const why = `the hub refused or replaced this connection (code ${code}); shutting down`;
+        if (link.stop) link.stop(why, EXIT_ERROR);
+        else link.refused ??= why;
+        return;
+      }
       log(
         willReconnect
           ? `disconnected from the hub (code ${code}); reconnecting`
@@ -581,16 +608,14 @@ async function run(args: string[], ctx: Ctx): Promise<number> {
       off();
       resolveExit(code);
     };
-    const off = onSignal((sig) => {
-      if (stopping) {
-        log(`${sig} again: exiting now`);
-        return finish(EXIT_INTERRUPTED);
-      }
+    /** The orderly shutdown, bounded by shutdownTimeoutMs; ends with `code`. */
+    const stop = (why: string, code: number) => {
+      if (stopping) return;
       stopping = true;
-      log(`${sig}: shutting down (send it again to exit at once)`);
+      log(why);
       timer = setT(() => {
         log("shutdown is taking too long; exiting");
-        finish(EXIT_OK);
+        finish(code);
       }, deps.shutdownTimeoutMs ?? DEFAULT_SHUTDOWN_TIMEOUT_MS);
       void (async () => {
         try {
@@ -606,9 +631,24 @@ async function run(args: string[], ctx: Ctx): Promise<number> {
         } catch {
           // Exiting anyway.
         }
-        finish(EXIT_OK);
+        finish(code);
       })();
+    };
+    const off = onSignal((sig) => {
+      if (stopping) {
+        log(`${sig} again: killing every job's processes and exiting now`);
+        try {
+          // Synchronously SIGKILLs every runner and git process group, so nothing outlives the agent.
+          executor.forceStop();
+        } catch {
+          // Exiting anyway.
+        }
+        return finish(EXIT_INTERRUPTED);
+      }
+      stop(`${sig}: shutting down (send it again to exit at once)`, EXIT_OK);
     });
+    link.stop = stop;
+    if (link.refused !== undefined) stop(link.refused, EXIT_ERROR);
   });
 }
 

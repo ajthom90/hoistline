@@ -175,18 +175,20 @@ describe("agent CLI end to end", () => {
       expect(err).toContain(`job ${jobId} is awaiting approval; run: hoistline-agent approvals`);
     };
 
-    // Approved: the hash comes from `approvals show`; a wrong prefix is refused and the job keeps waiting.
+    // Approved: the full hash comes from `approvals show`; a prefix (usage error) or a wrong hash is refused and the
+    // job keeps waiting.
     const job = delegate({ "approved.txt": "approved by the owner\n" });
     await parked(job.id);
     out = "";
     expect(await cli("approvals", "show", job.id)).toBe(0);
     const hash = /spec hash:\s+([0-9a-f]{64})/.exec(out)![1]!;
-    const wrong = (hash[0] === "0" ? "1" : "0") + hash.slice(1, 16);
+    const wrong = (hash[0] === "0" ? "1" : "0") + hash.slice(1);
+    expect(await cli("approvals", "approve", job.id, "--yes", "--hash", hash.slice(0, 16))).toBe(2);
     expect(await cli("approvals", "approve", job.id, "--yes", "--hash", wrong)).toBe(1);
     await new Promise((r) => setTimeout(r, 200));
     expect(hub.jobs.status(hub.owner.id, job.id)).toBe("awaiting_approval");
     expect(pending()).toEqual([`${job.id}.json`]);
-    expect(await cli("approvals", "approve", job.id, "--yes", "--hash", hash.slice(0, 16))).toBe(0);
+    expect(await cli("approvals", "approve", job.id, "--yes", "--hash", hash)).toBe(0);
     await waitFor(() => hub.jobs.status(hub.owner.id, job.id) === "succeeded", "approved job to succeed");
     expect(hub.jobs.result(hub.owner.id, job.id)).toMatchObject({ status: "succeeded", branch: `hoistline/${job.id}` });
     expect(fx(["show", `refs/heads/hoistline/${job.id}:approved.txt`], remote)).toBe("approved by the owner\n");
