@@ -132,13 +132,99 @@ describe("machines and sharing", () => {
   it("sharing with a login that has not signed in throws", () => {
     const { store, alice, machine } = setup();
     expect(() => store.shareMachine(alice.id, machine.id, "carol")).toThrow(/has not signed in to Hoistline yet/);
-    expect(() => store.shareMachine(alice.id, machine.id, "")).toThrow(/has not signed in to Hoistline yet/);
+  });
+
+  it("an empty value or unknown prefix throws", () => {
+    const { store, alice, machine } = setup();
+    for (const bad of ["", "  ", "github:", "user:", "oidc:x", "gitlab:x"]) {
+      expect(() => store.shareMachine(alice.id, machine.id, bad)).toThrow(/share target|prefix/);
+      expect(() => store.unshareMachine(alice.id, machine.id, bad)).toThrow(/share target|prefix/);
+    }
   });
 
   it("sharing with an ambiguous login throws", () => {
     const { store, alice, machine } = setup();
-    store.upsertUser({ provider: "oidc:https://idp", subject: "9", login: "bob" });
-    expect(() => store.shareMachine(alice.id, machine.id, "bob")).toThrow(/ambiguous login/);
+    // The store never produces this; force two GitHub rows with the same login.
+    store.upsertUser({ provider: "github", subject: "9", login: "zed" });
+    store.upsertUser({ provider: "github", subject: "10", login: "zed2" });
+    store.db.prepare("UPDATE users SET login = 'zed' WHERE subject = '10'").run();
+    expect(() => store.shareMachine(alice.id, machine.id, "zed")).toThrow(/ambiguous login/);
+  });
+
+  it("an OIDC user with a GitHub user's login does not clear it, and github:bob still resolves to GitHub", () => {
+    const { store, alice, bob, machine } = setup();
+    const oidc = store.upsertUser({ provider: "oidc:https://idp", subject: "9", login: "bob" });
+    expect(store.db.prepare("SELECT login FROM users WHERE id = ?").get(bob.id)).toEqual({ login: "bob" });
+    expect(store.shareMachine(alice.id, machine.id, "github:bob").id).toBe(bob.id);
+    expect(store.getMachine(oidc.id, machine.id)).toBeNull();
+  });
+
+  it("an OIDC user taking a GitHub login does not make bob resolve to the OIDC user", () => {
+    const { store, alice, bob, machine } = setup();
+    const oidc = store.upsertUser({ provider: "oidc:https://idp", subject: "9", login: "Bob" });
+    const shared = store.shareMachine(alice.id, machine.id, "bob");
+    expect(shared.id).toBe(bob.id);
+    expect(store.getMachine(oidc.id, machine.id)).toBeNull();
+  });
+
+  it("github:<login> never resolves to an OIDC user", () => {
+    const { store, alice, machine } = setup();
+    store.upsertUser({ provider: "oidc:https://idp", subject: "9", login: "dave" });
+    expect(() => store.shareMachine(alice.id, machine.id, "github:dave")).toThrow(/has not signed in to Hoistline yet/);
+    expect(() => store.shareMachine(alice.id, machine.id, "dave")).toThrow(/has not signed in to Hoistline yet/);
+  });
+
+  it("user:<id> shares and unshares by exact id, including OIDC users", () => {
+    const { store, alice, machine } = setup();
+    const oidc = store.upsertUser({ provider: "oidc:https://idp", subject: "9", login: "dave" });
+    expect(store.shareMachine(alice.id, machine.id, `user:${oidc.id}`)).toMatchObject({ id: oidc.id, provider: oidc.provider });
+    expect(store.getMachine(oidc.id, machine.id)?.id).toBe(machine.id);
+    store.unshareMachine(alice.id, machine.id, `user:${oidc.id}`);
+    expect(store.getMachine(oidc.id, machine.id)).toBeNull();
+    expect(() => store.shareMachine(alice.id, machine.id, "user:nope")).toThrow(/has not signed in to Hoistline yet/);
+  });
+
+  it("a bare login behaves as github:<login>", () => {
+    const { store, alice, bob, machine } = setup();
+    expect(store.shareMachine(alice.id, machine.id, "BOB").id).toBe(bob.id);
+    expect(store.listShares(alice.id, machine.id)).toEqual([{ userId: bob.id, provider: "github", login: "bob" }]);
+    store.unshareMachine(alice.id, machine.id, "github:Bob");
+    expect(store.listShares(alice.id, machine.id)).toEqual([]);
+  });
+
+  it("a share whose sharee's login was blanked can be listed and revoked via user:<id>", () => {
+    const { store, alice, bob, machine } = setup();
+    store.shareMachine(alice.id, machine.id, "bob");
+    store.upsertUser({ provider: "github", subject: "666", login: "bob" }); // clears the stale holder's login
+    expect(store.listShares(alice.id, machine.id)).toEqual([{ userId: bob.id, provider: "github", login: "" }]);
+    expect(() => store.unshareMachine(alice.id, machine.id, "github:bob")).toThrow(/has not signed in/);
+    store.unshareMachine(alice.id, machine.id, `user:${bob.id}`);
+    expect(store.listShares(alice.id, machine.id)).toEqual([]);
+    expect(store.getMachine(bob.id, machine.id)).toBeNull();
+  });
+
+  it("listShares is owner only", () => {
+    const { store, bob, machine } = setup();
+    expect(() => store.listShares(bob.id, machine.id)).toThrow("Machine not found");
+  });
+
+  it("unshare resolves only among current sharees: an unshared user throws the zero-match error", () => {
+    const { store, alice, bob, machine } = setup();
+    const carol = store.upsertUser({ provider: "github", subject: "3", login: "carol" });
+    store.shareMachine(alice.id, machine.id, "bob");
+    expect(() => store.unshareMachine(alice.id, machine.id, "github:carol")).toThrow(/has not signed in to Hoistline yet/);
+    expect(() => store.unshareMachine(alice.id, machine.id, `user:${carol.id}`)).toThrow(/has not signed in/);
+    expect(store.getMachine(bob.id, machine.id)?.id).toBe(machine.id);
+  });
+
+  it("an OIDC user taking a login does not clear the GitHub holder, but a GitHub takeover still clears GitHub only", () => {
+    const store = open();
+    const gh = store.upsertUser({ provider: "github", subject: "1", login: "x" });
+    const oidc = store.upsertUser({ provider: "oidc:https://idp", subject: "1", login: "x" });
+    store.upsertUser({ provider: "github", subject: "2", login: "x" });
+    const rows = store.db.prepare("SELECT id, login FROM users").all() as { id: string; login: string }[];
+    expect(rows.find((r) => r.id === gh.id)?.login).toBe("");
+    expect(rows.find((r) => r.id === oidc.id)?.login).toBe("x");
   });
 
   it("a share survives the grantee renaming their login", () => {

@@ -111,8 +111,9 @@ export class Store {
 
   /**
    * Finds or creates the user for an identity-provider subject. `provider` is "github" (subject = numeric id)
-   * or "oidc:<issuer>". The login is display-only. Logins are unique per provider, so another subject
-   * still holding the same login is stale and has its login cleared.
+   * or "oidc:<issuer>". The login is display-only. Only GitHub logins are unique, so for GitHub another
+   * subject still holding the same login is stale and has its login cleared; other providers' logins are never
+   * cleared or treated as unique.
    */
   upsertUser(identity: { provider: string; subject: string; login: string }): User {
     const { provider, subject, login } = identity;
@@ -132,7 +133,7 @@ export class Store {
           )
           .run(record);
       }
-      if (login) {
+      if (provider === "github" && login) {
         this.db
           .prepare("UPDATE users SET login = '' WHERE provider = ? AND id != ? AND lower(login) = lower(?)")
           .run(provider, record.id, login);
@@ -200,30 +201,57 @@ export class Store {
   }
 
   /**
-   * Only the owner may share. `withLogin` (case-insensitive display login) is resolved to a user id now and
-   * the share is keyed on that id. Throws if the machine is not the owner's, nobody with that login has
-   * signed in, or the login is ambiguous.
+   * Only the owner may share. `target` is `github:<login>` (case-insensitive, GitHub users only),
+   * `user:<hub user id>` (exact), or a bare string, which means `github:<string>`. It is resolved to a user id
+   * now and the share is keyed on that id. Returns the resolved user. Throws if the machine is not the owner's,
+   * the target is empty or has an unknown prefix, nobody matches, or the login is ambiguous.
    */
-  shareMachine(ownerId: string, machineId: string, withLogin: string): void {
+  shareMachine(ownerId: string, machineId: string, target: string): User {
     this.requireOwned(ownerId, machineId);
-    const userId = this.resolveLogin(withLogin);
-    this.db.prepare("INSERT OR IGNORE INTO machine_shares (machine_id, user_id) VALUES (?, ?)").run(machineId, userId);
+    const user = this.resolveTarget(target);
+    this.db.prepare("INSERT OR IGNORE INTO machine_shares (machine_id, user_id) VALUES (?, ?)").run(machineId, user.id);
+    return toUser(user);
   }
 
-  unshareMachine(ownerId: string, machineId: string, withLogin: string): void {
+  /** Revokes a share. `target` takes the same forms as shareMachine but resolves only among current sharees. */
+  unshareMachine(ownerId: string, machineId: string, target: string): void {
     this.requireOwned(ownerId, machineId);
-    const userId = this.resolveLogin(withLogin);
-    this.db.prepare("DELETE FROM machine_shares WHERE machine_id = ? AND user_id = ?").run(machineId, userId);
+    const user = this.resolveTarget(target, machineId);
+    this.db.prepare("DELETE FROM machine_shares WHERE machine_id = ? AND user_id = ?").run(machineId, user.id);
   }
 
-  private resolveLogin(login: string): string {
-    const name = login.trim();
-    const rows = (name ? this.db.prepare("SELECT id FROM users WHERE lower(login) = lower(?)").all(name) : []) as {
-      id: string;
-    }[];
-    if (rows.length === 0) throw new Error(`${name} has not signed in to Hoistline yet`);
-    if (rows.length > 1) throw new Error(`ambiguous login: ${name}`);
-    return rows[0]!.id;
+  /** Users holding a share on the machine (owner only). */
+  listShares(ownerId: string, machineId: string): { userId: string; provider: string; login: string }[] {
+    this.requireOwned(ownerId, machineId);
+    return this.db
+      .prepare(
+        `SELECT u.id AS userId, u.provider AS provider, u.login AS login
+         FROM machine_shares s JOIN users u ON u.id = s.user_id
+         WHERE s.machine_id = ? ORDER BY u.provider, u.login, u.id`,
+      )
+      .all(machineId) as { userId: string; provider: string; login: string }[];
+  }
+
+  private resolveTarget(target: string, withinSharesOf?: string): UserRecord {
+    const raw = target.trim();
+    const colon = raw.indexOf(":");
+    const prefix = colon === -1 ? "github" : raw.slice(0, colon).toLowerCase();
+    const value = (colon === -1 ? raw : raw.slice(colon + 1)).trim();
+    if (prefix !== "github" && prefix !== "user") {
+      throw new Error(`unknown share target prefix "${prefix}"; use github:<login> or user:<id>`);
+    }
+    if (!value) throw new Error("share target is empty; use github:<login> or user:<id>");
+    const match = prefix === "user" ? "id = ?" : "provider = 'github' AND lower(login) = lower(?)";
+    const params: string[] = [value];
+    let scope = "";
+    if (withinSharesOf !== undefined) {
+      scope = " AND id IN (SELECT user_id FROM machine_shares WHERE machine_id = ?)";
+      params.push(withinSharesOf);
+    }
+    const rows = this.db.prepare(`SELECT * FROM users WHERE ${match}${scope}`).all(...params) as UserRecord[];
+    if (rows.length === 0) throw new Error(`${value} has not signed in to Hoistline yet`);
+    if (rows.length > 1) throw new Error(`ambiguous login: ${value}`);
+    return rows[0]!;
   }
 
   private requireOwned(ownerId: string, machineId: string): void {
