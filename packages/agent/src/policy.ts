@@ -57,11 +57,19 @@ export function effectivePolicy(loaded: PolicyConfig | null): PolicyConfig {
   return parsed.success ? (parsed.data as PolicyConfig) : DENY_ALL;
 }
 
-// Control chars, C1, invisible/zero-width/bidi marks, line/paragraph separators, BOM. Built from escaped text on purpose.
-const UNSAFE_CHARS = new RegExp(
-  "[\\u0000-\\u001f\\u007f-\\u009f\\u061c\\u180e\\u200b-\\u200f\\u2028-\\u202e\\u2060-\\u2064\\u2066-\\u206f\\ufeff]",
-  "g",
-);
+// Control chars, C1, soft hyphen, invisible/zero-width/bidi marks, line/paragraph separators, BOM, interlinear
+// annotation marks and tag characters. Built from escaped text on purpose.
+const UNSAFE_SOURCE =
+  "[\\u0000-\\u001f\\u007f-\\u009f\\u00ad\\u034f\\u061c\\u180e\\u200b-\\u200f\\u2028-\\u202e\\u2060-\\u2064" +
+  "\\u2066-\\u206f\\ufeff\\ufff9-\\ufffb\\u{e0000}-\\u{e007f}]";
+const UNSAFE_CHARS = new RegExp(UNSAFE_SOURCE, "gu");
+const UNSAFE_ONE = new RegExp(UNSAFE_SOURCE, "u");
+const hasUnsafe = (text: string): boolean => UNSAFE_ONE.test(text);
+
+/** Longest build-test command that is shown to the owner for approval; longer is a hard deny. */
+const MAX_REVIEW_COMMAND = 500;
+/** Longest tool or server name shown for approval. */
+const MAX_REVIEW_NAME = 100;
 
 /** Renders an untrusted value for a reason string: control characters stripped, truncated to 100 chars. */
 function show(value: unknown): string {
@@ -102,21 +110,38 @@ export function evaluateJob(policy: PolicyConfig, spec: JobSpec): Decision {
       return { result: "deny", reason: `model rule failed: ${show(spec.model)} is not a string`, repo };
     }
 
+    if (spec.command !== undefined && typeof spec.command !== "string") {
+      return { result: "deny", reason: `command rule failed: ${show(spec.command)} is not a string`, repo };
+    }
+
     // Evaluate every rule so an owner asked to approve sees all of the reasons, not only the first.
+    // A value the owner would be asked to approve is shown in full or not at all: if it is too long or contains
+    // control or invisible characters it goes in `unreviewable` and the job is a hard deny, never an `ask`.
     const failures: string[] = [];
+    const unreviewable: string[] = [];
     if (!p.repos.some((r) => canonicalRepo(r) === repo)) {
-      failures.push(`repo rule failed: ${show(spec.repo)} is not in the allowed repos`);
+      failures.push(`repo rule failed: ${JSON.stringify(repo)} is not in the allowed repos`); // canonical, <= 140 chars
     }
     if (!(p.runners as unknown[]).includes(spec.runner)) {
-      failures.push(`runner rule failed: ${show(spec.runner)} is not in the allowed runners`);
+      failures.push(`runner rule failed: ${JSON.stringify(spec.runner)} is not in the allowed runners`); // enum value
       if (spec.runner === "build-test") {
-        failures.push(`runs arbitrary command: ${show(spec.command ?? "(none)")}`);
+        const command = spec.command;
+        if (command === undefined) failures.push("runs arbitrary command: (none)");
+        else if (command.length > MAX_REVIEW_COMMAND) {
+          unreviewable.push(`command too long to review safely (${command.length} chars)`);
+        } else if (hasUnsafe(command)) unreviewable.push("command contains invisible or control characters");
+        else failures.push(`runs arbitrary command: ${JSON.stringify(command)}`);
       }
     }
     if (p.models !== undefined) {
       if (spec.model === undefined) failures.push("model rule failed: a model is required but none was given");
-      else if (!p.models.includes(spec.model)) failures.push(`model rule failed: ${show(spec.model)} is not in the allowed models`);
+      else if (!p.models.includes(spec.model)) {
+        if (spec.model.length > MAX_MODEL_LENGTH || hasUnsafe(spec.model)) {
+          unreviewable.push(`model rule failed: ${show(spec.model)} is not in the allowed models and cannot be shown safely`);
+        } else failures.push(`model rule failed: ${JSON.stringify(spec.model)} is not in the allowed models`);
+      }
     }
+    if (unreviewable.length > 0) return { result: "deny", reason: [...failures, ...unreviewable].join("; "), repo };
     if (failures.length > 0) return { result: p.onViolation, reason: failures.join("; "), repo };
     return { result: "allow", reason: "job matches the allowed repos, runners and models", repo };
   } catch {
@@ -137,11 +162,15 @@ export function evaluateToolCall(policy: PolicyConfig, server: string, tool: str
       return { result: "deny", reason: `tool rule failed: ${show(`${server}.${tool}`)} is not a valid server and tool name` };
     }
     const name = `${server}.${tool}`;
-    if (p.tools === undefined) return violation(p, `tool rule failed: ${show(name)} denied because no tools are allowed`);
-    if (p.tools.includes(name) || p.tools.includes(`${server}.*`)) {
+    if (p.tools !== undefined && (p.tools.includes(name) || p.tools.includes(`${server}.*`))) {
       return { result: "allow", reason: "tool is in the allowed tools" };
     }
-    return violation(p, `tool rule failed: ${show(name)} is not in the allowed tools`);
+    // Not allowed. A name that cannot be shown in full and safely is never offered for approval.
+    if (server.length > MAX_REVIEW_NAME || tool.length > MAX_REVIEW_NAME || hasUnsafe(name)) {
+      return { result: "deny", reason: `tool rule failed: ${show(name)} cannot be shown safely (too long or contains control or invisible characters)` };
+    }
+    if (p.tools === undefined) return violation(p, `tool rule failed: ${JSON.stringify(name)} denied because no tools are allowed`);
+    return violation(p, `tool rule failed: ${JSON.stringify(name)} is not in the allowed tools`);
   } catch {
     return DENIED_INVALID;
   }

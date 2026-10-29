@@ -23,7 +23,6 @@ export const BUILD_TEST_WARNING =
   "Warning: the build-test runner executes arbitrary shell commands supplied in the job. Anyone who can send " +
   "jobs to this machine can run any command as you while build-test is allowed.";
 
-
 type Parsed<T> = { value: T } | { error: string };
 
 async function askValid<T>(io: SetupIO, question: string, parse: (answer: string) => Parsed<T>): Promise<T> {

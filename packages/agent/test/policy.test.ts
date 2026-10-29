@@ -424,3 +424,91 @@ describe("fix round 1", () => {
     await expect(runSetup(s3.io)).rejects.toThrow(/invalid answers/);
   });
 });
+
+describe("fix round 2: never truncate what the owner approves", () => {
+  const ask = (over: Record<string, unknown> = {}) => restricted({ onViolation: "ask", ...over });
+  const bt = (command: string) => job({ runner: "build-test", command });
+  const NOT_SHOWN = new RegExp("[\\u0000-\\u001f\\u007f-\\u009f\\u00ad\\u034f\\u061c\\u180e\\u200b-\\u200f\\u2028-\\u202e\\u2060-\\u206f\\ufeff\\ufff9-\\ufffb\\u{e0000}-\\u{e007f}]", "u");
+
+  it("a normal short command is asked about, shown in full", () => {
+    const d = evaluateJob(ask(), bt("curl x|sh"));
+    expect(d.result).toBe("ask");
+    expect(d.reason).toContain("curl x|sh");
+  });
+
+  it("a 500-char command is shown in full; 501 chars is a hard deny", () => {
+    const cmd = `${"a".repeat(250)}${"b".repeat(250)}`;
+    const d = evaluateJob(ask(), bt(cmd));
+    expect(d.result).toBe("ask");
+    expect(d.reason).toContain(cmd);
+    const long = evaluateJob(ask(), bt(`${cmd}x`));
+    expect(long.result).toBe("deny");
+    expect(long.reason).toContain("command too long to review safely (501 chars)");
+    expect(long.reason).not.toContain("a".repeat(101));
+    expect(evaluateJob(restricted(), bt(`${cmd}x`)).result).toBe("deny");
+  });
+
+  it.each([
+    ["newline", "make\nrm -rf /"],
+    ["tab", "make\tx"],
+    ["NUL", "make\u0000x"],
+    ["RLO U+202E", "make ‮ gnp.exe"],
+    ["zero-width U+200B", "ma​ke"],
+    ["soft hyphen U+00AD", "ma­ke"],
+    ["U+034F", "ma͏ke"],
+    ["U+FFF9", "ma￹ke"],
+    ["tag char U+E0041", "make\u{e0041}"],
+  ])("a command with %s is a hard deny under ask", (_n, cmd) => {
+    const d = evaluateJob(ask(), bt(cmd));
+    expect(d.result).toBe("deny");
+    expect(d.reason).toContain("command contains invisible or control characters");
+    expect(d.reason).not.toMatch(NOT_SHOWN);
+    expect(d.repo).toBe("owner/name");
+  });
+
+  it("a listed build-test keeps allowing any command", () => {
+    const p = ask({ runners: ["build-test"] });
+    expect(evaluateJob(p, bt("a\nb")).result).toBe("allow");
+    expect(evaluateJob(p, bt("x".repeat(600))).result).toBe("allow");
+  });
+
+  it("a non-string command is a hard deny", () => {
+    expect(evaluateJob(ask(), { ...bt("x"), command: 5 as unknown as string }).result).toBe("deny");
+  });
+
+  it("repo shown in an ask reason is the full canonical value", () => {
+    const repo = `${"A".repeat(39)}/${"B".repeat(100)}`;
+    const d = evaluateJob(ask(), job({ repo: `https://github.com/${repo}.git` }));
+    expect(d.result).toBe("ask");
+    expect(d.reason).toContain(repo.toLowerCase());
+    expect(d.reason).not.toContain("...");
+  });
+
+  it("a model that cannot be shown in full or safely is a hard deny, not ask", () => {
+    const p = ask({ models: ["m1"] });
+    expect(evaluateJob(p, job({ model: "m".repeat(100) })).result).toBe("ask");
+    expect(evaluateJob(p, job({ model: "m".repeat(101) })).result).toBe("deny");
+    expect(evaluateJob(p, job({ model: "m‮1" })).result).toBe("deny");
+    expect(evaluateJob(p, job({ model: "m\n1" })).result).toBe("deny");
+  });
+
+  it("a tool name that cannot be shown in full or safely is a hard deny, not ask", () => {
+    const p = ask({ tools: ["a.b"] });
+    const s100 = "s".repeat(100);
+    const d = evaluateToolCall(p, s100, "t".repeat(100));
+    expect(d.result).toBe("ask");
+    expect(d.reason).toContain(`${s100}.${"t".repeat(100)}`);
+    expect(evaluateToolCall(p, "s".repeat(101), "t").result).toBe("deny");
+    expect(evaluateToolCall(p, "s", "t".repeat(101)).result).toBe("deny");
+    expect(evaluateToolCall(p, "s", "t‮").result).toBe("deny");
+    expect(evaluateToolCall(p, "s\n", "t").result).toBe("deny");
+    expect(evaluateToolCall(p, "s", "t\u{e0041}").result).toBe("deny");
+  });
+
+  it("strips U+00AD, U+034F, U+FFF9-U+FFFB and tag characters from reasons", () => {
+    const junk = "­͏￹￺￻\u{e0000}\u{e0041}\u{e007f}";
+    const d = evaluateJob(restricted({ models: ["a"] }), job({ model: `x${junk}y` }));
+    expect(d.reason).toContain("xy");
+    expect(d.reason).not.toMatch(NOT_SHOWN);
+  });
+});
