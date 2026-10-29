@@ -8,6 +8,7 @@ import {
   rmSync,
   statSync,
   symlinkSync,
+  utimesSync,
   writeFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -146,7 +147,6 @@ describe("approval queue", () => {
     const result = settled(q.requestApproval(req));
     await tick(0);
     const bad = [
-      "not json",
       JSON.stringify({ jobId: req.jobId, decision: "approve" }), // no hash
       JSON.stringify({ jobId: req.jobId, decision: "yes", specHash: req.specHash, decidedAt: 1 }),
       JSON.stringify({ jobId: req.jobId, decision: "approve", specHash: req.specHash, decidedAt: 1, extra: true }),
@@ -193,6 +193,110 @@ describe("approval queue", () => {
     await tick();
     expect(result.done).toBe(false);
     expect(q.show(req.jobId)).not.toBeNull();
+  });
+
+  it("does not lose a decision made the moment the pending file appears", async () => {
+    mkdirSync(join(dir, "decisions"), { recursive: true, mode: 0o700 });
+    const req = request();
+    writeFileSync(
+      decisionFile(req.jobId),
+      JSON.stringify({ jobId: req.jobId, decision: "deny", specHash: req.specHash, decidedAt: 1_000_000 }),
+      { mode: 0o600 },
+    );
+    let q2: ApprovalQueue | undefined;
+    const q = createApprovalQueue({
+      dir,
+      pollIntervalMs: 5,
+      // The owner answers as soon as the request is visible, before anything else runs.
+      onPendingPublished: (jobId) => q2!.decide(jobId, "approve", req.specHash),
+    });
+    q2 = createApprovalQueue({ dir });
+    queues.push(q, q2);
+    expect(await q.requestApproval(req)).toBe(true);
+  });
+
+  it("publishes atomically and leaves no temporary files", async () => {
+    const { q, tick } = manualQueue();
+    const req = request();
+    void q.requestApproval(req);
+    await tick(0);
+    q.decide(req.jobId, "deny", req.specHash);
+    expect(readdirSync(join(dir, "pending"))).toEqual([`${req.jobId}.json`]);
+    expect(readdirSync(join(dir, "decisions"))).toEqual([`${req.jobId}.json`]);
+  });
+
+  it("treats a young empty or unparsable file as not yet written, and removes it once old", async () => {
+    const { q, tick } = manualQueue();
+    const req = request();
+    const result = settled(q.requestApproval(req));
+    await tick(0);
+    for (const content of ["", "not json", '{"jobId":']) {
+      writeFileSync(decisionFile(req.jobId), content, { mode: 0o600 });
+      await tick();
+      expect(result.done).toBe(false);
+      expect(existsSync(decisionFile(req.jobId))).toBe(true);
+    }
+    writeFileSync(pendingFile("planted"), "", { mode: 0o600 });
+    expect(q.list().map((p) => p.jobId)).toEqual([req.jobId]);
+    q.prune();
+    expect(existsSync(pendingFile("planted"))).toBe(true);
+    // Eleven seconds later they are garbage.
+    const old = new Date(Date.now() - 11_000);
+    utimesSync(decisionFile(req.jobId), old, old);
+    utimesSync(pendingFile("planted"), old, old);
+    await tick();
+    expect(result.done).toBe(false);
+    expect(existsSync(decisionFile(req.jobId))).toBe(false);
+    q.prune();
+    expect(existsSync(pendingFile("planted"))).toBe(false);
+  });
+
+  it("ignores temporary files when listing and prunes old ones", async () => {
+    const { q, tick } = manualQueue();
+    const req = request();
+    void q.requestApproval(req);
+    await tick(0);
+    const tmp = join(dir, "pending", `${req.jobId}.json.0123456789abcdef.tmp`);
+    writeFileSync(tmp, "{}", { mode: 0o600 });
+    expect(q.list().map((p) => p.jobId)).toEqual([req.jobId]);
+    q.prune();
+    expect(existsSync(tmp)).toBe(true);
+    const old = new Date(Date.now() - 11_000);
+    utimesSync(tmp, old, old);
+    q.prune();
+    expect(existsSync(tmp)).toBe(false);
+  });
+
+  it("a decision racing the waiter's timeout never affects a later request with the same id", async () => {
+    const { q, tick } = manualQueue({ ttlMs: 1000 });
+    const req = request();
+    const first = settled(q.requestApproval(req));
+    await tick(0);
+    const shown = q.show(req.jobId)!;
+    await tick(1000);
+    expect(first).toEqual({ done: true, value: false });
+    // The owner's `decide` read the request before it timed out and writes its answer just after.
+    writeFileSync(
+      decisionFile(req.jobId),
+      JSON.stringify({ jobId: req.jobId, decision: "approve", specHash: shown.specHash, decidedAt: 1_001_000 }),
+      { mode: 0o600 },
+    );
+    const second = settled(q.requestApproval(req));
+    await tick(0);
+    await tick();
+    expect(second.done).toBe(false);
+    expect(existsSync(decisionFile(req.jobId))).toBe(false);
+  });
+
+  it("can approve a request with a 100,000-character prompt", async () => {
+    const { q, tick } = manualQueue();
+    const req = request({}, { prompt: "é".repeat(100_000) });
+    const result = settled(q.requestApproval(req));
+    await tick(0);
+    expect(q.show(req.jobId)?.spec.prompt).toHaveLength(100_000);
+    q.decide(req.jobId, "approve", req.specHash);
+    await tick();
+    expect(result).toEqual({ done: true, value: true });
   });
 
   it("removes the pending file and resolves false when the signal aborts", async () => {
@@ -255,23 +359,24 @@ describe("approval queue", () => {
     const req = request();
     const first = settled(q.requestApproval(req));
     await tick(0);
-    expect(await q.requestApproval({ ...req })).toBe(false);
+    await expect(q.requestApproval({ ...req })).rejects.toThrow(/already awaiting approval/);
     expect(existsSync(pendingFile(req.jobId))).toBe(true);
     // Another process's queue on the same directory refuses it too.
     const other = createApprovalQueue({ dir });
     queues.push(other);
-    expect(await other.requestApproval({ ...req })).toBe(false);
+    await expect(other.requestApproval({ ...req })).rejects.toThrow(/already awaiting approval/);
     expect(existsSync(pendingFile(req.jobId))).toBe(true);
     q.decide(req.jobId, "approve", req.specHash);
     await tick();
     expect(first).toEqual({ done: true, value: true });
   });
 
-  it("refuses a pending request too large to read back", async () => {
+  it("rejects (does not deny) a pending request too large to read back", async () => {
     const errors: unknown[] = [];
     const { q } = manualQueue({ onError: (e) => errors.push(e) });
-    const req = request({}, { prompt: "x".repeat(70_000) });
-    expect(await q.requestApproval(req)).toBe(false);
+    // 100,000 control characters: each is six bytes of JSON, over the 512 KiB bound.
+    const req = request({}, { prompt: "\u0001".repeat(100_000) });
+    await expect(q.requestApproval(req)).rejects.toThrow(/too large/);
     expect(existsSync(pendingFile(req.jobId))).toBe(false);
     expect(errors).toHaveLength(1);
   });
@@ -307,7 +412,7 @@ describe("approval queue", () => {
     symlinkSync(victim, dir);
     const errors: unknown[] = [];
     const { q } = manualQueue({ onError: (e) => errors.push(e) });
-    expect(await q.requestApproval(request())).toBe(false);
+    await expect(q.requestApproval(request())).rejects.toThrow(/symbolic link/);
     expect(readdirSync(victim)).toEqual([]);
     expect(errors.length).toBeGreaterThan(0);
     expect(() => q.list()).toThrow(/symbolic link|not a directory/);
@@ -319,8 +424,24 @@ describe("approval queue", () => {
     mkdirSync(dir, { mode: 0o700 });
     symlinkSync(victim, join(dir, "pending"));
     const { q } = manualQueue();
-    expect(await q.requestApproval(request())).toBe(false);
+    await expect(q.requestApproval(request())).rejects.toThrow(/symbolic link/);
     expect(readdirSync(victim)).toEqual([]);
+  });
+
+  it.runIf(posix)("never follows a symlinked pending file", async () => {
+    const { q, tick } = manualQueue();
+    const req = request();
+    void q.requestApproval(req);
+    await tick(0);
+    const victim = join(root, "victim.json");
+    writeFileSync(victim, readFileSync(pendingFile(req.jobId)), { mode: 0o600 });
+    symlinkSync(victim, pendingFile("linked"));
+    expect(q.list().map((p) => p.jobId)).toEqual([req.jobId]);
+    expect(() => q.decide("linked", "approve", req.specHash)).toThrow(/no pending approval/);
+    expect(lstatSync(pendingFile("linked")).isSymbolicLink()).toBe(true);
+    q.prune();
+    expect(existsSync(pendingFile("linked"))).toBe(false);
+    expect(existsSync(victim)).toBe(true);
   });
 
   it.runIf(posix)("never follows a symlinked decision file and leaves its target untouched", async () => {
@@ -346,14 +467,14 @@ describe("approval queue", () => {
   it("rejects job ids that could escape the directory", async () => {
     const { q } = manualQueue();
     for (const jobId of ["../x", "a/b", "..", "", "a\\b"]) {
-      expect(await q.requestApproval(request({ jobId }))).toBe(false);
+      await expect(q.requestApproval(request({ jobId }))).rejects.toThrow(/invalid job id/);
       expect(() => q.decide(jobId, "approve", "a".repeat(64))).toThrow(/invalid job id/);
       expect(() => q.show(jobId)).toThrow(/invalid job id/);
     }
     expect(existsSync(join(root, "x.json"))).toBe(false);
   });
 
-  it("ignores and removes invalid pending files when listing", async () => {
+  it("ignores invalid pending files when listing, and only prune removes them", async () => {
     const { q, tick } = manualQueue();
     const req = request();
     void q.requestApproval(req);
@@ -366,6 +487,11 @@ describe("approval queue", () => {
       { mode: 0o600 },
     );
     expect(q.list().map((p) => p.jobId)).toEqual([req.jobId]);
+    expect(q.show("forged")).toBeNull();
+    expect(() => q.decide("mismatch", "approve", "c".repeat(64))).toThrow(/no pending approval/);
+    expect(existsSync(pendingFile("forged"))).toBe(true);
+    expect(existsSync(pendingFile("mismatch"))).toBe(true);
+    q.prune();
     expect(existsSync(pendingFile("forged"))).toBe(false);
     expect(existsSync(pendingFile("mismatch"))).toBe(false);
   });
@@ -396,14 +522,21 @@ describe("approval queue", () => {
     expect(existsSync(pendingFile(live.jobId))).toBe(true);
   });
 
-  it("never throws and resolves false when the directory cannot be created", async () => {
+  it("never throws synchronously; queue failures reject instead of denying", async () => {
     writeFileSync(join(root, "file"), "");
     const errors: unknown[] = [];
     const q = createApprovalQueue({ dir: join(root, "file", "approvals"), onError: (e) => errors.push(e) });
     queues.push(q);
-    expect(await q.requestApproval(request())).toBe(false);
-    expect(await q.requestApproval(null as unknown as ApprovalRequest)).toBe(false);
-    expect(await q.requestApproval(request({ specHash: "short" }))).toBe(false);
+    const calls = [
+      () => q.requestApproval(request()),
+      () => q.requestApproval(null as unknown as ApprovalRequest),
+      () => q.requestApproval(request({ specHash: "short" })),
+    ];
+    for (const call of calls) {
+      let p: Promise<boolean> | undefined;
+      expect(() => (p = call())).not.toThrow();
+      await expect(p).rejects.toThrow();
+    }
     expect(errors.length).toBeGreaterThan(0);
   });
 
@@ -433,6 +566,14 @@ describe("escapeForTerminal", () => {
     expect(escapeForTerminal("\u0007\u009b ⁦\t")).toBe("\\u{0007}\\u{009B}\\u{2028}\\u{2066}\\u{0009}");
     expect(escapeForTerminal("tag\u{E0041}")).toBe("tag\\u{E0041}");
     expect(escapeForTerminal("lone\uD800")).toBe("lone\\u{D800}");
+  });
+
+  it("escapes a literal backslash so source text cannot imitate an escape", () => {
+    expect(escapeForTerminal("a\\nb")).toBe("a\\\\nb");
+    expect(escapeForTerminal("a\nb")).toBe("a\\nb");
+    expect(escapeForTerminal("a\\nb")).not.toBe(escapeForTerminal("a\nb"));
+    expect(escapeForTerminal("\\u{001B}")).toBe("\\\\u{001B}");
+    expect(escapeForTerminal("C:\\dir")).toBe("C:\\\\dir");
   });
 
   it("leaves no control characters at all", () => {
