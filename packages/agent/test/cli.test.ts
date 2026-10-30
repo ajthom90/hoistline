@@ -4,8 +4,9 @@ import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
-import type { HubToAgent, JobSpec } from "@hoistline/protocol";
+import type { AgentToHub, HubToAgent, JobSpec } from "@hoistline/protocol";
 import { createApprovalQueue, type ApprovalQueue } from "../src/approvals.js";
 import { main, type CliDeps, type CliIO } from "../src/cli.js";
 import { specHash, type ApprovalRequest, type CreateExecutorOptions, type Executor } from "../src/executor.js";
@@ -65,6 +66,12 @@ const RESTRICTED = { mode: "restricted", repos: ["owner/name"], runners: ["muse"
 function writePolicy(policy: unknown = RESTRICTED): void {
   mkdirSync(home, { recursive: true });
   writeFileSync(join(home, "policy.json"), JSON.stringify(policy));
+}
+
+const STUB_SERVER = fileURLToPath(new URL("./fixtures/stub-mcp-server.mjs", import.meta.url));
+function writeServers(servers: unknown): void {
+  mkdirSync(home, { recursive: true });
+  writeFileSync(join(home, "servers.json"), JSON.stringify({ servers }));
 }
 
 let seq = 0;
@@ -272,6 +279,37 @@ describe("policy show", () => {
   });
 });
 
+describe("servers list", () => {
+  it("says there are no servers when servers.json is missing", async () => {
+    const r = await run(["servers", "list"]);
+    expect(r.code).toBe(0);
+    expect(r.out).toContain(`servers file: ${join(home, "servers.json")}`);
+    expect(r.out).toMatch(/no servers file: no MCP servers are proxied/);
+  });
+
+  it("says why when servers.json is invalid", async () => {
+    writeServers({ "bad.name": { command: "x", args: [] } });
+    const r = await run(["servers", "list"]);
+    expect(r.code).toBe(0);
+    expect(r.out).toMatch(/is invalid.*no MCP servers are proxied/);
+  });
+
+  it("prints each server with its command, escaped", async () => {
+    writeServers({ fs: { command: "/usr/bin/fs\u001b[31m", args: ["--root", "a b\nc"], env: { TOKEN: "secret-value" } } });
+    const r = await run(["servers", "list"]);
+    expect(r.code).toBe(0);
+    expect(r.out).toContain("fs: \"/usr/bin/fs\\u{001B}[31m\" --root \"a b\\nc\"");
+    expect(r.out).toContain("env: TOKEN");
+    expect(r.out).not.toContain("secret-value");
+    expect(r.out).not.toContain("\u001b");
+  });
+
+  it("rejects extra arguments", async () => {
+    expect((await run(["servers", "list", "x"])).code).toBe(2);
+    expect((await run(["servers", "nope"])).code).toBe(2);
+  });
+});
+
 describe("status", () => {
   it("prints hub, machine, policy and pending count", async () => {
     writeIdentity();
@@ -458,11 +496,13 @@ describe("run", () => {
     received: HubToAgent[];
     trigger: (sig: "SIGINT" | "SIGTERM") => void;
     connected: () => boolean;
+    sent: AgentToHub[];
   };
 
   function fakes(opts: { closeHangs?: boolean; shutdownTimeoutMs?: number } = {}): Fake {
     const calls: string[] = [];
     const received: HubToAgent[] = [];
+    const sent: AgentToHub[] = [];
     let handlers: AgentHandlers | undefined;
     let executorOpts: CreateExecutorOptions | undefined;
     let signalHandler: ((sig: "SIGINT" | "SIGTERM") => void) | undefined;
@@ -496,7 +536,9 @@ describe("run", () => {
         handlers = h;
         const conn: AgentConnection = {
           connected: true,
-          send: () => {},
+          send: (m) => {
+            sent.push(m);
+          },
           close: () => {
             calls.push("connection.close");
           },
@@ -517,6 +559,7 @@ describe("run", () => {
       executorOpts: () => executorOpts!,
       trigger: (sig) => signalHandler!(sig),
       connected: () => handlers !== undefined,
+      sent,
     };
   }
 
@@ -580,6 +623,37 @@ describe("run", () => {
     expect(i).toBeGreaterThan(-1);
     expect(f.calls.indexOf("connection.close")).toBeGreaterThan(i);
     expect(f.calls).toContain("signals.off");
+  });
+
+  it("proxies the servers in servers.json: hello lists them and tools messages are answered", async () => {
+    writeIdentity();
+    writePolicy({ mode: "trusted" });
+    writeServers({ stub: { command: process.execPath, args: [STUB_SERVER] } });
+    const f = fakes();
+    const { done } = await started(f);
+    expect(f.handlers().hello().servers).toEqual(["stub"]);
+    f.handlers().onMessage({ type: "tools.list", callId: "c1" });
+    f.handlers().onMessage({ type: "tools.call", callId: "c2", userId: "u", server: "stub", tool: "echo", args: { a: 1 } });
+    const deadline = Date.now() + 10_000;
+    while (f.sent.length < 2 && Date.now() < deadline) await new Promise((r) => setTimeout(r, 10));
+    expect(f.sent).toContainEqual({ type: "tools.list", callId: "c1", servers: [{ name: "stub", tools: [expect.objectContaining({ name: "echo" })] }] });
+    expect(f.sent).toContainEqual(expect.objectContaining({ type: "tools.result", callId: "c2", ok: true }));
+    // The executor does not see tools messages.
+    expect(f.received).toEqual([]);
+    f.trigger("SIGINT");
+    expect(await done).toBe(0);
+  });
+
+  it("runs with no servers when servers.json is invalid, and says so", async () => {
+    writeIdentity();
+    mkdirSync(home, { recursive: true });
+    writeFileSync(join(home, "servers.json"), "{oops");
+    const f = fakes();
+    const { done, err } = await started(f);
+    expect(f.handlers().hello().servers).toEqual([]);
+    expect(err()).toMatch(/servers file .*servers\.json is invalid.*no MCP servers are proxied/);
+    f.trigger("SIGINT");
+    expect(await done).toBe(0);
   });
 
   it("uses --cache-dir", async () => {

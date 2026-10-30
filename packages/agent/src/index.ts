@@ -81,3 +81,14 @@ export {
   type PendingApproval,
 } from "./approvals.js";
 export { AGENT_VERSION, main, type CliDeps, type CliIO } from "./cli.js";
+export {
+  ASK_DENIED_REASON,
+  McpProxy,
+  SERVER_NAME,
+  ServersFileSchema,
+  defaultServersPath,
+  loadServers,
+  type McpProxyOptions,
+  type ProxiedTool,
+  type ServerConfig,
+} from "./proxy.js";

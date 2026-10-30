@@ -32,6 +32,9 @@ importers:
       '@hoistline/protocol':
         specifier: workspace:*
         version: link:../protocol
+      '@modelcontextprotocol/sdk':
+        specifier: ^1.32.2
+        version: 1.32.2(zod@4.6.7)
       ws:
         specifier: ^8.22.0
         version: 8.22.0

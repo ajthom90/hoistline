@@ -9,6 +9,7 @@ import { createExecutor, type CreateExecutorOptions, type Executor } from "./exe
 import type { PrepareOptions } from "./git.js";
 import { agentHome, defaultIdentityPath, loadIdentity, saveIdentity, type AgentIdentity } from "./identity.js";
 import { pairMachine } from "./pair.js";
+import { McpProxy, defaultServersPath, loadServers, type ServerConfig } from "./proxy.js";
 import { DENY_ALL, defaultPolicyPath, loadEffectivePolicy, loadPolicy, savePolicy, type PolicyConfig } from "./policy.js";
 import { registerBuiltinRunners, registeredRunners } from "./runners/index.js";
 import { runSetup, type SetupIO } from "./setup.js";
@@ -66,6 +67,7 @@ usage:
   hoistline-agent pair <hub-url> <code> [--name <name>] [--force]
   hoistline-agent setup [--yes]
   hoistline-agent policy show
+  hoistline-agent servers list
   hoistline-agent run [--cache-dir <dir>] [--max-concurrent <n>]
   hoistline-agent approvals [list]
   hoistline-agent approvals show <jobId> [--max <chars>]
@@ -75,7 +77,8 @@ usage:
   hoistline-agent version
   hoistline-agent help
 
-Files live in $HOISTLINE_AGENT_HOME (default ~/.hoistline).
+Files live in $HOISTLINE_AGENT_HOME (default ~/.hoistline). The stdio MCP servers this machine
+proxies for the hub (direct mode) are listed in servers.json there; restart run to pick up changes.
 approvals approve asks you to type the job id; without a terminal it needs both --yes and
 --hash with the request's full 64-character spec hash (as approvals show prints it).
 `;
@@ -171,6 +174,12 @@ async function dispatch(argv: string[], ctx: Ctx): Promise<number> {
       if (sub !== "show") throw new UsageError("unknown policy command (usage: policy show)");
       parse(more, {}, { min: 0, max: 0, usage: "policy show" });
       return policyShow(ctx);
+    }
+    case "servers": {
+      const [sub, ...more] = rest;
+      if (sub !== "list") throw new UsageError("unknown servers command (usage: servers list)");
+      parse(more, {}, { min: 0, max: 0, usage: "servers list" });
+      return serversList(ctx);
     }
     case "run":
       return run(rest, ctx);
@@ -296,6 +305,40 @@ function policyShow(ctx: Ctx): number {
   }
   ctx.out("effective policy:");
   printJson(ctx, state.kind === "ok" ? state.policy : DENY_ALL);
+  return EXIT_OK;
+}
+
+const PLAIN_ARG = /^[A-Za-z0-9_\-./=:@,+%]+$/;
+
+/** A command line for display: each part escaped, parts that are not plain quoted. Never shows env values. */
+function commandLine(server: ServerConfig): string {
+  return [server.command, ...server.args]
+    .map((part) => (PLAIN_ARG.test(part) ? part : `"${escapeForTerminal(part)}"`))
+    .join(" ");
+}
+
+function serversList(ctx: Ctx): number {
+  const path = defaultServersPath(ctx.io.env);
+  ctx.out(`servers file: ${escapeForTerminal(path)}`);
+  if (!exists(path)) {
+    ctx.out("no servers file: no MCP servers are proxied");
+    return EXIT_OK;
+  }
+  const { servers, error } = loadServers(path);
+  if (error !== undefined) {
+    ctx.out(`${escapeForTerminal(error)}; no MCP servers are proxied`);
+    return EXIT_OK;
+  }
+  const names = Object.keys(servers);
+  if (names.length === 0) ctx.out("no servers configured");
+  for (const name of names) {
+    const server = servers[name]!;
+    ctx.out(`${name}: ${commandLine(server)}`);
+    if (server.cwd !== undefined) ctx.out(`  cwd: ${escapeForTerminal(server.cwd)}`);
+    const envKeys = Object.keys(server.env ?? {});
+    if (envKeys.length > 0) ctx.out(`  env: ${envKeys.map(escapeForTerminal).join(", ")}`);
+  }
+  ctx.out("which tools the hub may call is decided by the policy (see hoistline-agent policy show)");
   return EXIT_OK;
 }
 
@@ -560,20 +603,35 @@ async function run(args: string[], ctx: Ctx): Promise<number> {
     ...(deps.prepareOptions ? { prepareOptions: deps.prepareOptions } : {}),
   });
 
+  // Direct mode: the owner's stdio MCP servers. Read once; an invalid file proxies nothing.
+  const serversFile = loadServers(defaultServersPath(ctx.io.env));
+  if (serversFile.error !== undefined) {
+    log(`hoistline-agent: ${escapeForTerminal(serversFile.error)}; no MCP servers are proxied`);
+  }
+  // The policy is read on every list and call, like per job.
+  const proxy = new McpProxy(serversFile.servers, () => loadEffectivePolicy(policyPath), { log });
+  const sendToHub = (msg: Parameters<AgentConnection["send"]>[0]) => {
+    if (!link.conn) throw new Error("not connected to the hub");
+    link.conn.send(msg);
+  };
+
   const connection = (deps.connect ?? connect)(identity, {
     hello: () => ({
       agentVersion: AGENT_VERSION,
       os: `${process.platform}-${process.arch}`,
       runners: registeredRunners(),
       runningJobs: executor.runningJobs(),
-      servers: [],
+      servers: proxy.serverNames(),
     }),
     onConnected: () => {
       // Synchronously, inside the welcome handler: see Executor.flushOutbox.
       executor.flushOutbox();
       log("connected to the hub");
     },
-    onMessage: (msg) => executor.onMessage(msg),
+    onMessage: (msg) => {
+      if (msg.type === "tools.list" || msg.type === "tools.call") proxy.onMessage(msg, sendToHub);
+      else executor.onMessage(msg);
+    },
     onDisconnected: ({ code, willReconnect }) => {
       if (REFUSED_CLOSE_CODES.has(code)) {
         // Refused (unknown or revoked machine, protocol error) or replaced by another agent with this identity.
@@ -621,7 +679,7 @@ async function run(args: string[], ctx: Ctx): Promise<number> {
       void (async () => {
         try {
           // Aborts every job first (removing its pending approval), so they end cancelled, not denied.
-          const closing = executor.close();
+          const closing = Promise.all([executor.close(), proxy.close()]);
           queue.close();
           await closing;
         } catch {
