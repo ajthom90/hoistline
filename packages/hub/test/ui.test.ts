@@ -159,6 +159,54 @@ describe("CSRF and headers", () => {
     expect(same.status).toBe(200);
   });
 
+  it("gates every /ui path whatever its case or method", async () => {
+    const hub = await startHub(ctx);
+    for (const path of ["/UI/jobs", "/Ui", "/uI/tokens", "/UI/TOKENS", "/ui/JOBS"]) {
+      const res = await browser.request(`${hub.url}${path}`);
+      expect(res.status, path).toBe(303);
+      expect(res.headers.get("location")).toBe("/ui/login");
+    }
+    for (const method of ["PUT", "DELETE", "PATCH"]) {
+      expect((await browser.request(`${hub.url}/UI/pair`, { method })).status, method).toBe(303);
+    }
+    expect((await browser.postForm(`${hub.url}/UI/pair`, {})).status).toBe(303);
+    expect((await browser.postForm(`${hub.url}/UI/TOKENS`, { name: "x" })).status).toBe(303);
+    await uiLogin(hub, browser);
+    expect((await browser.postForm(`${hub.url}/UI/pair`, {})).status).toBe(403);
+    expect((await browser.postForm(`${hub.url}/Ui/Tokens`, { name: "x" })).status).toBe(403);
+    expect(hub.store.db.prepare("SELECT count(*) AS n FROM personal_access_tokens").get()).toEqual({ n: 0 });
+    expect((await browser.request(`${hub.url}/ui/pair`, { method: "PUT" })).status).toBe(404);
+  });
+
+  it("refuses POSTs with Origin: null", async () => {
+    const hub = await startHub(ctx);
+    await uiLogin(hub, browser);
+    const { csrf } = await page(hub, browser);
+    expect((await browser.postForm(`${hub.url}/ui/pair`, { csrf }, { origin: "null" })).status).toBe(403);
+  });
+
+  it("renders a plain 500 page under /ui in any case, without internals", async () => {
+    const hub = await startHub(ctx);
+    await uiLogin(hub, browser);
+    const original = hub.store.machinesFor.bind(hub.store);
+    hub.store.machinesFor = () => {
+      throw new Error("secret-internal-detail");
+    };
+    try {
+      for (const path of ["/ui", "/UI"]) {
+        const res = await browser.request(`${hub.url}${path}`);
+        expect(res.status).toBe(500);
+        expect(res.headers.get("content-type")).toContain("text/html");
+        const html = await res.text();
+        expect(html).toContain("Something went wrong.");
+        expect(html).not.toContain("secret-internal-detail");
+        expect(html).not.toMatch(/at .*\.ts:\d+/);
+      }
+    } finally {
+      hub.store.machinesFor = original;
+    }
+  });
+
   it("sends the security headers on every /ui response, and no script", async () => {
     const hub = await startHub(ctx);
     const check = (res: Response) => {

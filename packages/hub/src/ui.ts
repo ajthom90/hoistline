@@ -129,8 +129,20 @@ export function uiRouter(deps: UiDeps): express.Router {
     }
     next();
   };
-  router.get(/^\/ui(\/.*)?$/, requireSession);
-  router.post(/^\/ui(\/.*)?$/, requireSession, express.urlencoded({ extended: false, limit: "16kb" }), checkPost);
+  // Mounted by prefix, which Express matches case-insensitively for every method, like the routes below: no spelling of
+  // a /ui path reaches a route without a session, nor a POST without its CSRF and Origin checks.
+  const parseForm = express.urlencoded({ extended: false, limit: "16kb" });
+  router.use("/ui", requireSession, (req, res, next) => {
+    if (req.method !== "POST") return next();
+    parseForm(req, res, (err?: unknown) => {
+      if (err) return next(err);
+      try {
+        checkPost(req, res, next);
+      } catch (e) {
+        next(e);
+      }
+    });
+  });
 
   const render = (res: Response, title: string, body: string, status = 200) => {
     const { user, session } = ctxOf(res);
@@ -353,18 +365,20 @@ export function uiRouter(deps: UiDeps): express.Router {
     res.redirect(303, "/ui/login");
   });
 
-  router.all(/^\/ui(\/.*)?$/, () => {
+  router.use("/ui", () => {
     throw notFound();
   });
 
-  // Errors under /ui: a plain page, never details of internal failures.
+  // Errors under /ui (any case): a plain page, never details of internal failures.
   const onError: express.ErrorRequestHandler = (err, req, res, next) => {
-    if (res.headersSent || !req.path.startsWith("/ui")) return next(err);
+    const path = req.originalUrl.split("?")[0] ?? "";
+    if (res.headersSent || !/^\/ui(\/|$)/i.test(path)) return next(err);
     const status = err instanceof UiError ? err.status : typeof err?.status === "number" && err.status < 500 ? 400 : 500;
     const message = err instanceof UiError ? err.message : status === 500 ? "Something went wrong." : "Bad request.";
     const body = `<p class="error">${h(message)}</p><p><a href="/ui">Back</a></p>`;
     const title = status === 404 ? "Not found" : status === 403 ? "Forbidden" : "Error";
-    if (res.locals.ui) render(res, title, body, status);
+    res.set(SECURITY_HEADERS);
+    if (res.locals.ui && status < 500) render(res, title, body, status);
     else res.status(status).type("html").send(page({ title, body }));
   };
   router.use(onError);
