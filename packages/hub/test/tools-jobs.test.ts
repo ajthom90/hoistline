@@ -356,7 +356,7 @@ describe("input validation", () => {
     ["NUL in command", { ...baseArgs, machine: "m", command: "a\0" }],
     ["empty prompt", { ...baseArgs, machine: "m", prompt: "" }],
     ["empty machine", { ...baseArgs, machine: "" }],
-    ["overlong machine", { ...baseArgs, machine: "m".repeat(101) }],
+    ["overlong machine", { ...baseArgs, machine: "m".repeat(301) }],
     ["overlong repo", { ...baseArgs, machine: "m", repo: "r".repeat(201) }],
     ["overlong branch", { ...baseArgs, machine: "m", branch: "b".repeat(256) }],
     ["overlong prompt", { ...baseArgs, machine: "m", prompt: "p".repeat(100_001) }],
@@ -372,6 +372,14 @@ describe("input validation", () => {
     // Rejected as invalid input: no machine lookup, no job.
     expect(["machine not found", "machine offline", "internal error"]).not.toContain(r.text);
     expect(delegate).not.toHaveBeenCalled();
+  });
+
+  it("accepts a 300-character machine reference, the same limit as list_tools and call_tool", async () => {
+    const hub = await startHub();
+    const ref = `${"o".repeat(150)}/${"m".repeat(149)}`;
+    expect(ref).toHaveLength(300);
+    const r = await call(await client(hub), "delegate_task", { ...baseArgs, machine: ref });
+    expect(r).toMatchObject({ isError: true, text: "machine not found" });
   });
 
   it("rejects bad job ids and extra keys on the other tools without any lookup", async () => {

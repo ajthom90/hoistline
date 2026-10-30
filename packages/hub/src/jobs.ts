@@ -82,6 +82,12 @@ export class AmbiguousMachineError extends Error {
   }
 }
 
+/**
+ * Longest machine reference a tool accepts (an id, a name or "<owner>/<machine>"), the same for delegate_task,
+ * list_tools and call_tool so a reference that works in one works in all.
+ */
+export const MACHINE_REF_MAX = 300;
+
 /** A machine reference that names no single machine; the message names machines by id only and is safe to show. */
 export class MachineRefError extends Error {
   constructor(message: string) {

@@ -6,6 +6,7 @@ import { z } from "zod";
 import {
   AmbiguousMachineError,
   describeReason,
+  MACHINE_REF_MAX,
   MachineOfflineError,
   MachineRefError,
   NotFoundError,
@@ -20,7 +21,7 @@ const noNul = (s: z.ZodString) => s.refine((v) => !v.includes("\0"), { message: 
 const JobId = noNul(z.string().min(1).max(100));
 
 const DelegateInput = z.strictObject({
-  machine: noNul(z.string().min(1).max(100)).describe("A machine id, or the name of a machine you can access."),
+  machine: noNul(z.string().min(1).max(MACHINE_REF_MAX)).describe("A machine id, or the name of a machine you can access."),
   runner: RunnerName.describe("Which runner executes the task."),
   repo: noNul(z.string().min(1).max(200)).describe("The repository to work on."),
   branch: noNul(z.string().min(1).max(255)).describe("The base branch to start from."),

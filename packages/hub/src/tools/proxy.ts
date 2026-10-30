@@ -4,7 +4,7 @@ import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import type { AgentToHub } from "@hoistline/protocol";
 import { z } from "zod";
 import type { Gateway } from "../gateway.js";
-import { MachineOfflineError, NotFoundError, resolveMachine } from "../jobs.js";
+import { MACHINE_REF_MAX, MachineOfflineError, NotFoundError, resolveMachine } from "../jobs.js";
 import type { Machine, Store, User } from "../store.js";
 import { failure, toToolError, wrapUntrusted } from "./jobs.js";
 
@@ -535,7 +535,7 @@ export function registerProxyTools(server: McpServer, direct: DirectMode, user: 
         "including tools not offered directly by name. Call any of them with call_tool. " +
         UNTRUSTED_NOTE,
       inputSchema: z.strictObject({
-        machine: noNul(z.string().min(1).max(300))
+        machine: noNul(z.string().min(1).max(MACHINE_REF_MAX))
           .optional()
           .describe('Only this machine: its id, its name, or "<owner>/<machine>".'),
         server: noNul(z.string().min(1).max(200)).optional().describe("Only this server."),
@@ -603,7 +603,7 @@ export function registerProxyTools(server: McpServer, direct: DirectMode, user: 
         "as list_tools shows them, and the tool's arguments. The machine owner's policy decides what may run. " +
         UNTRUSTED_NOTE,
       inputSchema: z.strictObject({
-        machine: noNul(z.string().min(1).max(300)),
+        machine: noNul(z.string().min(1).max(MACHINE_REF_MAX)),
         server: noNul(z.string().min(1).max(200)),
         tool: noNul(z.string().min(1).max(200)),
         args: Args.optional(),
