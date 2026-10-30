@@ -11,3 +11,8 @@ updates:
     groups:
       npm:
         patterns: ["*"]
+    ignore:
+      # TypeScript 7 (the Go compiler) is not supported by typescript-eslint yet (its peer range is <6.1).
+      # Remove this once a typescript-eslint release accepts typescript 7.
+      - dependency-name: typescript
+        update-types: ["version-update:semver-major"]
