@@ -10,7 +10,12 @@ cd "$ROOT"
 
 VERSION="${1:-$(node -p "require('./packages/agent/package.json').version")}"
 VERSION="${VERSION#v}"
-[[ "$VERSION" =~ ^[0-9A-Za-z.+-]+$ ]] || { echo "build-agent: bad version: $VERSION" >&2; exit 2; }
+# Semver, as the release workflow's tag filter (v[0-9]+.[0-9]+.[0-9]+*) expects: 1.2.3, 1.2.3-rc.1, 1.2.3+build.
+SEMVER='^[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.+-]*)?$'
+[[ "$VERSION" =~ $SEMVER ]] || { echo "build-agent: not a semver version: $VERSION" >&2; exit 2; }
+
+# bun leaves temporary .bun-build files in the working directory when cross-compiling, even when it fails.
+trap 'rm -f ./*.bun-build ./.*.bun-build' EXIT
 
 # The agent imports @hoistline/protocol through its built dist.
 pnpm --filter @hoistline/protocol build
@@ -23,5 +28,3 @@ for target in darwin-arm64 darwin-x64 linux-x64 windows-x64; do
   bun build packages/agent/src/bin.ts --compile --target="bun-$target" \
     --define "HOISTLINE_AGENT_VERSION=\"$VERSION\"" --outfile "$out"
 done
-# bun leaves temporary .bun-build files in the working directory when cross-compiling.
-rm -f ./*.bun-build ./.*.bun-build
