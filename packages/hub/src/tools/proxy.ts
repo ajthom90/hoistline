@@ -4,7 +4,7 @@ import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import type { AgentToHub } from "@hoistline/protocol";
 import { z } from "zod";
 import type { Gateway } from "../gateway.js";
-import { AmbiguousMachineError, MachineOfflineError, NotFoundError } from "../jobs.js";
+import { MachineOfflineError, NotFoundError, resolveMachine } from "../jobs.js";
 import type { Machine, Store, User } from "../store.js";
 import { failure, toToolError, wrapUntrusted } from "./jobs.js";
 
@@ -275,61 +275,9 @@ export class DirectMode {
     return this.resolve(userId, ref).id;
   }
 
-  /**
-   * The machine `ref` names among the machines the user owns or has a share on, online or offline:
-   * - a machine id;
-   * - `<owner-login>/<machine-name>` (split at the first "/"): only a machine with that name whose owner has that
-   *   login; never a machine literally named like the whole reference;
-   * - a bare machine name: the user's own machine, else a shared one. A share needs no consent from the recipient,
-   *   so a shared machine never silently takes the place of the user's own: when a name matches one of the user's
-   *   own machines and a shared one, it means the user's own only while that machine is online; otherwise the call
-   *   fails naming both choices by id.
-   * Errors name machines by id only (no text another user controls). Throws NotFoundError (identical for unknown
-   * and inaccessible machines), AmbiguousMachineError or DirectModeError.
-   */
+  /** The machine `ref` names, if the user can access it: see resolveMachine (shared with delegate_task). */
   resolve(userId: string, ref: string): Machine {
-    const byId = this.store.getMachine(userId, ref);
-    if (byId) return byId;
-    const all = this.store.machinesFor(userId);
-    const ids = (ms: Machine[]) => ms.map((m) => m.id).join(", ");
-    const hint = "Name one by its id; list_tools shows each machine's owner.";
-    const slash = ref.indexOf("/");
-    if (slash >= 0) {
-      const login = ref.slice(0, slash).toLowerCase();
-      const name = ref.slice(slash + 1);
-      if (login === "" || name === "") throw new NotFoundError();
-      const logins = new Map<string, string>();
-      const loginOf = (m: Machine) => {
-        let l = logins.get(m.ownerId);
-        if (l === undefined) {
-          l = (this.store.getUser(m.ownerId)?.login ?? "").toLowerCase();
-          logins.set(m.ownerId, l);
-        }
-        return l;
-      };
-      const matches = all.filter((m) => m.name === name && loginOf(m) !== "" && loginOf(m) === login);
-      if (matches.length === 1) return matches[0]!;
-      if (matches.length > 1) {
-        throw new DirectModeError(`more than one machine matches ${JSON.stringify(ref)}: ${ids(matches)}. ${hint}`);
-      }
-      throw new NotFoundError();
-    }
-    const owned = all.filter((m) => m.ownerId === userId && m.name === ref);
-    const shared = all.filter((m) => m.ownerId !== userId && m.name === ref);
-    if (owned.length > 1) throw new AmbiguousMachineError(ref);
-    if (owned.length === 1) {
-      const own = owned[0]!;
-      if (shared.length === 0 || this.gateway.isOnline(own.id)) return own;
-      throw new DirectModeError(
-        `${JSON.stringify(ref)} could mean your own machine ${own.id} (offline) or a machine shared with you: ` +
-          `${ids(shared)}. ${hint}`,
-      );
-    }
-    if (shared.length === 1) return shared[0]!;
-    if (shared.length > 1) {
-      throw new DirectModeError(`more than one machine shared with you is named ${JSON.stringify(ref)}: ${ids(shared)}. ${hint}`);
-    }
-    throw new NotFoundError();
+    return resolveMachine(this.store, userId, ref, (id) => this.gateway.isOnline(id));
   }
 
   /** The tools of every online machine the user owns or has a share on. */
@@ -600,15 +548,19 @@ export function registerProxyTools(server: McpServer, direct: DirectMode, user: 
         const selected = entries.filter(
           (e) => (only === undefined || e.machineId === only) && (serverName === undefined || e.server === serverName),
         );
-        const head =
-          selected.length === 0
+        const total = selected.length;
+        const head = (listed: number) =>
+          total === 0
             ? "No proxied tools are available (no accessible machine is online with tools)."
-            : `${selected.length} proxied tools. "name" is the tool's direct name (null: use call_tool). For a shared ` +
-              'machine, pass "<owner>/<machine>" or its machineId as call_tool\'s machine.';
+            : `${listed === total ? `${total} proxied tools.` : `${listed} of ${total} proxied tools listed (truncated).`}` +
+              ` "name" is the tool's direct name (null: use call_tool). Pass "<owner>/<machine>" or the machineId ` +
+              "as call_tool's machine for any machine you can reach.";
         // Built one entry at a time against the byte budget (wrapper and frame included); stops when it is spent.
         const frame = (truncated: boolean, items: string) =>
           `{\n"truncated": ${truncated},\n${truncated ? `"hint": ${JSON.stringify(LIST_TOOLS_HINT)},\n` : ""}"tools": [\n${items}\n]\n}`;
-        let used = Buffer.byteLength(head) + 1 + UNTRUSTED_WRAPPER_BYTES + Buffer.byteLength(frame(true, ""));
+        // Room for the longest head this list can get: "N of M" with N as wide as M.
+        let used = Buffer.byteLength(head(0)) + String(total).length + 1 + UNTRUSTED_WRAPPER_BYTES +
+          Buffer.byteLength(frame(true, ""));
         const items: string[] = [];
         let truncated = false;
         for (const e of selected) {
@@ -637,7 +589,8 @@ export function registerProxyTools(server: McpServer, direct: DirectMode, user: 
           used += bytes;
         }
         // Every agent-supplied value (names, descriptions, schemas) is inside the untrusted block.
-        return { content: [{ type: "text", text: `${head}\n${wrapUntrusted(frame(truncated, items.join(",\n")))}` }] };
+        const text = `${head(items.length)}\n${wrapUntrusted(frame(truncated, items.join(",\n")))}`;
+        return { content: [{ type: "text", text }] };
       }),
   );
 
@@ -646,7 +599,7 @@ export function registerProxyTools(server: McpServer, direct: DirectMode, user: 
     {
       description:
         "Call a proxied MCP tool on a machine you can access: the machine (its id, its name, or \"<owner>/<machine>\" " +
-        "for a machine shared with you), the server and tool names " +
+        "for any machine you can reach, your own included), the server and tool names " +
         "as list_tools shows them, and the tool's arguments. The machine owner's policy decides what may run. " +
         UNTRUSTED_NOTE,
       inputSchema: z.strictObject({

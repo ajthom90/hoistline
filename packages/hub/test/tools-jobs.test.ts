@@ -250,6 +250,7 @@ describe("tool list", () => {
     expect(by("task_result").description).toMatch(/untrusted/i);
     expect(by("task_status").description).toMatch(/untrusted/i);
     expect(by("delegate_task").description).toMatch(/another machine/i);
+    expect(by("delegate_task").description).toContain("<owner>/<machine>");
   });
 });
 

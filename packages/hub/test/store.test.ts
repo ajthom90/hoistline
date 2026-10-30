@@ -79,6 +79,15 @@ describe("pairing codes", () => {
     expect(store.redeemPairingCode(code.toLowerCase().replaceAll("-", ""), "laptop", "pk")).not.toBeNull();
   });
 
+  it("refuses a machine name containing \"/\" without using up the code", () => {
+    const store = open();
+    const alice = store.upsertUser({ provider: "github", subject: "1", login: "alice" });
+    const code = store.createPairingCode(alice.id);
+    expect(() => store.redeemPairingCode(code, "bob/prod", "pk")).toThrow(/must not contain "\/"/);
+    expect(store.machinesFor(alice.id)).toEqual([]);
+    expect(store.redeemPairingCode(code, "prod", "pk")).not.toBeNull();
+  });
+
   it("rejects unknown codes and sweeps expired ones", () => {
     const store = open();
     const alice = store.upsertUser({ provider: "github", subject: "1", login: "alice" });
@@ -276,6 +285,21 @@ describe("machines and sharing", () => {
     const oidc = store.upsertUser({ provider: "oidc:https://idp", subject: "42", login: "alice2" });
     expect(oidc.id).not.toBe(gh.id);
     expect(store.upsertUser({ provider: "github", subject: "42", login: "alice" }).id).toBe(gh.id);
+  });
+});
+
+describe("countUsersByLogin", () => {
+  it("counts users with the login across providers, ignoring ASCII case, deleted machines' owners included", () => {
+    const store = open();
+    expect(store.countUsersByLogin("bob")).toBe(0);
+    store.upsertUser({ provider: "github", subject: "2", login: "bob" });
+    expect(store.countUsersByLogin("bob")).toBe(1);
+    expect(store.countUsersByLogin("BOB")).toBe(1);
+    const mallory = store.upsertUser({ provider: "oidc:https://idp.example", subject: "m", login: "Bob" });
+    const m = store.redeemPairingCode(store.createPairingCode(mallory.id), "prod", "pk")!;
+    store.deleteMachine(mallory.id, m.id);
+    expect(store.countUsersByLogin("bob")).toBe(2);
+    expect(store.countUsersByLogin("")).toBe(0);
   });
 });
 

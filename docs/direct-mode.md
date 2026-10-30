@@ -50,7 +50,8 @@ This prints each server's command and the names (not the values) of its `env` en
 Each server starts the first time its tools are listed or called and then keeps running. Starting (up to the end of
 the MCP handshake) must finish within 20 s, or the agent kills the server. When a server exits, whatever it left
 running in its process group is killed too. Output lines that are not JSON-RPC are skipped (and logged at most once a
-minute).
+minute). A server that writes an output line over 10 MiB is stopped like a crash: the agent logs it once, kills the
+server's process group and fails its pending calls with "server output too large".
 
 A server that crashes or does not start is not restarted by itself: the agent starts it again on the next list or
 call, but not sooner than 1 s, then 2 s, 4 s and 8 s after the failure. After 5 failures in a row it waits 60 s each
@@ -99,9 +100,11 @@ than 8 levels deep, maps of more than 100 properties and property names over 64 
 could share a machine named like yours. Shared machines' tools are reached only through `list_tools` and
 `call_tool`, which show who owns each machine.
 
-**Naming a machine** in `list_tools` and `call_tool`: its id, its name, or `<owner>/<machine>` (the owner's login).
-A reference with a `/` is always read as `<owner>/<machine>` and matches only a machine of that name owned by that
-login. Machine names cannot contain `/` (pairing refuses it; a machine paired earlier with a `/` in its name is reached
+**Naming a machine** in `list_tools`, `call_tool` and `delegate_task`: its id, its name, or `<owner>/<machine>` (the
+owner's login), for any machine you can reach, your own included. A reference with a `/` is always read as
+`<owner>/<machine>` and matches only a machine of that name owned by that login. Logins are unique only for GitHub
+accounts, so `<owner>/<machine>` works only while exactly one user of the hub (any sign-in provider) has that login;
+otherwise it fails and asks for the machine id. Machine names cannot contain `/` (pairing refuses it; a machine paired earlier with a `/` in its name is reached
 by id or by `<owner>/<machine>`). A bare name means your own machine first, then a shared one. If it matches one of
 your machines and a shared one, it means yours while yours is online; while yours is offline the call fails and
 lists both machines by id. Two shared machines with the same name need `<owner>/<machine>` or the id.
@@ -111,8 +114,10 @@ lists both machines by id. Two shared machines with the same name need `<owner>/
 - `list_tools` (optionally `{ "machine": "<machine>", "server": "<server>" }`) lists every proxied tool you can
   call, including those not offered by name, with its machine, owner, whether it is shared, server, tool name, direct
   name (or null), description, parameters and input schema. Everything the machine supplied is inside one "untrusted
-  output" block. The response is at most 512 KiB; when the list does not fit, it says `"truncated": true` and you
-  can ask for one machine or server.
+  output" block, as one JSON object: `{ "truncated": false, "tools": [ ... ] }`, or, when the list did not fit,
+  `{ "truncated": true, "hint": "...", "tools": [ ... ] }`. The response is at most 512 KiB; when it is truncated,
+  the line before the block says how many tools are listed ("N of M proxied tools listed") and you can ask for one
+  machine or server.
 - `call_tool` with `{ "machine": "<machine>", "server": "fs", "tool": "read_file", "args": { ... } }` calls any of
   them.
 

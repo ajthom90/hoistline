@@ -116,6 +116,11 @@ export function utf8Tail(text: string, maxBytes: number): { text: string; trunca
   return { text: bytes.toString("utf8", start), truncated: true };
 }
 
+/** Login comparison key: ASCII letters lowercased, nothing else changed (exactly SQLite's lower()). */
+export function foldLogin(login: string): string {
+  return login.replace(/[A-Z]/g, (c) => c.toLowerCase());
+}
+
 /** SQLite persistence for users, machines, pairing, shares and jobs. OAuth state shares the connection via `db`. */
 export class Store {
   readonly db: Database.Database;
@@ -213,7 +218,9 @@ export class Store {
     return code;
   }
 
+  /** Throws for a machine name containing "/" (it would read as `<owner>/<machine>`), leaving the code unused. */
   redeemPairingCode(code: string, machineName: string, publicKey: string): Machine | null {
+    if (machineName.includes("/")) throw new Error('the machine name must not contain "/"');
     const hash = sha256(normalizeCode(code));
     return this.db.transaction(() => {
       const row = this.db.prepare("SELECT user_id, expires_at FROM pairing_codes WHERE code_hash = ?").get(hash) as
@@ -288,6 +295,18 @@ export class Store {
     if (!row?.identifiers) return null;
     const parsed: unknown = JSON.parse(row.identifiers);
     return Array.isArray(parsed) ? parsed.filter((v): v is string => typeof v === "string") : null;
+  }
+
+  /**
+   * How many users, of any provider, have this login (compared as foldLogin does). Logins are unique only for
+   * GitHub, so a login names one user only when this is 1. An empty login counts nobody.
+   */
+  countUsersByLogin(login: string): number {
+    if (login === "") return 0;
+    const row = this.db.prepare("SELECT count(*) AS n FROM users WHERE login != '' AND lower(login) = lower(?)").get(login) as {
+      n: number;
+    };
+    return row.n;
   }
 
   getUser(userId: string): User | null {

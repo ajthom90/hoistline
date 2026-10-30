@@ -543,6 +543,15 @@ describe("direct mode access", () => {
     expect(bobs.calls).toEqual([]);
   });
 
+  it("call_tool's description offers <owner>/<machine> for any machine you can reach", async () => {
+    const hub = await startHub();
+    await fakeAgent(hub, hub.alice, "mac", [FS]);
+    const c = await client(hub);
+    const desc = (await c.listTools()).tools.find((t) => t.name === "call_tool")?.description ?? "";
+    expect(desc).toContain('"<owner>/<machine>" for any machine you can reach');
+    expect(desc).not.toContain("shared with you)");
+  });
+
   it("a qualified reference matches only that owner's machine, never a machine literally named like it", async () => {
     const hub = await startHub();
     const mallory = hub.store.upsertUser({ provider: "github", subject: "4", login: "mallory" });
@@ -570,6 +579,26 @@ describe("direct mode access", () => {
     expect((await call(c, "call_tool", { machine: malloryMachine.identity.machineId, server: "fs", tool: "Read_File" })).isError).toBe(false);
     expect((await call(c, "call_tool", { machine: "mallory/bob/prod", server: "fs", tool: "Read_File" })).isError).toBe(false);
     expect(malloryMachine.calls).toHaveLength(2);
+  });
+
+  it("refuses a qualified reference when more than one user has that login", async () => {
+    const hub = await startHub();
+    // Mallory signs in through an OIDC provider with the login "bob"; the real (GitHub) bob has no "prod".
+    const mallory = hub.store.upsertUser({ provider: "oidc:https://idp.example", subject: "m", login: "bob" });
+    const malloryMachine = await fakeAgent(hub, mallory, "prod", [FS]);
+    hub.store.shareMachine(mallory.id, malloryMachine.identity.machineId, `user:${hub.alice.id}`);
+    const c = await client(hub);
+
+    const r = await call(c, "call_tool", { machine: "bob/prod", server: "fs", tool: "Read_File" });
+    expect(r.isError).toBe(true);
+    expect(r.text).toMatch(/more than one user has the login "bob"/);
+    expect(r.text).toMatch(/machine id/);
+    expect(r.text).not.toContain("prod");
+    expect((await call(c, "list_tools", { machine: "bob/prod" })).isError).toBe(true);
+    expect(malloryMachine.calls).toEqual([]);
+    // By id it is reachable.
+    const byId = await call(c, "call_tool", { machine: malloryMachine.identity.machineId, server: "fs", tool: "Read_File" });
+    expect(byId.isError).toBe(false);
   });
 
   it("does not return a result once the share was revoked during the call", async () => {
@@ -611,6 +640,8 @@ describe("direct mode limits", () => {
     expect(listed.hint).toMatch(/machine/);
     expect(listed.tools.length).toBeGreaterThan(0);
     expect(listed.tools.length).toBeLessThan(500);
+    // The head line counts what is actually listed.
+    expect(r.text.startsWith(`${listed.tools.length} of 500 proxied tools listed`)).toBe(true);
 
     const one = await call(c, "list_tools", { machine: "two", server: "c" });
     const oneJson = JSON.parse(one.text.slice(one.text.indexOf("{"), one.text.lastIndexOf("}") + 1)) as {
@@ -619,6 +650,7 @@ describe("direct mode limits", () => {
     };
     expect(oneJson.truncated).toBe(false);
     expect(oneJson.tools).toHaveLength(50);
+    expect(one.text.startsWith("50 proxied tools.")).toBe(true);
     expect(oneJson.tools.every((t) => t.machine === "two" && t.server === "c")).toBe(true);
   });
 

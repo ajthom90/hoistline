@@ -7,6 +7,7 @@ import {
   AmbiguousMachineError,
   describeReason,
   MachineOfflineError,
+  MachineRefError,
   NotFoundError,
   OUTPUT_TAIL_BYTES,
   TooManyJobsError,
@@ -44,6 +45,7 @@ export function toToolError(err: unknown): CallToolResult {
   if (err instanceof NotFoundError) return failure("machine not found");
   if (err instanceof MachineOfflineError) return failure("machine offline");
   if (err instanceof AmbiguousMachineError) return failure("ambiguous machine name: use the machine id");
+  if (err instanceof MachineRefError) return failure(err.message);
   if (err instanceof TooManyJobsError) return failure("too many active jobs");
   if (err instanceof z.ZodError) return failure("invalid request");
   return failure("internal error");
@@ -91,7 +93,8 @@ export function registerJobTools(server: McpServer, jobs: Jobs, user: User): voi
         "Run a coding task on another machine you can access, using one of its runners. This causes code to run " +
         "on that machine, with the runner trusted and unrestricted according to the machine owner's policy; the " +
         "job may be held for the owner's approval. The result is pushed to a new branch hoistline/<jobId>. " +
-        "Returns at once with a jobId: poll task_status, then read task_result.",
+        "Returns at once with a jobId: poll task_status, then read task_result. Name the machine by its id, its " +
+        "name (your own machine first, then one shared with you), or \"<owner>/<machine>\".",
       inputSchema: DelegateInput,
       outputSchema: z.strictObject({
         jobId: z.string(),

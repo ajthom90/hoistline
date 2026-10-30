@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import { JobSpecSchema, signJob, type AgentToHub, type JobSpec, type RunnerName } from "@hoistline/protocol";
 import type { Gateway } from "./gateway.js";
-import { ACTIVE_JOB_STATUSES, utf8Tail, type JobRow, type Machine, type Store } from "./store.js";
+import { ACTIVE_JOB_STATUSES, foldLogin, utf8Tail, type JobRow, type Machine, type Store } from "./store.js";
 
 export type JobStatus = "queued" | "awaiting_approval" | "running" | "succeeded" | "failed" | "cancelled";
 
@@ -82,6 +82,14 @@ export class AmbiguousMachineError extends Error {
   }
 }
 
+/** A machine reference that names no single machine; the message names machines by id only and is safe to show. */
+export class MachineRefError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "MachineRefError";
+  }
+}
+
 export class TooManyJobsError extends Error {
   constructor(message: string) {
     super(message);
@@ -113,16 +121,71 @@ export function describeReason(reason: string): string | undefined {
   return Object.hasOwn(REASON_DESCRIPTIONS, reason) ? REASON_DESCRIPTIONS[reason] : undefined;
 }
 
+export type MachineResolverStore = Pick<Store, "getMachine" | "machinesFor" | "getUser" | "countUsersByLogin">;
+
 /**
- * The machine `ref` (an id, or the name of a machine the user can access) names, if the user owns it or has a share
- * on it. Throws NotFoundError (unknown and inaccessible machines look the same) or AmbiguousMachineError.
+ * The machine `ref` names among the machines the user owns or has a share on, online or offline. Used by direct mode
+ * and delegate_task alike:
+ * - a machine id;
+ * - `<owner-login>/<machine-name>` (split at the first "/"): only a machine with that name whose owner has that
+ *   login, and only while exactly one user in the store (any provider) has that login, since logins are unique only
+ *   for GitHub; never a machine literally named like the whole reference;
+ * - a bare machine name: the user's own machine, else a shared one. A share needs no consent from the recipient,
+ *   so a shared machine never silently takes the place of the user's own: when a name matches one of the user's
+ *   own machines and a shared one, it means the user's own only while that machine is online (`isOnline`);
+ *   otherwise the reference is refused, naming both choices by id.
+ * Errors name machines by id only and echo no text another user controls. Throws NotFoundError (identical for
+ * unknown and inaccessible machines), AmbiguousMachineError (two of the user's own machines) or MachineRefError.
  */
-export function resolveMachine(store: Pick<Store, "getMachine" | "machinesFor">, userId: string, ref: string): Machine {
+export function resolveMachine(
+  store: MachineResolverStore,
+  userId: string,
+  ref: string,
+  isOnline: (machineId: string) => boolean,
+): Machine {
   const byId = store.getMachine(userId, ref);
   if (byId) return byId;
-  const named = store.machinesFor(userId).filter((m) => m.name === ref);
-  if (named.length > 1) throw new AmbiguousMachineError(ref);
-  if (named.length === 1) return named[0]!;
+  const all = store.machinesFor(userId);
+  const ids = (ms: Machine[]) => ms.map((m) => m.id).join(", ");
+  const hint = "Name one by its machine id.";
+  const slash = ref.indexOf("/");
+  if (slash >= 0) {
+    const typed = ref.slice(0, slash);
+    const login = foldLogin(typed);
+    const name = ref.slice(slash + 1);
+    if (login === "" || name === "") throw new NotFoundError();
+    if (store.countUsersByLogin(typed) > 1) {
+      throw new MachineRefError(
+        `more than one user has the login ${JSON.stringify(typed)}, so "<owner>/<machine>" cannot name the machine; ` +
+          "use the machine id instead",
+      );
+    }
+    const logins = new Map<string, string>();
+    const loginOf = (m: Machine) => {
+      let l = logins.get(m.ownerId);
+      if (l === undefined) {
+        l = foldLogin(store.getUser(m.ownerId)?.login ?? "");
+        logins.set(m.ownerId, l);
+      }
+      return l;
+    };
+    const matches = all.filter((m) => m.name === name && loginOf(m) !== "" && loginOf(m) === login);
+    if (matches.length === 1) return matches[0]!;
+    if (matches.length > 1) throw new MachineRefError(`more than one machine matches: ${ids(matches)}. ${hint}`);
+    throw new NotFoundError();
+  }
+  const owned = all.filter((m) => m.ownerId === userId && m.name === ref);
+  const shared = all.filter((m) => m.ownerId !== userId && m.name === ref);
+  if (owned.length > 1) throw new AmbiguousMachineError(ref);
+  if (owned.length === 1) {
+    const own = owned[0]!;
+    if (shared.length === 0 || isOnline(own.id)) return own;
+    throw new MachineRefError(
+      `the name could mean your own machine ${own.id} (offline) or a machine shared with you: ${ids(shared)}. ${hint}`,
+    );
+  }
+  if (shared.length === 1) return shared[0]!;
+  if (shared.length > 1) throw new MachineRefError(`more than one machine shared with you has that name: ${ids(shared)}. ${hint}`);
   throw new NotFoundError();
 }
 
@@ -222,7 +285,7 @@ export class Jobs {
    * AmbiguousMachineError, MachineOfflineError, TooManyJobsError, or a validation error for a malformed request.
    */
   delegate(userId: string, req: DelegateRequest): JobRow {
-    const machine = resolveMachine(this.store, userId, req.machine);
+    const machine = resolveMachine(this.store, userId, req.machine, (id) => this.gateway.isOnline(id));
     if (!this.gateway.isOnline(machine.id)) throw new MachineOfflineError();
     const spec: JobSpec = JobSpecSchema.parse({
       jobId: randomUUID(),

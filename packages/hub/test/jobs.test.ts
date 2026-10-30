@@ -200,19 +200,71 @@ describe("delegate", () => {
     expect(gateway.sent).toEqual([]);
   });
 
-  it("resolves a machine by name among accessible machines, and refuses an ambiguous name", () => {
+  it("resolves a bare name to the user's own machine first, then to a shared one", () => {
     const jobs = makeJobs();
     gateway.connect(laptop.id);
     expect(jobs.delegate(alice.id, req("laptop")).machineId).toBe(laptop.id);
 
-    // Bob's "laptop" is invisible to alice until it is shared with her.
+    // Bob shares his own "laptop" with alice: her own still wins.
     const bobLaptop = pair(bob, "laptop");
     gateway.connect(bobLaptop.id);
-    expect(jobs.delegate(alice.id, req("laptop")).machineId).toBe(laptop.id);
     store.shareMachine(bob.id, bobLaptop.id, `user:${alice.id}`);
-    expect(() => jobs.delegate(alice.id, req("laptop"))).toThrow(AmbiguousMachineError);
-    // The id still works.
+    expect(jobs.delegate(alice.id, req("laptop")).machineId).toBe(laptop.id);
+    // The id and the qualified reference reach Bob's.
     expect(jobs.delegate(alice.id, req(bobLaptop.id)).machineId).toBe(bobLaptop.id);
+    expect(jobs.delegate(alice.id, req("bob/laptop")).machineId).toBe(bobLaptop.id);
+    // A name only shared with her resolves to the shared machine.
+    const bobBox = pair(bob, "box");
+    gateway.connect(bobBox.id);
+    store.shareMachine(bob.id, bobBox.id, `user:${alice.id}`);
+    expect(jobs.delegate(alice.id, req("box")).machineId).toBe(bobBox.id);
+  });
+
+  it("refuses an ambiguous name, naming the candidates by id only", () => {
+    const jobs = makeJobs();
+    // Her own "laptop" is offline: Bob's shared "laptop" must not take its place silently.
+    const bobLaptop = pair(bob, "laptop");
+    gateway.connect(bobLaptop.id);
+    store.shareMachine(bob.id, bobLaptop.id, `user:${alice.id}`);
+    let err: Error | undefined;
+    try {
+      jobs.delegate(alice.id, req("laptop"));
+    } catch (e) {
+      err = e as Error;
+    }
+    expect(err?.message).toContain(laptop.id);
+    expect(err?.message).toContain(bobLaptop.id);
+    expect(err?.message).not.toContain("bob");
+    // Two own machines with one name.
+    const second = pair(alice, "desk");
+    const third = pair(alice, "desk");
+    gateway.connect(second.id);
+    gateway.connect(third.id);
+    expect(() => jobs.delegate(alice.id, req("desk"))).toThrow(AmbiguousMachineError);
+    expect(gateway.sent).toEqual([]);
+  });
+
+  it("a qualified reference never reaches a machine literally named like it", () => {
+    const jobs = makeJobs();
+    const mallory = store.upsertUser({ provider: "github", subject: "4", login: "mallory" });
+    const legacy = pair(mallory, "legacy");
+    store.db.prepare("UPDATE machines SET name = ? WHERE id = ?").run("bob/prod", legacy.id);
+    gateway.connect(legacy.id);
+    store.shareMachine(mallory.id, legacy.id, `user:${alice.id}`);
+    expect(() => jobs.delegate(alice.id, req("bob/prod"))).toThrow(NotFoundError);
+    expect(gateway.sent).toEqual([]);
+    expect(jobs.delegate(alice.id, req("mallory/bob/prod")).machineId).toBe(legacy.id);
+  });
+
+  it("refuses a qualified reference whose login more than one user has", () => {
+    const jobs = makeJobs();
+    const mallory = store.upsertUser({ provider: "oidc:https://idp.example", subject: "m", login: "bob" });
+    const prod = pair(mallory, "prod");
+    gateway.connect(prod.id);
+    store.shareMachine(mallory.id, prod.id, `user:${alice.id}`);
+    expect(() => jobs.delegate(alice.id, req("bob/prod"))).toThrow(/more than one user has the login "bob".*id/);
+    expect(gateway.sent).toEqual([]);
+    expect(jobs.delegate(alice.id, req(prod.id)).machineId).toBe(prod.id);
   });
 
   it("validates the request with the job spec schema", () => {
