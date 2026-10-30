@@ -257,6 +257,20 @@ function readPolicyState(path: string): PolicyState {
   }
 }
 
+/** Runners that run with approvals off and no CLI sandbox (see docs/runners.md). */
+const UNSANDBOXED_RUNNERS = ["cursor", "grok"] as const;
+
+/** One warning line per unsandboxed runner the effective policy allows (trusted mode allows every runner). */
+function runnerWarnings(state: PolicyState): string[] {
+  if (state.kind !== "ok") return [];
+  const policy = state.policy;
+  return UNSANDBOXED_RUNNERS.filter((r) => policy.mode === "trusted" || policy.runners.includes(r)).map((r) =>
+    escapeForTerminal(
+      `warning: ${r} runs with approvals off and no CLI sandbox: anything a job's prompt asks, it can do as you.`,
+    ),
+  );
+}
+
 function policyStateLine(state: PolicyState): string {
   if (state.kind === "missing") return "deny-all (no policy file; run hoistline-agent setup)";
   if (state.kind === "invalid") return "deny-all (the policy file is invalid)";
@@ -307,6 +321,7 @@ function policyShow(ctx: Ctx): number {
   } else {
     ctx.out(policySummary(state.policy));
   }
+  for (const line of runnerWarnings(state)) ctx.out(line);
   ctx.out("effective policy:");
   printJson(ctx, state.kind === "ok" ? state.policy : DENY_ALL);
   return EXIT_OK;
@@ -652,10 +667,12 @@ async function run(args: string[], ctx: Ctx): Promise<number> {
     },
   });
   link.conn = connection;
+  const policyState = readPolicyState(policyPath);
   log(
     `hoistline-agent ${AGENT_VERSION}: machine ${escapeForTerminal(identity.machineId)}, ` +
-      `hub ${escapeForTerminal(identity.hubUrl)}, policy ${policyStateLine(readPolicyState(policyPath))}`,
+      `hub ${escapeForTerminal(identity.hubUrl)}, policy ${policyStateLine(policyState)}`,
   );
+  for (const line of runnerWarnings(policyState)) log(line);
 
   const setT = deps.setTimeout ?? ((fn: () => void, ms: number) => setTimeout(fn, ms));
   const clearT = deps.clearTimeout ?? ((h: unknown) => clearTimeout(h as NodeJS.Timeout));

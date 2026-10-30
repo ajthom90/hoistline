@@ -15,6 +15,7 @@ import { fileURLToPath } from "node:url";
 import type { JobSpec } from "@hoistline/protocol";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import {
+  MAX_ARGV_PROMPT_BYTES,
   PROMPT_DELIMITER,
   PromptTooLargeError,
   RUNNER_PREAMBLE,
@@ -306,6 +307,13 @@ describe.skipIf(!posix)("cursor template", () => {
   it("refuses to build without an absolute working directory", () => {
     expect(() => buildCommand(cursor())).toThrow(/working directory/);
     expect(() => buildCommand(cursor(), { cwd: "relative" })).toThrow(/working directory/);
+  });
+
+  it("accepts a wrapped prompt of exactly 120 KiB and refuses one byte more", () => {
+    const room = MAX_ARGV_PROMPT_BYTES - Buffer.byteLength(wrapped(""));
+    const at = buildCommand(cursor({ prompt: "a".repeat(room) }), { cwd: work });
+    expect(Buffer.byteLength(at.args.at(-1)!)).toBe(MAX_ARGV_PROMPT_BYTES);
+    expect(() => buildCommand(cursor({ prompt: "a".repeat(room + 1) }), { cwd: work })).toThrow(PromptTooLargeError);
   });
 
   it("refuses a prompt too large for one argument and spawns nothing", async () => {

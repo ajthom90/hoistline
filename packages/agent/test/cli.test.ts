@@ -278,6 +278,28 @@ describe("policy show", () => {
     expect(r.out).toMatch(/invalid/i);
   });
 
+  const warn = (r: string) => (r.match(/^warning: .*$/gm) ?? []);
+  const text = (runner: string) =>
+    `warning: ${runner} runs with approvals off and no CLI sandbox: anything a job's prompt asks, it can do as you.`;
+
+  it("warns once for each allowed cursor or grok runner in restricted mode", async () => {
+    writePolicy({ ...RESTRICTED, runners: ["muse", "grok"] });
+    const r = await run(["policy", "show"]);
+    expect(warn(r.out)).toEqual([text("grok")]);
+  });
+
+  it("warns for cursor and grok in trusted mode", async () => {
+    writePolicy({ mode: "trusted" });
+    const r = await run(["policy", "show"]);
+    expect(warn(r.out)).toEqual([text("cursor"), text("grok")]);
+  });
+
+  it("shows no warning when neither cursor nor grok is allowed", async () => {
+    writePolicy({ ...RESTRICTED, runners: ["muse", "codex"] });
+    expect(warn((await run(["policy", "show"])).out)).toEqual([]);
+    expect(warn((await run(["policy", "show"])).err)).toEqual([]);
+  });
+
   it("prints a valid policy as JSON", async () => {
     writePolicy();
     const r = await run(["policy", "show"]);
@@ -631,6 +653,23 @@ describe("run", () => {
     expect(i).toBeGreaterThan(-1);
     expect(f.calls.indexOf("connection.close")).toBeGreaterThan(i);
     expect(f.calls).toContain("signals.off");
+  });
+
+  it("warns at startup for each allowed cursor or grok runner, and only then", async () => {
+    const text = (runner: string) =>
+      `warning: ${runner} runs with approvals off and no CLI sandbox: anything a job's prompt asks, it can do as you.`;
+    const lines = async (policy: unknown) => {
+      writeIdentity();
+      writePolicy(policy);
+      const f = fakes();
+      const { done, err } = await started(f, ["run"]);
+      f.trigger("SIGTERM");
+      await done;
+      return err().split("\n").filter((l) => l.startsWith("warning: "));
+    };
+    expect(await lines({ ...RESTRICTED, runners: ["grok"] })).toEqual([text("grok")]);
+    expect(await lines({ mode: "trusted" })).toEqual([text("cursor"), text("grok")]);
+    expect(await lines(RESTRICTED)).toEqual([]);
   });
 
   it("proxies the servers in servers.json: hello lists them and tools messages are answered", async () => {

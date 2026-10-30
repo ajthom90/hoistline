@@ -37,9 +37,10 @@ runner does:
 3. **Never interpolate the prompt into a flag.** No `--prompt=${prompt}`, no `-p${prompt}`, and no splitting the
    prompt into several arguments. The one allowed exception is a CLI with no stdin form and a flag-only prompt
    (Grok): the prompt is then exactly one argv element of the form `--flag=<prompt>`, never two elements. Clap
-   reads everything after the first `=` as that flag's value, so a prompt that begins with `--` cannot become a
-   flag of its own. Adapters that use it must still go through `wrapPromptForArgv` (120 KiB cap). The prompt reaches the child exactly as given: spaces, quotes, `$()`, backticks,
-   `;`, newlines and very long text included.
+   takes everything after the first `=` as that flag's value, and the wrapped prompt always begins with the
+   preamble, so it does not start with `-`. Adapters that use it must still go through `wrapPromptForArgv`
+   (120 KiB cap). The prompt reaches the child exactly as given: spaces, quotes, `$()`, backticks, `;`, newlines
+   and very long text included.
 4. **Model names are validated before the adapter sees them.** `buildCommand` rejects any `model` that does not
    match `^[A-Za-z0-9][A-Za-z0-9._:/-]{0,99}$`, so a model can never look like a flag or carry shell syntax. Pass
    it as the value of the CLI's model flag in its own array element (for example `["--model", spec.model]`).
@@ -328,8 +329,10 @@ after `--` (the `[prompt...]` argument), built with `wrapPromptForArgv` and subj
 no stdin form for the prompt (`--prompt-file` exists but needs a file in the workspace, for the reasons given under
 Muse), so the wrapped prompt is passed as the single argv element `--single=<prompt>`, built with
 `wrapPromptForArgv` (`prompt_too_large: ... for grok` above 120 KiB). This is the allowed exception to rule 3:
-the prompt is one element, and clap reads everything after `=` as the flag's value, so a prompt starting with `--`
-or `-` cannot be taken as another flag. The tests check that such a prompt stays inside that one element.
+the prompt is one element, and clap takes everything after `=` as the flag's value. The wrapped prompt always
+begins with the preamble, and the tests check that a user prompt beginning with `--` stays inside that one
+element. That is a statement about argv only: Grok may still preprocess prompt text. It has a `--verbatim` flag
+("send the prompt exactly as given") that this adapter does not pass.
 
 - `--output-format streaming-json`: streaming JSON events on stdout, for later tasks to parse.
 - `--cwd <worktree>`: the working directory.
@@ -340,11 +343,26 @@ or `-` cannot be taken as another flag. The tests check that such a prompt stays
   sandbox the owner's environment or config sets.
 - Not used: `-w`/`--worktree`, `-c`/`--continue`, `-r`/`--resume`.
 
-**Cursor and Grok are not sandboxed by Hoistline, and not isolated from each other.** Neither adapter relies on a
-CLI sandbox to separate one job from another, and neither adds the shared git mirror to any writable root. Both are
-run with their approval prompts off, as the owner's user, so they fall under the accepted residual risk above: they
-can write anywhere the owner can. A worktree's git metadata lives in the mirror, so a runner that can commit can
-also write there.
+**Cursor and Grok run with approvals off and no CLI sandbox.** Cursor (`--force`) and Grok (`--always-approve`)
+run every tool call without asking, and Hoistline passes no sandbox flag to either. That is weaker than Codex,
+which keeps its workspace-write sandbox, and Muse, which keeps its sandbox. Whatever a job's prompt asks, they can
+do as the owner. Allow them only for repos and prompts you trust. `hoistline-agent policy show` and `run` print
+one warning line for each of them that the effective policy allows (trusted mode allows both).
+
+Neither adapter relies on a CLI sandbox to separate one job from another, and neither adds the shared git mirror to
+any writable root. Both fall under the accepted residual risk above: they can write anywhere the owner can. A
+worktree's git metadata lives in the mirror, so a runner that can commit can also write there.
+
+**Prompts travel in argv** for Muse, Cursor and Grok (Codex uses stdin). On a host with several accounts, other
+local users can read argv from the process list. Use a single-user machine, or on Linux mount `/proc` with
+`hidepid=2`.
+
+**Not verified against a real run.** Commander's handling of `--` (Cursor) and clap's handling of `--single=`
+(Grok) were checked against the help text and standard parser behavior only. The first real run of each should be
+a smoke test.
+
+**Cursor models.** The help shows bracket-parameterized models such as `name[effort=high]`. The model rule
+(`^[A-Za-z0-9][A-Za-z0-9._:/-]{0,99}$`) refuses them, so only plain model names work.
 
 **Muse and Codex are not configured the same way.** Muse keeps its web tools, its sandbox network mode is
 `proxy-only` (network through Muse's proxy), and it still loads the owner's user config. Codex has network off
