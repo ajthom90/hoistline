@@ -22,8 +22,9 @@ services:
 
   # Optional: Cloudflare Tunnel in this compose project (see docs/cloudflare-tunnel.md).
   # It shares the hub's network namespace, so it reaches the hub over loopback (point the tunnel's public hostname
-  # at http://localhost:3000). The hub trusts X-Forwarded-For only from loopback; from anywhere else every client
-  # shares one rate-limit bucket for POST /pair (10 attempts a minute).
+  # at http://localhost:3000). The hub trusts X-Forwarded-For only from loopback. From anywhere else every client
+  # shares each per-IP rate-limit bucket: /pair 10/min, /authorize 100/15 min, /token 50/15 min,
+  # /register 20/hour, /revoke 50/15 min.
   # cloudflared:
   #   image: cloudflare/cloudflared:latest   # pin a version tag
   #   restart: unless-stopped

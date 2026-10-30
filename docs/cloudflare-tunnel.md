@@ -40,7 +40,7 @@ cloudflared tunnel run --url http://127.0.0.1:3000 hoistline
 ```
 
 This works, but the hub sees connections through Docker's published port as coming from a Docker address, not
-loopback, so all clients share one pairing rate-limit bucket (below).
+loopback, so all clients share the rate-limit buckets (below).
 
 Check the hub through the tunnel:
 
@@ -50,23 +50,37 @@ curl -s https://hoistline.example.com/.well-known/oauth-authorization-server
 
 It should print JSON whose `issuer` is your `PUBLIC_URL` with a trailing `/`.
 
-## Trust proxy and the pairing rate limit
+## Trust proxy and rate limits
 
 The hub has no trust-proxy setting. It is fixed in code (`app.set("trust proxy", "loopback")` in
 `packages/hub/src/server.ts`): the hub uses `X-Forwarded-For` only when the connection comes from loopback.
 Otherwise it uses the connection's own address.
 
-`POST /pair` is unauthenticated and allows 10 attempts per minute per client IP. If cloudflared does not reach the
-hub over loopback, every client appears to come from one address, so **all clients share one bucket of 10 pairing
-attempts a minute**. For a hub with a handful of users this mostly means a pairing may need a retry after a minute,
-but one client sending bad codes can hold up pairing for everyone.
+These routes are rate limited per client IP (`req.ip`):
+
+| Route | Limit | Set by |
+| --- | --- | --- |
+| `POST /pair` | 10 per minute | the hub (`packages/hub/src/pairing.ts`) |
+| `/authorize` | 100 per 15 minutes | the MCP SDK's OAuth router |
+| `POST /token` | 50 per 15 minutes | the MCP SDK's OAuth router |
+| `POST /register` | 20 per hour | the MCP SDK's OAuth router |
+| `POST /revoke` | 50 per 15 minutes | the MCP SDK's OAuth router |
+
+(SDK limits as of `@modelcontextprotocol/sdk` 1.32.2.)
+
+If cloudflared does not reach the hub over loopback, every client appears to come from one address, so **all
+clients share each of these buckets**: 10 pairing attempts a minute, 20 client registrations an hour, and so on, for
+everyone together. For a hub with a handful of users this mostly means an occasional retry after the window, but one
+client (or a misbehaving MCP client that keeps re-registering) can use up a bucket for everyone. The recommended
+compose setup above reaches the hub over loopback and avoids this.
 
 Checked on Docker Desktop for Mac with the hub image: twelve `POST /pair` requests with different `X-Forwarded-For`
 values got `429` from the 11th on through the published port, and none through loopback inside the hub's network
 namespace. Not checked on a Linux Docker host, where the result through the published port is expected to be the
-same.
+same. The SDK routes were not measured; they key on the same `req.ip`.
 
 With cloudflared on loopback, per-client buckets rely on Cloudflare sending the client's address in
 `X-Forwarded-For`. That was not checked here.
 
-The other routes are not rate limited by IP.
+The other routes (including `POST /mcp`, `/oauth/callback`, `/oauth/consent` and the web UI) are not rate limited
+by IP.
