@@ -327,6 +327,26 @@ describe("machines", () => {
     expect(shared).toMatch(/bobbox[\s\S]*bob[\s\S]*offline/);
   });
 
+  it("shows the OS an agent reports, escaped, and 'not reported' otherwise (old agents still connect)", async () => {
+    const hub = await startHub(ctx);
+    const alice = await uiLogin(hub, browser);
+    const linux = await pair(hub, alice, "linuxbox");
+    const old = await pair(hub, alice, "oldbox");
+    const odd = await pair(hub, alice, "oddbox");
+    const a = new RawAgent(hub, ctx);
+    await a.hello(linux.machineId, linux.privateKey, ["muse"], "linux-x64");
+    await onlineAgent(hub, ctx, old);
+    const c = new RawAgent(hub, ctx);
+    await c.hello(odd.machineId, odd.privateKey, ["muse"], "<b>x</b>");
+    await waitFor(() => hub.gateway.isOnline(linux.machineId) && hub.gateway.isOnline(odd.machineId), "agents online");
+    expect(hub.gateway.agentInfo(linux.machineId)?.os).toBe("linux-x64");
+    const { html } = await page(hub, browser);
+    expect(html).toMatch(/linuxbox[\s\S]*?<td[^>]*>linux-x64<\/td>/);
+    expect(html).toMatch(/oldbox[\s\S]*?<td class="muted">not reported<\/td>/);
+    expect(html).toContain("&lt;b&gt;x&lt;/b&gt;");
+    expect(html).not.toContain("<b>x</b>");
+  });
+
   it("shares by login: the machine appears in the grantee's list_machines", async () => {
     const hub = await startHub(ctx);
     const alice = await uiLogin(hub, browser);

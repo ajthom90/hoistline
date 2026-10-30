@@ -216,6 +216,7 @@ export class Gateway {
     const info: AgentInfo = {
       machineId: hello.machineId,
       agentVersion: hello.agentVersion,
+      ...(hello.os === undefined ? {} : { os: hello.os }),
       runners: hello.runners,
       runningJobs: hello.runningJobs,
       servers: hello.servers,

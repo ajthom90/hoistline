@@ -166,6 +166,11 @@ export function uiRouter(deps: UiDeps): express.Router {
     const shared = all.filter((m) => m.ownerId !== user.id);
     const status = (id: string) =>
       gateway.isOnline(id) ? `<span class="online">online</span>` : `<span class="offline">offline</span>`;
+    // Reported in the agent's hello, so known only while it is connected.
+    const os = (id: string) => {
+      const reported = gateway.agentInfo(id)?.os;
+      return reported ? `<td>${h(reported)}</td>` : `<td class="muted">not reported</td>`;
+    };
     const mineRows = mine.map((m) => {
       const runners = gateway.agentInfo(m.id)?.runners ?? [];
       const shares = store.listShares(user.id, m.id).map(
@@ -186,7 +191,7 @@ export function uiRouter(deps: UiDeps): express.Router {
         `<input name="confirm" required maxlength="100" placeholder="type the machine name"> <button type="submit">Delete</button>`,
       );
       return (
-        `<tr><td>${h(m.name)}<div class="muted mono">${h(m.id)}</div></td><td class="muted">not reported</td><td>${status(m.id)}</td>` +
+        `<tr><td>${h(m.name)}<div class="muted mono">${h(m.id)}</div></td>${os(m.id)}<td>${status(m.id)}</td>` +
         `<td>${runners.length ? h(runners.join(", ")) : `<span class="muted">none</span>`}</td>` +
         `<td>${shares.join("")}${share}</td><td>${del}</td></tr>`
       );

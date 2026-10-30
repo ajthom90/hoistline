@@ -341,12 +341,21 @@ export class RawAgent {
     ctx.cleanups.push(() => this.ws.terminate());
   }
 
-  async hello(machineId: string, key: KeyObject, runners: ("muse" | "codex")[] = ["muse"]): Promise<void> {
+  async hello(machineId: string, key: KeyObject, runners: ("muse" | "codex")[] = ["muse"], os?: string): Promise<void> {
     await waitFor(() => this.messages.length > 0, "challenge");
     const challenge = this.messages[0]!;
     if (challenge.type !== "challenge") throw new Error(`expected challenge, got ${challenge.type}`);
     const signature = sign(null, agentAuthPayload(machineId, challenge.nonce), key).toString("base64url");
-    const hello: AgentToHub = { type: "hello", machineId, agentVersion: "0.0.0", runners, runningJobs: [], servers: [], signature };
+    const hello: AgentToHub = {
+      type: "hello",
+      machineId,
+      agentVersion: "0.0.0",
+      ...(os === undefined ? {} : { os }),
+      runners,
+      runningJobs: [],
+      servers: [],
+      signature,
+    };
     this.ws.send(JSON.stringify(hello));
   }
 
