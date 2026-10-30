@@ -563,6 +563,7 @@ async function run(args: string[], ctx: Ctx): Promise<number> {
   const connection = (deps.connect ?? connect)(identity, {
     hello: () => ({
       agentVersion: AGENT_VERSION,
+      os: `${process.platform}-${process.arch}`,
       runners: registeredRunners(),
       runningJobs: executor.runningJobs(),
       servers: [],

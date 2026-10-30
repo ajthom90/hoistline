@@ -553,7 +553,13 @@ describe("run", () => {
     expect(opts.loadPolicy!()).toEqual({ mode: "trusted" });
 
     const hello = f.handlers().hello();
-    expect(hello).toEqual({ agentVersion: expect.any(String), runners: expect.any(Array), runningJobs: ["job-a", "job-b"], servers: [] });
+    expect(hello).toEqual({
+      agentVersion: expect.any(String),
+      os: `${process.platform}-${process.arch}`,
+      runners: expect.any(Array),
+      runningJobs: ["job-a", "job-b"],
+      servers: [],
+    });
 
     // onConnected flushes synchronously: the flush has happened by the time it returns.
     const before = f.calls.length;

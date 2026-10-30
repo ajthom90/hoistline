@@ -15,7 +15,7 @@ const MAX_PAYLOAD = 8 * 1024 * 1024;
 
 export interface AgentHandlers {
   /** State announced in the hello on every (re)connect. */
-  hello(): { agentVersion: string; runners: RunnerName[]; runningJobs: string[]; servers: string[] };
+  hello(): { agentVersion: string; os?: string; runners: RunnerName[]; runningJobs: string[]; servers: string[] };
   /** Every validated hub message after the handshake. */
   onMessage(msg: HubToAgent): void;
   /** The hub accepted the handshake. */
