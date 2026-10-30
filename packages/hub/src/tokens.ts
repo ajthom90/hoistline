@@ -11,6 +11,8 @@ export const PAT_MAX_NAME = 64;
 const DAY_MS = 24 * 60 * 60 * 1000;
 /** last_used_at is written at most this often per token. */
 const LAST_USED_RESOLUTION_MS = 60_000;
+/** Expired tokens stay listed (marked expired) this long, then are deleted. */
+const EXPIRED_KEPT_MS = 30 * DAY_MS;
 
 const sha256 = (value: string) => createHash("sha256").update(value).digest("hex");
 
@@ -73,6 +75,7 @@ export class AccessTokens {
       last_used_at: null,
     };
     this.db.transaction(() => {
+      this.prune(now);
       const live = this.db
         .prepare("SELECT count(*) AS n FROM personal_access_tokens WHERE user_id = ? AND expires_at > ?")
         .get(userId, now) as { n: number };
@@ -87,12 +90,18 @@ export class AccessTokens {
     return { token, info: toInfo(record) };
   }
 
-  /** The user's tokens (live and expired), newest first. */
+  /** The user's tokens (live, and expired within the last 30 days), newest first. */
   list(userId: string): AccessTokenInfo[] {
+    this.prune(this.store.now());
     const rows = this.db
       .prepare("SELECT * FROM personal_access_tokens WHERE user_id = ? ORDER BY created_at DESC, id")
       .all(userId) as TokenRecord[];
     return rows.map(toInfo);
+  }
+
+  /** Deletes every user's tokens that expired more than 30 days before `now`. */
+  private prune(now: number): void {
+    this.db.prepare("DELETE FROM personal_access_tokens WHERE expires_at <= ?").run(now - EXPIRED_KEPT_MS);
   }
 
   /** Revokes (deletes) one of the user's tokens. False when the user has no token with that id. */

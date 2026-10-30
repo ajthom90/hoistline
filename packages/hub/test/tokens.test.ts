@@ -120,6 +120,30 @@ describe("personal access tokens", () => {
     expect(span("max").expires_at - span("max").created_at).toBe(365 * DAY);
   });
 
+  it("prunes tokens expired more than 30 days ago when tokens are listed or created", async () => {
+    const hub = await startHub(ctx);
+    await uiLogin(hub, browser);
+    await createPat(hub, browser, "short", 1);
+    const bobBrowser = new Browser();
+    await uiLogin(hub, bobBrowser, "code-bob");
+    await createPat(hub, bobBrowser, "bobs", 1);
+    const count = () => (hub.store.db.prepare("SELECT count(*) AS n FROM personal_access_tokens").get() as { n: number }).n;
+    hub.advance(31 * DAY - 60_000);
+    // Expired, but less than 30 days ago: still listed. (Sessions last 12 hours, so log in again.)
+    await uiLogin(hub, browser);
+    expect((await page(hub, browser, "/ui/tokens")).html).toContain("short");
+    expect(count()).toBe(2);
+    hub.advance(2 * 60_000);
+    expect((await page(hub, browser, "/ui/tokens")).html).not.toContain("short");
+    expect(count()).toBe(0);
+
+    await createPat(hub, browser, "again", 1);
+    hub.advance(31 * DAY + 60_000);
+    await uiLogin(hub, bobBrowser, "code-bob");
+    await createPat(hub, bobBrowser, "new");
+    expect(hub.store.db.prepare("SELECT name FROM personal_access_tokens").all()).toEqual([{ name: "new" }]);
+  });
+
   it("refuses a 21st live token", async () => {
     const hub = await startHub(ctx);
     await uiLogin(hub, browser);
