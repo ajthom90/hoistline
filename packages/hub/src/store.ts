@@ -7,7 +7,7 @@ import {
   randomUUID,
   type KeyObject,
 } from "node:crypto";
-import { readdirSync, readFileSync } from "node:fs";
+import { chmodSync, readdirSync, readFileSync } from "node:fs";
 import Database from "better-sqlite3";
 
 export interface User {
@@ -121,6 +121,23 @@ export function foldLogin(login: string): string {
   return login.replace(/[A-Z]/g, (c) => c.toLowerCase());
 }
 
+/**
+ * Makes the database file and its -wal/-shm siblings owner-only (0600): the database holds the job-signing private
+ * key and the cookie secret. SQLite creates -wal/-shm (and recreates them later) with the main file's mode, so the
+ * main file's mode carries over. main.ts also sets umask 077; this covers databases created before that. Best effort:
+ * a filesystem that refuses chmod (some network mounts) keeps whatever the umask gave.
+ */
+function restrictDatabaseFiles(path: string): void {
+  if (process.platform === "win32" || path === "" || path === ":memory:" || path.startsWith("file:")) return;
+  for (const file of [path, `${path}-wal`, `${path}-shm`]) {
+    try {
+      chmodSync(file, 0o600);
+    } catch {
+      // Missing sibling, or a filesystem without POSIX modes.
+    }
+  }
+}
+
 /** SQLite persistence for users, machines, pairing, shares and jobs. OAuth state shares the connection via `db`. */
 export class Store {
   readonly db: Database.Database;
@@ -131,6 +148,7 @@ export class Store {
     this.db = new Database(path);
     this.db.pragma("journal_mode = WAL");
     this.db.pragma("foreign_keys = ON");
+    restrictDatabaseFiles(path);
     this.migrate();
   }
 

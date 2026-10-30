@@ -14,15 +14,19 @@ Before you start, create the GitHub OAuth app and pick the public hostname as in
 ## 1. A dataset for the database
 
 1. Create a dataset, for example `tank/apps/hoistline`.
-2. Make it owned by uid 10001 and gid 10001 (the hub runs as that user). In the dataset's permissions editor you can
-   enter the numeric ids; or from a shell on the TrueNAS host:
+2. Make it owned by uid 10001 and gid 10001 (the hub runs as that user) and private to that user (mode 700, no
+   access for group or others). In the dataset's permissions editor you can enter the numeric ids and clear the
+   group and other permissions; or from a shell on the TrueNAS host:
 
    ```sh
    chown 10001:10001 /mnt/tank/apps/hoistline
+   chmod 700 /mnt/tank/apps/hoistline
    ```
 
-The hub keeps its SQLite database (`hoistline.db`, plus `-wal` and `-shm` files) there. Back up this dataset; it
-holds users, machines, jobs, OAuth tokens and the hub's job-signing key.
+The hub keeps its SQLite database (`hoistline.db`, plus `-wal` and `-shm` files) there, created owner-only (0600).
+Back up this dataset, and keep it and its backups private: it holds users, machines, jobs, OAuth tokens, the hub's
+job-signing key and the cookie secret. Anyone who can read it can forge jobs for every paired machine and forge login
+cookies.
 
 ## 2. Install via YAML
 

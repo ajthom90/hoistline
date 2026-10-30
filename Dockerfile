@@ -26,7 +26,8 @@ RUN apt-get update \
 RUN groupadd --gid 10001 hoistline \
   && useradd --uid 10001 --gid 10001 --no-create-home --shell /usr/sbin/nologin hoistline \
   && mkdir /data \
-  && chown 10001:10001 /data
+  && chown 10001:10001 /data \
+  && chmod 700 /data
 WORKDIR /app
 COPY --from=build /out/package.json ./package.json
 COPY --from=build /out/node_modules ./node_modules

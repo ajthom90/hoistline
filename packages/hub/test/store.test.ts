@@ -1,5 +1,5 @@
 import { createHash, sign, verify, type KeyObject } from "node:crypto";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { chmodSync, existsSync, mkdtempSync, readFileSync, rmSync, statSync } from "node:fs";
 import Database from "better-sqlite3";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -655,5 +655,39 @@ describe("SqliteOAuthProvider", () => {
     const dump = JSON.stringify(store.db.prepare("SELECT * FROM oauth_tokens").all());
     expect(dump).not.toContain(tokens.access_token);
     expect(dump).not.toContain(tokens.refresh_token!);
+  });
+});
+
+describe.skipIf(process.platform === "win32")("database file permissions", () => {
+  const mode = (path: string) => statSync(path).mode & 0o777;
+
+  it("keeps the database and its -wal/-shm private even under a permissive umask", () => {
+    const path = join(dir, "hub.db");
+    const previous = process.umask(0o022);
+    try {
+      const store = open(path);
+      store.getOrCreateSigningKey();
+      store.getOrCreateSecret("cookie");
+    } finally {
+      process.umask(previous);
+    }
+    expect(mode(path)).toBe(0o600);
+    for (const suffix of ["-wal", "-shm"]) {
+      if (existsSync(path + suffix)) expect(mode(path + suffix)).toBe(0o600);
+    }
+    expect(existsSync(path + "-wal")).toBe(true);
+  });
+
+  it("tightens an existing database that was created world-readable", () => {
+    const path = join(dir, "hub.db");
+    const previous = process.umask(0o022);
+    try {
+      open(path).close();
+      chmodSync(path, 0o644);
+      open(path);
+    } finally {
+      process.umask(previous);
+    }
+    expect(mode(path)).toBe(0o600);
   });
 });

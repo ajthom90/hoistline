@@ -50,10 +50,12 @@ use only their own machines, not yours). Entries are comma-separated: `github-id
 `github:<login>`, `email:<verified OIDC email>`, `sub:<OIDC subject>`. A malformed entry stops the hub at startup.
 
 The database lives in `./data` (set `HUB_DATA_DIR` to change it). The hub runs as uid 10001, so that directory must
-be writable by it. On Linux:
+be writable by it. Keep it private: the database holds the hub's job-signing key and its cookie secret, so anyone who
+can read it can forge jobs for your machines and forge login cookies. The hub creates its files owner-only (0600),
+and the directory should be too. On Linux:
 
 ```sh
-mkdir -p data && sudo chown 10001:10001 data
+mkdir -p data && sudo chown 10001:10001 data && sudo chmod 700 data
 ```
 
 Start it:

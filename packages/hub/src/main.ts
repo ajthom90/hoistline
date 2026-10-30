@@ -9,6 +9,10 @@ import { DirectMode } from "./tools/proxy.js";
 import { createApp } from "./server.js";
 import { Store } from "./store.js";
 
+// Everything the hub creates (data dir, database, -wal/-shm) is owner-only: the database holds the job-signing
+// private key and the cookie secret. Set before the store opens.
+process.umask(0o077);
+
 const { port, deps } = configFromEnv(process.env);
 const login = deps.oidc ? `OIDC (${deps.oidc.issuer})` : "GitHub";
 
