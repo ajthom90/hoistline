@@ -59,7 +59,13 @@ const REFUSED_CLOSE_CODES = new Set([4400, 4401, 4409]);
 /** Printed before each line of a multi-line value, so where a line starts is never in doubt. */
 const GUTTER = "  | ";
 
-export const AGENT_VERSION: string = (createRequire(import.meta.url)("../package.json") as { version: string }).version;
+/** Set by `bun build --define` in scripts/build-agent.sh: a single-file executable has no package.json beside it. */
+declare const HOISTLINE_AGENT_VERSION: string | undefined;
+
+export const AGENT_VERSION: string =
+  typeof HOISTLINE_AGENT_VERSION === "string"
+    ? HOISTLINE_AGENT_VERSION
+    : (createRequire(import.meta.url)("../package.json") as { version: string }).version;
 
 const HELP = `hoistline-agent: runs jobs from a Hoistline hub on this machine
 

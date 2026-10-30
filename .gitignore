@@ -3,3 +3,7 @@ dist/
 *.tsbuildinfo
 coverage/
 .env
+dist-bin/
+.smoke/
+/data/
+*.bun-build
