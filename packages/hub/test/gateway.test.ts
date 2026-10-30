@@ -222,6 +222,8 @@ describe("POST /pair", () => {
     for (const body of [
       { code, name: "", publicKey },
       { code, name: "x".repeat(101), publicKey },
+      // "/" separates owner and machine in "<owner>/<machine>" references.
+      { code, name: "bob/prod", publicKey },
       { code, name: "a", publicKey: "not-a-key" },
       { code, name: "a", publicKey: publicKeyOf(rsa) },
       { code, name: "a", publicKey, extra: 1 },

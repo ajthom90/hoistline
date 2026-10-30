@@ -213,6 +213,10 @@ async function pair(args: string[], ctx: Ctx): Promise<number> {
     { min: 2, max: 2, usage },
   );
   const [hubUrl, code] = positionals as [string, string];
+  // The hub refuses it too: "/" separates owner and machine in "<owner>/<machine>" references.
+  if (typeof values.name === "string" && values.name.includes("/")) {
+    throw new UsageError('the machine name must not contain "/"');
+  }
   const path = defaultIdentityPath(ctx.io.env);
   if (exists(path) && values.force !== true) {
     ctx.err(`hoistline-agent: this machine is already paired (${escapeForTerminal(path)}); use --force to pair again`);

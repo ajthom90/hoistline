@@ -160,6 +160,14 @@ describe("pair", () => {
     if (posix) expect(statSync(join(home, "identity.json")).mode & 0o777).toBe(0o600);
   });
 
+  it("refuses a machine name containing a slash without contacting the hub", async () => {
+    const hub = stubFetch();
+    const r = await run(["pair", "https://hub.example.com", "ABCD-EFGH", "--name", "bob/prod"], {}, { fetch: hub.fetch });
+    expect(r.code).toBe(2);
+    expect(r.err).toMatch(/machine name must not contain "\/"/);
+    expect(hub.seen).toEqual([]);
+  });
+
   it("refuses to overwrite an identity without --force", async () => {
     writeIdentity();
     const before = readFileSync(join(home, "identity.json"), "utf8");

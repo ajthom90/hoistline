@@ -31,7 +31,9 @@ const PairRequest = z
       .trim()
       .min(1)
       .max(100)
-      .refine((name) => !/\p{C}/u.test(name)),
+      .refine((name) => !/\p{C}/u.test(name))
+      // "/" separates owner and machine in "<owner>/<machine>" references (direct mode).
+      .refine((name) => !name.includes("/")),
     publicKey: PublicKey,
   })
   .strict();
