@@ -98,6 +98,14 @@ const sqlValue = (value: unknown) => (typeof value === "boolean" ? (value ? 1 : 
 
 const ACTIVE_SQL = `status IN (${ACTIVE_JOB_STATUSES.map((s) => `'${s}'`).join(", ")})`;
 
+/** A saved identifier `github:<x>` that no longer matches its user's login (or the login was cleared). */
+const STALE_GITHUB = `typeof(value) = 'text' AND lower(value) LIKE 'github:%'
+  AND (users.login = '' OR substr(lower(value), 8) != lower(users.login))`;
+/** Drops stale `github:<x>` identifiers (as migration 004 does); append `AND ...` to scope it. */
+const STRIP_STALE_GITHUB = `UPDATE users SET identifiers = (
+    SELECT json_group_array(value) FROM json_each(users.identifiers) WHERE NOT (${STALE_GITHUB}))
+  WHERE identifiers IS NOT NULL AND EXISTS (SELECT 1 FROM json_each(users.identifiers) WHERE ${STALE_GITHUB})`;
+
 /** The last `maxBytes` bytes of `text`, starting at a character boundary. */
 export function utf8Tail(text: string, maxBytes: number): { text: string; truncated: boolean } {
   const bytes = Buffer.from(text, "utf8");
@@ -172,20 +180,24 @@ export class Store {
           .run(JSON.stringify(identity.identifiers), record.id);
       }
       if (provider === "github" && login) {
-        // The stale holders also lose their saved `github:<login>` identifier, so it can no longer satisfy a
-        // `github:<login>` allowlist entry that now names a different account.
-        const stale = this.db
-          .prepare("SELECT id, identifiers FROM users WHERE provider = ? AND id != ? AND lower(login) = lower(?)")
-          .all(provider, record.id, login) as { id: string; identifiers: string | null }[];
-        const staleIdentifier = `github:${login.toLowerCase()}`;
-        for (const user of stale) {
-          const ids = user.identifiers ? (JSON.parse(user.identifiers) as unknown) : null;
-          const kept = Array.isArray(ids) ? ids.filter((id) => typeof id !== "string" || id.toLowerCase() !== staleIdentifier) : null;
-          this.db
-            .prepare("UPDATE users SET login = '', identifiers = ? WHERE id = ?")
-            .run(kept === null ? null : JSON.stringify(kept), user.id);
-        }
+        this.db
+          .prepare("UPDATE users SET login = '' WHERE provider = ? AND id != ? AND lower(login) = lower(?)")
+          .run(provider, record.id, login);
+        // Every other user holding `github:<login>` loses it, found by the identifier itself (not by the login
+        // column, which an earlier hub may already have cleared), so it can no longer satisfy a `github:<login>`
+        // allowlist entry that now names this account.
+        this.db
+          .prepare(
+            `UPDATE users SET identifiers = (
+               SELECT json_group_array(value) FROM json_each(users.identifiers)
+               WHERE NOT (typeof(value) = 'text' AND lower(value) = @stale))
+             WHERE id != @id AND identifiers IS NOT NULL AND EXISTS (
+               SELECT 1 FROM json_each(users.identifiers) WHERE typeof(value) = 'text' AND lower(value) = @stale)`,
+          )
+          .run({ id: record.id, stale: `github:${login.toLowerCase()}` });
       }
+      // This user's own `github:<x>` entries must match their current login (see migration 004).
+      this.db.prepare(`${STRIP_STALE_GITHUB} AND id = ?`).run(record.id);
       return toUser(record);
     })();
   }
@@ -227,13 +239,13 @@ export class Store {
     })();
   }
 
-  /** Machines the user owns or that were shared with their GitHub login. */
+  /** Machines the user owns or that were shared with them; never deleted machines. */
   machinesFor(userId: string): Machine[] {
     const rows = this.db
       .prepare(
         `SELECT m.* FROM machines m
-         WHERE m.owner_id = @userId
-            OR m.id IN (SELECT machine_id FROM machine_shares WHERE user_id = @userId)
+         WHERE m.deleted_at IS NULL
+           AND (m.owner_id = @userId OR m.id IN (SELECT machine_id FROM machine_shares WHERE user_id = @userId))
          ORDER BY m.created_at, m.id`,
       )
       .all({ userId }) as MachineRecord[];
@@ -246,10 +258,13 @@ export class Store {
 
   /**
    * Unscoped lookup for agent authentication only (the agent proves the machine key). Never use it to answer a
-   * user's request; use getMachine, which is scoped to the caller.
+   * user's request; use getMachine, which is scoped to the caller. Deleted machines are not found (their agents
+   * cannot authenticate).
    */
   getMachineById(machineId: string): Machine | null {
-    const row = this.db.prepare("SELECT * FROM machines WHERE id = ?").get(machineId) as MachineRecord | undefined;
+    const row = this.db.prepare("SELECT * FROM machines WHERE id = ? AND deleted_at IS NULL").get(machineId) as
+      | MachineRecord
+      | undefined;
     return row ? toMachine(row) : null;
   }
 
@@ -308,15 +323,16 @@ export class Store {
   }
 
   /**
-   * Deletes a machine the caller owns, with its key, its shares and every job row on it (the jobs table references
-   * the machine). Cancel its active jobs and disconnect its agent first. Throws if the machine is not the owner's.
+   * Deletes a machine the caller owns (soft): marks it deleted, removes its key (the column is NOT NULL, so it is
+   * emptied) and its shares. The row stays so job history still names it; every other lookup ignores it, so its
+   * name is free again. Cancel its active jobs and disconnect its agent first. Throws if the machine is not the
+   * owner's.
    */
   deleteMachine(ownerId: string, machineId: string): void {
-    this.requireOwned(ownerId, machineId);
     this.db.transaction(() => {
-      this.db.prepare("DELETE FROM jobs WHERE machine_id = ?").run(machineId);
+      this.requireOwned(ownerId, machineId);
       this.db.prepare("DELETE FROM machine_shares WHERE machine_id = ?").run(machineId);
-      this.db.prepare("DELETE FROM machines WHERE id = ?").run(machineId);
+      this.db.prepare("UPDATE machines SET deleted_at = ?, public_key = '' WHERE id = ?").run(this.now(), machineId);
     })();
   }
 
@@ -355,7 +371,9 @@ export class Store {
   }
 
   private requireOwned(ownerId: string, machineId: string): void {
-    const row = this.db.prepare("SELECT 1 FROM machines WHERE id = ? AND owner_id = ?").get(machineId, ownerId);
+    const row = this.db
+      .prepare("SELECT 1 FROM machines WHERE id = ? AND owner_id = ? AND deleted_at IS NULL")
+      .get(machineId, ownerId);
     if (!row) throw new Error("Machine not found");
   }
 
@@ -504,18 +522,33 @@ export class Store {
 
   /**
    * For the web UI: jobs the user submitted plus every job on a machine the user owns, newest first, each with the
-   * requester's display login and the machine's name.
+   * requester's display login and the machine's name. Jobs on deleted machines are included (machineDeleted).
    */
-  jobsForOwnerOrSubmitter(userId: string, limit = 200): (JobRow & { requesterLogin: string; machineName: string })[] {
+  jobsForOwnerOrSubmitter(
+    userId: string,
+    limit = 200,
+  ): (JobRow & { requesterLogin: string; machineName: string; machineDeleted: boolean })[] {
     const rows = this.db
       .prepare(
-        `SELECT j.*, u.login AS requester_login, m.name AS machine_name
+        `SELECT j.*, u.login AS requester_login, m.name AS machine_name, m.deleted_at AS machine_deleted_at
          FROM jobs j JOIN users u ON u.id = j.user_id JOIN machines m ON m.id = j.machine_id
          WHERE j.user_id = @userId OR m.owner_id = @userId
          ORDER BY j.created_at DESC, j.id LIMIT @limit`,
       )
-      .all({ userId, limit }) as (JobRecord & { requester_login: string; machine_name: string })[];
-    return rows.map((r) => ({ ...toJob(r), requesterLogin: r.requester_login, machineName: r.machine_name }));
+      .all({ userId, limit }) as (JobRecord & {
+      requester_login: string;
+      machine_name: string;
+      machine_deleted_at: number | null;
+    })[];
+    return rows.map((r) => {
+      const { requester_login, machine_name, machine_deleted_at, ...job } = r;
+      return {
+        ...toJob(job),
+        requesterLogin: requester_login,
+        machineName: machine_name,
+        machineDeleted: machine_deleted_at !== null,
+      };
+    });
   }
 
   /** Applies the patch (id, userId and createdAt are immutable) and bumps updatedAt unless the patch sets it. */

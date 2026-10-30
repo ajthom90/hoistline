@@ -405,6 +405,35 @@ describe("migrations", () => {
     expect(current).toBe(readFileSync(fixture, "utf8"));
   });
 
+  it("004 strips github:<x> identifiers from users whose login is not x, and adds machines.deleted_at", () => {
+    const path = join(dir, "at003.db");
+    const db = new Database(path);
+    db.exec(readFileSync(fixture, "utf8"));
+    db.exec("CREATE TABLE schema_migrations (name TEXT PRIMARY KEY, applied_at INTEGER NOT NULL)");
+    for (const name of ["002_job_result_columns.sql", "003_ui.sql"]) {
+      db.exec(readFileSync(new URL(`../src/migrations/${name}`, import.meta.url), "utf8"));
+    }
+    for (const name of ["001_init.sql", "002_job_result_columns.sql", "003_ui.sql"]) {
+      db.prepare("INSERT INTO schema_migrations VALUES (?, 1)").run(name);
+    }
+    const insert = db.prepare("INSERT INTO users (id, provider, subject, login, created_at, identifiers) VALUES (?, ?, ?, ?, 1, ?)");
+    insert.run("cleared", "github", "10", "", JSON.stringify(["github-id:10", "github:octo"]));
+    insert.run("renamed", "github", "11", "New-Name", JSON.stringify(["github-id:11", "github:old-name", "GitHub:new-name"]));
+    insert.run("current", "github", "12", "Carol", JSON.stringify(["github-id:12", "github:carol"]));
+    insert.run("oidc", "oidc:https://idp", "s", "", JSON.stringify(["sub:s", "email:a@b.c"]));
+    insert.run("none", "github", "13", "dave", null);
+    db.prepare("INSERT INTO machines VALUES ('m1', 'current', 'laptop', 'pk', 1, NULL)").run();
+    db.close();
+
+    const store = open(path);
+    expect(store.getUserIdentifiers("cleared")).toEqual(["github-id:10"]);
+    expect(store.getUserIdentifiers("renamed")).toEqual(["github-id:11", "GitHub:new-name"]);
+    expect(store.getUserIdentifiers("current")).toEqual(["github-id:12", "github:carol"]);
+    expect(store.getUserIdentifiers("oidc")).toEqual(["sub:s", "email:a@b.c"]);
+    expect(store.getUserIdentifiers("none")).toBeNull();
+    expect(store.db.prepare("SELECT deleted_at FROM machines WHERE id = 'm1'").get()).toEqual({ deleted_at: null });
+  });
+
   it("upgrades a database created by the released schema", () => {
     const path = join(dir, "old.db");
     const db = new Database(path);
@@ -421,7 +450,12 @@ describe("migrations", () => {
 
     const store = open(path);
     const names = store.db.prepare("SELECT name FROM schema_migrations ORDER BY name").all();
-    expect(names).toEqual([{ name: "001_init.sql" }, { name: "002_job_result_columns.sql" }, { name: "003_ui.sql" }]);
+    expect(names).toEqual([
+      { name: "001_init.sql" },
+      { name: "002_job_result_columns.sql" },
+      { name: "003_ui.sql" },
+      { name: "004_machine_delete.sql" },
+    ]);
     // Users from before 003 have no saved allowlist identifiers until they log in again.
     expect(store.getUserIdentifiers("u1")).toBeNull();
     expect(store.getJobById("old")).toMatchObject({ status: "running", output: "out" });

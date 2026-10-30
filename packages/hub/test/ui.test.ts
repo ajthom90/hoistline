@@ -372,6 +372,68 @@ describe("machines", () => {
     expect(again.closeCode).toBe(4401);
     expect(hub.gateway.isOnline(laptop.machineId)).toBe(false);
   });
+
+  it("keeps a deleted machine's job history: task_status/task_result still answer, and the jobs page marks it deleted", async () => {
+    const hub = await startHub(ctx);
+    const alice = await uiLogin(hub, browser);
+    const bobBrowser = new Browser();
+    const bob = await uiLogin(hub, bobBrowser, "code-bob");
+    const laptop = await pair(hub, alice, "laptop");
+    const agent = await onlineAgent(hub, ctx, laptop);
+    hub.store.shareMachine(alice.id, laptop.machineId, "github:bob");
+    const done = hub.jobs.delegate(bob.id, { machine: "laptop", ...delegateArgs });
+    hub.store.updateJob(done.id, { status: "succeeded", exitCode: 0, output: "all good" });
+    const active = hub.jobs.delegate(bob.id, { machine: "laptop", ...delegateArgs });
+
+    expect((await post(hub, browser, `/ui/machines/${laptop.machineId}/delete`, { confirm: "laptop" })).status).toBe(303);
+    await waitFor(() => agent.closeCode !== undefined, "agent disconnected");
+    const row = hub.store.db.prepare("SELECT deleted_at, public_key FROM machines WHERE id = ?").get(laptop.machineId) as {
+      deleted_at: number | null;
+      public_key: string;
+    };
+    expect(row.deleted_at).not.toBeNull();
+    expect(row.public_key).toBe("");
+    expect(hub.store.db.prepare("SELECT count(*) AS n FROM machine_shares").get()).toEqual({ n: 0 });
+    expect(hub.jobs.status(bob.id, active.id)).toBe("cancelled");
+
+    const client = await mcpClient(hub, ctx, await createPat(hub, bobBrowser));
+    const status = await client.callTool({ name: "task_status", arguments: { jobId: done.id } });
+    expect(status.isError).toBeFalsy();
+    expect(JSON.stringify(status.content)).toContain("succeeded");
+    const result = await client.callTool({ name: "task_result", arguments: { jobId: done.id } });
+    expect(result.isError).toBeFalsy();
+    expect(JSON.stringify(result.content)).toContain("all good");
+    const listed = await client.callTool({ name: "list_machines", arguments: {} });
+    expect((listed.structuredContent as { machines: unknown[] }).machines).toEqual([]);
+
+    const jobsPage = (await page(hub, browser, "/ui/jobs")).html;
+    expect(jobsPage).toContain(done.id);
+    expect(jobsPage).toContain("laptop (deleted)");
+    expect((await page(hub, bobBrowser, "/ui/jobs")).html).toContain("laptop (deleted)");
+
+    // The owner can no longer act on it: it is gone from every scoped lookup.
+    expect((await post(hub, browser, `/ui/machines/${laptop.machineId}/delete`, { confirm: "laptop" })).status).toBe(404);
+    expect((await post(hub, browser, "/ui/share", { machineId: laptop.machineId, login: "bob" })).status).toBe(404);
+    expect(() => hub.jobs.activeJobsForMachine(alice.id, laptop.machineId)).toThrow();
+    expect(hub.jobs.cancelAsOwner(alice.id, active.id)).toBe(false);
+  });
+
+  it("lets a new machine take a deleted machine's name without ambiguity", async () => {
+    const hub = await startHub(ctx);
+    const alice = await uiLogin(hub, browser);
+    const old = await pair(hub, alice, "laptop");
+    expect((await post(hub, browser, `/ui/machines/${old.machineId}/delete`, { confirm: "laptop" })).status).toBe(303);
+    const fresh = await pair(hub, alice, "laptop");
+    await onlineAgent(hub, ctx, fresh);
+    const job = hub.jobs.delegate(alice.id, { machine: "laptop", ...delegateArgs });
+    expect(hub.store.getJob(alice.id, job.id)!.machineId).toBe(fresh.machineId);
+    const client = await mcpClient(hub, ctx, await createPat(hub, browser));
+    const out = await client.callTool({ name: "delegate_task", arguments: { ...delegateArgs, machine: "laptop" } });
+    expect(out.isError).toBeFalsy();
+    const machines = (await page(hub, browser)).html;
+    expect(machines).toContain(fresh.machineId);
+    expect(machines).not.toContain(old.machineId);
+  });
 });
 
 describe("jobs", () => {

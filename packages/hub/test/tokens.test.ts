@@ -176,6 +176,27 @@ describe("personal access tokens", () => {
     expect(await mcpStatus(byId, oldToken)).toBe(200);
   });
 
+  it("strips github:<login> from a user whose login was cleared earlier, when another account logs in with it", async () => {
+    const oauthProvider = new InMemoryOAuthProvider();
+    const hub = await startHub(ctx, { oauthProvider });
+    const octoOld = await uiLogin(hub, browser, "code-octo-old");
+    const pat = await createPat(hub, browser, "old");
+    const { accessToken } = await oauthLogin(hub, new Browser(), "code-octo-old");
+    // As left by an earlier hub: login cleared, identifiers kept.
+    hub.store.db.prepare("UPDATE users SET login = '' WHERE id = ?").run(octoOld.id);
+    expect(hub.store.getUserIdentifiers(octoOld.id)).toContain("github:octo");
+
+    await uiLogin(hub, new Browser(), "code-octo-new");
+    expect(hub.store.getUserIdentifiers(octoOld.id)).toEqual(["github-id:10"]);
+    const byLogin = await startHub(ctx, { allowedUsers: ["github:octo"], oauthProvider }, hub);
+    expect(await mcpStatus(byLogin, pat)).toBe(401);
+    expect(await mcpStatus(byLogin, accessToken)).toBe(401);
+    expect((await browser.request(`${byLogin.url}/ui`)).status).toBe(303);
+    const byId = await startHub(ctx, { allowedUsers: ["github-id:10"], oauthProvider }, hub);
+    expect(await mcpStatus(byId, pat)).toBe(200);
+    expect(await mcpStatus(byId, accessToken)).toBe(200);
+  });
+
   it("survives logout: revocation is explicit", async () => {
     const hub = await startHub(ctx);
     await uiLogin(hub, browser);

@@ -105,6 +105,7 @@ const UNSAFE_CHARS = new RegExp(
 const REASON_DESCRIPTIONS: Record<string, string> = {
   approval_unavailable: "the machine could not record the approval request (approval queue unavailable)",
   approval_denied: "the machine's owner denied this job",
+  machine_deleted: "the machine's owner deleted the machine",
 };
 
 /** Plain wording for a known reason code (exact match only), or undefined. */
@@ -298,6 +299,19 @@ export class Jobs {
   activeJobsForMachine(ownerId: string, machineId: string): JobRow[] {
     if (this.store.getMachineById(machineId)?.ownerId !== ownerId) throw new NotFoundError();
     return this.store.activeJobs(machineId);
+  }
+
+  /**
+   * The owner is deleting the machine: every active job on it is cancelled now (reason machine_deleted), whatever
+   * its state, and its agent is told to stop them. Call before the store's deleteMachine and the disconnect: the
+   * agent cannot come back to report. Throws NotFoundError for unknown and foreign machines.
+   */
+  cancelForDeletedMachine(ownerId: string, machineId: string): void {
+    for (const job of this.activeJobsForMachine(ownerId, machineId)) {
+      if (this.store.transitionJob(job.id, ACTIVE, { status: "cancelled", reason: "machine_deleted" })) {
+        this.requestAgentCancel(machineId, job.id);
+      }
+    }
   }
 
   /** A share was revoked: that user's active jobs on that machine are cancelled. */

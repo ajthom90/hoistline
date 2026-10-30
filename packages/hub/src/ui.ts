@@ -264,9 +264,9 @@ export function uiRouter(deps: UiDeps): express.Router {
     if (field(req, "confirm") !== machine.name) {
       throw new UiError(400, "To delete the machine, type its name exactly in the confirmation field.");
     }
-    for (const job of jobs.activeJobsForMachine(user.id, machine.id)) jobs.cancelAsOwner(user.id, job.id);
-    gateway.disconnect(machine.id, CLOSE_AUTH_FAILED);
+    jobs.cancelForDeletedMachine(user.id, machine.id);
     store.deleteMachine(user.id, machine.id);
+    gateway.disconnect(machine.id, CLOSE_AUTH_FAILED);
     res.redirect(303, "/ui");
   });
 
@@ -281,7 +281,7 @@ export function uiRouter(deps: UiDeps): express.Router {
         ? form(`/ui/jobs/${j.id}/cancel`, session.csrf, `<button type="submit">Cancel</button>`)
         : "";
       return (
-        `<tr><td class="mono">${h(j.id)}<div class="muted">${h(prompt)}</div></td><td>${h(j.machineName)}</td>` +
+        `<tr><td class="mono">${h(j.id)}<div class="muted">${h(prompt)}</div></td><td>${h(j.machineDeleted ? `${j.machineName} (deleted)` : j.machineName)}</td>` +
         `<td>${h(j.requesterLogin || "(no login)")}</td><td>${h(j.runner)}</td><td>${h(j.status)}</td>` +
         `<td>${h(when(j.createdAt))}</td><td>${reason}</td><td>${cancel}</td></tr>`
       );
