@@ -884,14 +884,18 @@ describe("a runner redirecting the mirror's common dir", () => {
     const cache = temp();
     await prepareWorktree("o/n", "main", "j1", cache, file);
     const mirror = mirrorOf(cache);
-    const att = attackerCommonDir(emptyBare(), join(cache, "m"));
+    const evil = emptyBare();
+    const att = attackerCommonDir(evil, join(cache, "m"));
     writeFileSync(join(mirror, "commondir"), `${att}\n`);
     // Control: plain git with --git-dir alone follows the commondir.
     const real = (p: string) => realpathSync(p.trim());
     expect(real(fx(["--git-dir", mirror, "rev-parse", "--git-common-dir"]))).toBe(real(att));
     const git = mirrorGit(cache, mirror, {});
     expect(real((await git(["rev-parse", "--git-common-dir"])).stdout)).toBe(real(mirror));
-    expect((await git(["config", "--list"])).stdout).not.toMatch(/filter|url\./);
+    // Only the attacker's keys: the owner's own global config (e.g. git-lfs's filter.lfs.*) legitimately applies.
+    const config = (await git(["config", "--list"])).stdout;
+    expect(config).not.toMatch(/filter\.p\./);
+    expect(config).not.toContain(evil);
   });
 
   it("deletes planted gitdir and object alternates", async () => {
