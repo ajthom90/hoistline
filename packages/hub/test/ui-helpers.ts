@@ -1,4 +1,4 @@
-import { sign, type KeyObject } from "node:crypto";
+import { createHash, randomBytes, sign, type KeyObject } from "node:crypto";
 import { mkdtempSync, rmSync } from "node:fs";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
@@ -161,6 +161,63 @@ export async function uiLogin(hub: Hub, browser: Browser, code = "code-alice"): 
   expect(res.headers.get("location")).toBe("/ui");
   const gh = GITHUB_USERS[code]!;
   return hub.store.getUserByKey("github", String(gh.id))!;
+}
+
+const CLIENT_REDIRECT = "http://127.0.0.1:9/callback";
+
+/** POST /token with a form; returns the status and JSON body. */
+export async function tokenEndpoint(hub: Hub, form: Record<string, string>) {
+  const res = await fetch(`${hub.url}/token`, {
+    method: "POST",
+    headers: { "content-type": "application/x-www-form-urlencoded" },
+    body: new URLSearchParams(form),
+  });
+  return { status: res.status, body: (await res.json()) as Record<string, unknown> };
+}
+
+/** A full MCP OAuth login (register, consent, GitHub callback, code exchange) as the GitHub user behind `code`. */
+export async function oauthLogin(
+  hub: Hub,
+  browser: Browser,
+  code = "code-alice",
+): Promise<{ clientId: string; accessToken: string; refreshToken: string }> {
+  const reg = await fetch(`${hub.url}/register`, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ client_name: "test", redirect_uris: [CLIENT_REDIRECT], token_endpoint_auth_method: "none" }),
+  });
+  const clientId = ((await reg.json()) as { client_id: string }).client_id;
+  const verifier = randomBytes(32).toString("base64url");
+  const authorize = new URL(`${hub.url}/authorize`);
+  authorize.search = new URLSearchParams({
+    response_type: "code",
+    client_id: clientId,
+    redirect_uri: CLIENT_REDIRECT,
+    code_challenge: createHash("sha256").update(verifier).digest("base64url"),
+    code_challenge_method: "S256",
+    state: "s",
+  }).toString();
+  let res = await browser.request(authorize);
+  if (res.status === 200) {
+    const html = await res.text();
+    const field = (name: string) => new RegExp(`name="${name}" value="([^"]*)"`).exec(html)![1]!;
+    res = await browser.postForm(`${hub.url}/oauth/consent`, { state: field("state"), csrf: field("csrf"), decision: "approve" });
+  }
+  const upstream = new URL(res.headers.get("location")!);
+  const back = await browser.request(
+    `${hub.url}/oauth/callback?${new URLSearchParams({ code, state: upstream.searchParams.get("state")! })}`,
+  );
+  const hubCode = new URL(back.headers.get("location")!).searchParams.get("code");
+  expect(hubCode).toBeTruthy();
+  const tokens = await tokenEndpoint(hub, {
+    grant_type: "authorization_code",
+    client_id: clientId,
+    code: hubCode!,
+    code_verifier: verifier,
+    redirect_uri: CLIENT_REDIRECT,
+  });
+  expect(tokens.status).toBe(200);
+  return { clientId, accessToken: String(tokens.body.access_token), refreshToken: String(tokens.body.refresh_token) };
 }
 
 /** The CSRF token of a /ui page. */

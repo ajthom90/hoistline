@@ -2,6 +2,7 @@ import { createHash, randomBytes } from "node:crypto";
 import type { Request, Response } from "express";
 import type { AuthorizationParams, OAuthServerProvider } from "@modelcontextprotocol/sdk/server/auth/provider.js";
 import type { OAuthClientInformationFull } from "@modelcontextprotocol/sdk/shared/auth.js";
+import { InvalidGrantError } from "@modelcontextprotocol/sdk/server/auth/errors.js";
 import { parseAllowedUsers } from "./allowlist.js";
 import { CookieSigner, parseCookies, safeEqual, serializeCookie } from "./cookies.js";
 import type { IdentityProvider, UserIdentity } from "./identity.js";
@@ -48,6 +49,11 @@ export interface LoginFlowOptions {
    * answers the browser. Without it, UI logins are not offered.
    */
   onUiLogin?: (user: UserIdentity, res: Response) => void | Promise<void>;
+  /**
+   * Whether the user a refresh token was issued to may still use the hub. Defaults to the allowlist against the
+   * identifiers the token carries; the hub passes its users table's saved identifiers instead.
+   */
+  stillAllowed?: (user: UserIdentity) => boolean;
 }
 
 /** A web UI login in progress: no client, no consent step; bound to the browser by its own nonce cookie. */
@@ -129,7 +135,19 @@ export class LoginFlow {
       authorize: (client, params, res) => this.start(client, params, res),
       challengeForAuthorizationCode: (client, code) => store.challengeForAuthorizationCode(client, code),
       exchangeAuthorizationCode: (...args) => store.exchangeAuthorizationCode(...args),
-      exchangeRefreshToken: (...args) => store.exchangeRefreshToken(...args),
+      exchangeRefreshToken: async (client, refreshToken, scopes, resource) => {
+        // The store consumes the presented refresh token either way; a user no longer allowed gets invalid_grant and
+        // the pair just issued is revoked (it never leaves the hub).
+        const tokens = await store.exchangeRefreshToken(client, refreshToken, scopes, resource);
+        const info = await store.verifyAccessToken(tokens.access_token);
+        const user = info.extra?.user as UserIdentity | undefined;
+        const allowed = this.options.stillAllowed ?? ((u: UserIdentity) => this.isAllowed(u.identifiers));
+        if (user && allowed(user)) return tokens;
+        if (store.revokeToken && tokens.refresh_token) {
+          await store.revokeToken(client, { token: tokens.refresh_token, token_type_hint: "refresh_token" });
+        }
+        throw new InvalidGrantError("The user is no longer allowed on this hub");
+      },
       verifyAccessToken: (token) => store.verifyAccessToken(token),
     };
     // Optional capabilities: the SDK router offers /revoke only when revokeToken exists.

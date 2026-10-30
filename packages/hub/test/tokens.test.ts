@@ -1,5 +1,7 @@
 import { createHash } from "node:crypto";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
+import { InMemoryOAuthProvider } from "../src/auth/in-memory-provider.js";
+import { SqliteOAuthProvider } from "../src/auth/sqlite-provider.js";
 import {
   Browser,
   createPat,
@@ -7,10 +9,13 @@ import {
   mcpClient,
   mcpStatus,
   newContext,
+  oauthLogin,
   page,
   post,
   startHub,
+  tokenEndpoint,
   uiLogin,
+  type Hub,
   type TestContext,
 } from "./ui-helpers.js";
 
@@ -178,5 +183,60 @@ describe("personal access tokens", () => {
     const res = await post(hub, browser, "/ui/logout");
     expect(res.status).toBe(303);
     expect(await mcpStatus(hub, token)).toBe(200);
+  });
+});
+
+describe("allowlist on OAuth tokens", () => {
+  const refresh = (hub: Hub, clientId: string, refreshToken: string) =>
+    tokenEndpoint(hub, { grant_type: "refresh_token", client_id: clientId, refresh_token: refreshToken });
+
+  it("refuses an OAuth access token once its user leaves the allowlist, and accepts it again when re-added", async () => {
+    const oauthProvider = new InMemoryOAuthProvider();
+    const hub = await startHub(ctx, { allowedUsers: ["github:alice", "github:bob"], oauthProvider });
+    const { accessToken } = await oauthLogin(hub, browser);
+    expect(await mcpStatus(hub, accessToken)).toBe(200);
+    const narrowed = await startHub(ctx, { allowedUsers: ["github:bob"], oauthProvider }, hub);
+    expect(await mcpStatus(narrowed, accessToken)).toBe(401);
+    const byId = await startHub(ctx, { allowedUsers: ["github-id:1"], oauthProvider }, hub);
+    expect(await mcpStatus(byId, accessToken)).toBe(200);
+  });
+
+  it("fails closed for an OAuth token whose user has no saved identifiers under an allowlist", async () => {
+    const oauthProvider = new InMemoryOAuthProvider();
+    const hub = await startHub(ctx, { oauthProvider });
+    const { accessToken } = await oauthLogin(hub, browser);
+    const alice = hub.store.getUserByKey("github", "1")!;
+    hub.store.db.prepare("UPDATE users SET identifiers = NULL WHERE id = ?").run(alice.id);
+    expect(await mcpStatus(hub, accessToken)).toBe(200);
+    const listed = await startHub(ctx, { allowedUsers: ["github:alice"], oauthProvider }, hub);
+    expect(await mcpStatus(listed, accessToken)).toBe(401);
+  });
+
+  it("refuses a refresh for a user no longer allowed with invalid_grant, and the refresh token is gone", async () => {
+    const oauthProvider = new InMemoryOAuthProvider();
+    const hub = await startHub(ctx, { allowedUsers: ["github:alice", "github:bob"], oauthProvider });
+    const { clientId, refreshToken } = await oauthLogin(hub, browser);
+    const narrowed = await startHub(ctx, { allowedUsers: ["github:bob"], oauthProvider }, hub);
+    const refused = await refresh(narrowed, clientId, refreshToken);
+    expect(refused.status).toBe(400);
+    expect(refused.body.error).toBe("invalid_grant");
+    // Re-adding the user does not revive the refused refresh token.
+    expect((await refresh(hub, clientId, refreshToken)).body.error).toBe("invalid_grant");
+    // An allowed user refreshes normally.
+    const bob = await oauthLogin(narrowed, new Browser(), "code-bob");
+    expect((await refresh(narrowed, bob.clientId, bob.refreshToken)).status).toBe(200);
+  });
+
+  it("revokes the pair a refused refresh would have issued (SQLite provider)", async () => {
+    const hub = await startHub(ctx);
+    const oauthProvider = new SqliteOAuthProvider(hub.store);
+    const wide = await startHub(ctx, { allowedUsers: ["github:alice"], oauthProvider }, hub);
+    const { clientId, refreshToken } = await oauthLogin(wide, browser);
+    const kinds = () => hub.store.db.prepare("SELECT kind FROM oauth_tokens ORDER BY kind").all();
+    expect(kinds()).toEqual([{ kind: "access" }, { kind: "refresh" }]);
+    const narrowed = await startHub(ctx, { allowedUsers: ["github:bob"], oauthProvider }, hub);
+    expect((await refresh(narrowed, clientId, refreshToken)).body.error).toBe("invalid_grant");
+    // Only the original access token is left (which the verifier refuses); no refresh token survives.
+    expect(kinds()).toEqual([{ kind: "access" }]);
   });
 });

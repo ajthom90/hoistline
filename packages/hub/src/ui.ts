@@ -16,6 +16,8 @@ export interface UiDeps {
   tokens: AccessTokens;
   sessions: UiSessions;
   login: LoginFlow;
+  /** The hub's shared allowlist re-check (also used for access tokens): whether the user may still use the hub. */
+  allowed: (user: User) => boolean;
   /** The hub's public base URL as configured (no trailing slash). */
   publicUrl: string;
   /** For OIDC hubs, the users-table provider (`oidc:<issuer>`); shares then resolve to existing users only. */
@@ -110,7 +112,7 @@ export function uiRouter(deps: UiDeps): express.Router {
       return;
     }
     // A user removed from the allowlist loses the UI at once, like their access tokens.
-    if (!login.isAllowed(store.getUserIdentifiers(user.id) ?? [])) {
+    if (!deps.allowed(user)) {
       sessions.delete(sessionId);
       res.append("Set-Cookie", serializeCookie(SESSION_COOKIE, "", { secure, maxAge: 0, path: "/ui" }));
       res.redirect(303, "/ui/login");

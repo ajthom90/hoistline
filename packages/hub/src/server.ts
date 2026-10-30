@@ -119,7 +119,24 @@ export function createApp(deps: AppDeps): express.Express {
     // provider, so the login is current. Using a token never writes users (its saved login can be stale).
     onLogin: deps.store ? (user) => recordUser(deps.store!, user) : undefined,
     onUiLogin: ui ? uiLoginHandler(ui.store, ui.sessions, deps.publicUrl) : undefined,
+    stillAllowed: deps.store ? (identity) => hubUserOf(identity) !== null : undefined,
   });
+
+  /**
+   * The one allowlist re-check for UI sessions, personal access tokens and OAuth tokens: a hub user's saved
+   * identifiers (from their last interactive login) when they still pass the allowlist, else null. A user with none
+   * saved fails closed under an allowlist.
+   */
+  const allowedIdentifiers = (user: User): string[] | null => {
+    const identifiers = deps.store!.getUserIdentifiers(user.id) ?? [];
+    return login.isAllowed(identifiers) ? identifiers : null;
+  };
+  /** The existing, still-allowed hub user an OAuth identity maps to (read-only lookup), or null. */
+  const hubUserOf = (identity: UserIdentity | undefined): User | null => {
+    const key = identity && userKey(identity);
+    const user = key ? deps.store!.getUserByKey(key.provider, key.subject) : null;
+    return user && allowedIdentifiers(user) ? user : null;
+  };
   const provider = login.provider();
 
   const app = express();
@@ -158,6 +175,7 @@ export function createApp(deps: AppDeps): express.Express {
         ...ui,
         tokens,
         login,
+        allowed: (user) => allowedIdentifiers(user) !== null,
         publicUrl: deps.publicUrl.replace(/\/+$/, ""),
         oidcProvider: deps.oidc ? `oidc:${deps.oidc.issuer}` : undefined,
       }),
@@ -169,9 +187,9 @@ export function createApp(deps: AppDeps): express.Express {
    * identifiers saved at the user's last interactive login; none saved fails closed). Never writes users.
    */
   const verifyPat = (token: string): AuthInfo => {
-    const found = tokens!.verify(token, (user) => login.isAllowed(deps.store!.getUserIdentifiers(user.id) ?? []));
-    if (!found) throw new InvalidTokenError("Invalid or expired access token");
-    const identifiers = deps.store!.getUserIdentifiers(found.user.id) ?? [];
+    let identifiers: string[] | null = null;
+    const found = tokens!.verify(token, (user) => (identifiers = allowedIdentifiers(user)) !== null);
+    if (!found || !identifiers) throw new InvalidTokenError("Invalid or expired access token");
     return {
       token,
       clientId: `pat:${found.tokenId}`,
@@ -181,15 +199,18 @@ export function createApp(deps: AppDeps): express.Express {
     };
   };
 
-  // With a store, a token is valid only while its identity maps to an existing hub user (read-only lookup).
+  // With a store, a token is valid only while its identity maps to an existing hub user who still passes the
+  // allowlist; without one, while the identifiers the token carries do.
   const verifier: OAuthTokenVerifier = {
     verifyAccessToken: async (token) => {
       if (tokens && token.startsWith(PAT_PREFIX)) return verifyPat(token);
       const info = await provider.verifyAccessToken(token);
-      if (!machines) return info;
       const identity = info.extra?.user as UserIdentity | undefined;
-      const key = identity && userKey(identity);
-      const user = key ? machines.store.getUserByKey(key.provider, key.subject) : null;
+      if (!deps.store) {
+        if (!login.isAllowed(identity?.identifiers ?? [])) throw new InvalidTokenError("Invalid or expired access token");
+        return info;
+      }
+      const user = hubUserOf(identity);
       if (!user) throw new InvalidTokenError("Invalid or expired access token");
       return { ...info, extra: { ...info.extra, hubUser: user } };
     },
