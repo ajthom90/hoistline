@@ -124,7 +124,10 @@ export class LoginFlow {
   async startUi(res: Response, carry?: string): Promise<void> {
     if (!this.options.onUiLogin) throw new Error("web UI login is not configured");
     const state = random();
-    const pending: PendingUiLogin = { browserNonce: random(), expiresAt: now() + LOGIN_TTL, ...(carry ? { carry } : {}) };
+    // Only a value shaped like a session id (32 random bytes, base64url) is worth carrying; anything else is dropped
+    // so unauthenticated requests cannot park large cookie values in memory.
+    const keep = carry !== undefined && /^[A-Za-z0-9_-]{43}$/.test(carry);
+    const pending: PendingUiLogin = { browserNonce: random(), expiresAt: now() + LOGIN_TTL, ...(keep ? { carry } : {}) };
     this.prune();
     this.uiLogins.set(state, pending);
     res.append("Set-Cookie", this.cookie(UI_LOGIN_COOKIE, pending.browserNonce, LOGIN_TTL));

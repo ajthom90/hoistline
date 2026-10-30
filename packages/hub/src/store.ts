@@ -104,7 +104,8 @@ const STALE_GITHUB = `typeof(value) = 'text' AND lower(value) LIKE 'github:%'
 /** Drops stale `github:<x>` identifiers (as migration 004 does); append `AND ...` to scope it. */
 const STRIP_STALE_GITHUB = `UPDATE users SET identifiers = (
     SELECT json_group_array(value) FROM json_each(users.identifiers) WHERE NOT (${STALE_GITHUB}))
-  WHERE identifiers IS NOT NULL AND EXISTS (SELECT 1 FROM json_each(users.identifiers) WHERE ${STALE_GITHUB})`;
+  WHERE identifiers IS NOT NULL AND json_valid(identifiers)
+    AND EXISTS (SELECT 1 FROM json_each(users.identifiers) WHERE ${STALE_GITHUB})`;
 
 /** The last `maxBytes` bytes of `text`, starting at a character boundary. */
 export function utf8Tail(text: string, maxBytes: number): { text: string; truncated: boolean } {
@@ -191,7 +192,7 @@ export class Store {
             `UPDATE users SET identifiers = (
                SELECT json_group_array(value) FROM json_each(users.identifiers)
                WHERE NOT (typeof(value) = 'text' AND lower(value) = @stale))
-             WHERE id != @id AND identifiers IS NOT NULL AND EXISTS (
+             WHERE id != @id AND identifiers IS NOT NULL AND json_valid(identifiers) AND EXISTS (
                SELECT 1 FROM json_each(users.identifiers) WHERE typeof(value) = 'text' AND lower(value) = @stale)`,
           )
           .run({ id: record.id, stale: `github:${login.toLowerCase()}` });
