@@ -113,6 +113,19 @@ export function describeReason(reason: string): string | undefined {
   return Object.hasOwn(REASON_DESCRIPTIONS, reason) ? REASON_DESCRIPTIONS[reason] : undefined;
 }
 
+/**
+ * The machine `ref` (an id, or the name of a machine the user can access) names, if the user owns it or has a share
+ * on it. Throws NotFoundError (unknown and inaccessible machines look the same) or AmbiguousMachineError.
+ */
+export function resolveMachine(store: Pick<Store, "getMachine" | "machinesFor">, userId: string, ref: string): Machine {
+  const byId = store.getMachine(userId, ref);
+  if (byId) return byId;
+  const named = store.machinesFor(userId).filter((m) => m.name === ref);
+  if (named.length > 1) throw new AmbiguousMachineError(ref);
+  if (named.length === 1) return named[0]!;
+  throw new NotFoundError();
+}
+
 /** Reasons only the hub may set: a job failed with one of them can still be replaced by the agent's real result. */
 const HUB_GIVE_UP_REASONS = new Set(["agent_disconnected", "lost_on_agent"]);
 
@@ -209,7 +222,7 @@ export class Jobs {
    * AmbiguousMachineError, MachineOfflineError, TooManyJobsError, or a validation error for a malformed request.
    */
   delegate(userId: string, req: DelegateRequest): JobRow {
-    const machine = this.resolveMachine(userId, req.machine);
+    const machine = resolveMachine(this.store, userId, req.machine);
     if (!this.gateway.isOnline(machine.id)) throw new MachineOfflineError();
     const spec: JobSpec = JobSpecSchema.parse({
       jobId: randomUUID(),
@@ -389,15 +402,6 @@ export class Jobs {
     } catch {
       // The agent replays the result on its next connection and is acked then.
     }
-  }
-
-  private resolveMachine(userId: string, ref: string): Machine {
-    const byId = this.store.getMachine(userId, ref);
-    if (byId) return byId;
-    const named = this.store.machinesFor(userId).filter((m) => m.name === ref);
-    if (named.length > 1) throw new AmbiguousMachineError(ref);
-    if (named.length === 1) return named[0]!;
-    throw new NotFoundError();
   }
 
   private armGrace(machineId: string): void {

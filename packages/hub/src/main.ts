@@ -5,6 +5,7 @@ import { SqliteOAuthProvider } from "./auth/sqlite-provider.js";
 import { configFromEnv } from "./config.js";
 import { Gateway } from "./gateway.js";
 import { Jobs } from "./jobs.js";
+import { DirectMode } from "./tools/proxy.js";
 import { createApp } from "./server.js";
 import { Store } from "./store.js";
 
@@ -28,7 +29,17 @@ const jobs = new Jobs(store, gateway);
 jobs.attach();
 // Jobs left active by the previous process fail unless their agent reconnects (and lists them) within the grace.
 jobs.recoverAfterRestart();
-const app = createApp({ ...deps, oauthProvider, store, gateway, jobs, cookieSecret: store.getOrCreateSecret("cookie") });
+const directMode = new DirectMode(store, gateway);
+directMode.attach();
+const app = createApp({
+  ...deps,
+  oauthProvider,
+  store,
+  gateway,
+  jobs,
+  directMode,
+  cookieSecret: store.getOrCreateSecret("cookie"),
+});
 const server = createServer(app);
 gateway.attach(server);
 server.listen(port, () => {
@@ -38,6 +49,7 @@ server.listen(port, () => {
 
 function shutdown(): void {
   jobs.close();
+  directMode.close();
   gateway.close();
   server.close(() => {
     store.close();

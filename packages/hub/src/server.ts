@@ -26,6 +26,7 @@ import { pairRouter } from "./pairing.js";
 import type { Store, User } from "./store.js";
 import { registerJobTools } from "./tools/jobs.js";
 import { registerMachineTools } from "./tools/machines.js";
+import { registerProxyTools, type DirectMode } from "./tools/proxy.js";
 import { AccessTokens, PAT_PREFIX } from "./tokens.js";
 import { uiLoginHandler, uiRouter } from "./ui.js";
 import { UiSessions } from "./ui/session.js";
@@ -58,6 +59,8 @@ export interface AppDeps {
   gateway?: Gateway;
   /** The job lifecycle (create it over the same store and gateway, and attach it, separately). */
   jobs?: Jobs;
+  /** Direct mode: proxied MCP tools (create it over the same store and gateway, and attach it, separately). */
+  directMode?: DirectMode;
 }
 
 interface ToolContext {
@@ -65,6 +68,8 @@ interface ToolContext {
   gateway: Gateway;
   /** When set, the job tools are registered too. */
   jobs?: Jobs;
+  /** When set, the proxied tools and list_tools / call_tool are registered too. */
+  directMode?: DirectMode;
   /** The hub user the bearer token belongs to. */
   user: User;
 }
@@ -92,6 +97,8 @@ function buildMcpServer(ctx?: ToolContext): McpServer {
   if (ctx) {
     registerMachineTools(server, ctx.store, ctx.gateway, ctx.user);
     if (ctx.jobs) registerJobTools(server, ctx.jobs, ctx.user);
+    // Registered per request from the caller's online, accessible machines, so every tools/list is current.
+    if (ctx.directMode) registerProxyTools(server, ctx.directMode, ctx.user);
   }
   return server;
 }
@@ -221,10 +228,12 @@ export function createApp(deps: AppDeps): express.Express {
   });
 
   // Stateless Streamable HTTP: a fresh server and transport per request.
-  app.post("/mcp", bearer, express.json(), async (req, res, next) => {
+  // Above the default 100 KB so direct-mode tool arguments up to 256 KiB reach the tool (which enforces that cap).
+  app.post("/mcp", bearer, express.json({ limit: "1mb" }), async (req, res, next) => {
     // Tools act as the hub user the token was issued to (resolved by provider and subject, never by login).
     const hubUser = req.auth?.extra?.hubUser as User | undefined;
-    const ctx: ToolContext | undefined = machines && hubUser ? { ...machines, jobs: deps.jobs, user: hubUser } : undefined;
+    const ctx: ToolContext | undefined =
+      machines && hubUser ? { ...machines, jobs: deps.jobs, directMode: deps.directMode, user: hubUser } : undefined;
     const server = buildMcpServer(ctx);
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
     res.on("close", () => {

@@ -24,3 +24,11 @@ export {
   type JobsGateway,
   type JobsOptions,
 } from "./jobs.js";
+export {
+  DirectMode,
+  DirectModeError,
+  exposedName,
+  type DirectModeGateway,
+  type DirectModeOptions,
+  type ProxiedToolEntry,
+} from "./tools/proxy.js";

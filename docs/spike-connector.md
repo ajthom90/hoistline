@@ -124,6 +124,20 @@ curl -s -X POST $HUB/register -H 'content-type: application/json' \
 11. Optional: repeat steps 3 to 8 with `OIDC_ISSUER`, `OIDC_CLIENT_ID`, `OIDC_CLIENT_SECRET` set instead of the GitHub variables, with `https://hoistline.example.com/oauth/callback` registered as the redirect URI at the OIDC provider.
 12. Write down what worked, what failed and any claude.ai quirks in "Findings" below. If claude.ai cannot complete the flow, stop before Task 3.
 
+## PENDING: does claude.ai fetch the tool list again during a conversation?
+
+Direct mode (see `docs/direct-mode.md`) offers each online machine's proxied tools by name. The `/mcp` endpoint is
+stateless, so the hub cannot send `notifications/tools/list_changed`; every `tools/list` request is answered with the
+current tools, but only if the client asks again. **To be checked by the author:**
+
+1. With the connector enabled in claude.ai (and in a Claude Code session using it), start a conversation with one
+   machine online and note its `<machine>__<server>__<tool>` tools.
+2. Bring a second machine with servers online during that conversation and ask Claude to use one of its tools.
+3. Note whether the new tools appear by name without starting a new conversation, or only through `list_tools`
+   and `call_tool`.
+
+Until this is checked, `list_tools` plus `call_tool` is the documented reliable path.
+
 ## Findings
 
 _Not yet run._
