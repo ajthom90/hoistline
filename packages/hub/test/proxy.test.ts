@@ -291,6 +291,38 @@ describe("direct mode tools", () => {
     expect(r.text).toMatch(/timed out/);
   });
 
+  it("caps a user's pending calls with a clear error, without contacting the machine", async () => {
+    const hub = await startHub({ maxPendingCallsPerUser: 2 });
+    const held: CallMsg[] = [];
+    const agent = await fakeAgent(hub, hub.alice, "Laptop", [FS], (msg) => held.push(msg));
+    const bobAgent = await fakeAgent(hub, hub.bob, "Desk", [FS]);
+    const id = agent.identity.machineId;
+    const first = hub.direct.call(hub.alice.id, id, "fs", "Read_File", {});
+    const second = hub.direct.call(hub.alice.id, id, "fs", "Read_File", {});
+    await waitFor(() => held.length === 2, "two held calls");
+
+    const c = await client(hub);
+    const over = await call(c, "call_tool", { machine: id, server: "fs", tool: "Read_File", args: {} });
+    expect(over).toMatchObject({ isError: true });
+    expect(over.text).toMatch(/too many tool calls in progress \(the limit is 2\)/);
+    expect(agent.calls).toHaveLength(2);
+
+    // Another user is not affected.
+    const bobs = await call(await client(hub, "token-bob"), "desk__fs__read_file", {});
+    expect(bobs.isError).toBe(false);
+    expect(bobAgent.calls).toHaveLength(1);
+
+    // Once a call finishes, a new one is accepted.
+    agent.conn.send({ type: "tools.result", callId: held[0]!.callId, ok: true, result: { content: [] } });
+    await first;
+    const third = hub.direct.call(hub.alice.id, id, "fs", "Read_File", {});
+    await waitFor(() => held.length === 3, "third call reached the machine");
+    for (const m of held.slice(1)) {
+      agent.conn.send({ type: "tools.result", callId: m.callId, ok: true, result: { content: [] } });
+    }
+    await Promise.all([second, third]);
+  });
+
   it("refuses oversized arguments without contacting the machine", async () => {
     const hub = await startHub();
     const agent = await fakeAgent(hub, hub.alice, "Laptop", [FS]);

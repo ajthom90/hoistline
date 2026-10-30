@@ -137,6 +137,9 @@ at once. Whether claude.ai fetches the tool list again during a conversation is 
   and they fit; other content (audio, resources) is replaced by a short note.
 - The hub waits 25 s for a machine's tool list after it connects (the agent gives each server 20 s; a server that
   is slower is left out and logged).
+- Each user may have at most 32 tool calls waiting for an answer at once, across all machines. Another call fails
+  at once with "too many tool calls in progress (the limit is 32); wait for one to finish and try again", without
+  reaching the machine.
 - The hub waits 60 s for an answer (the agent gives the server 55 s). If the machine disconnects during a call, the
   call fails with an error as soon as the hub sees the connection close. (A connection that dies silently, with
   no close, is noticed by the hub's ping check, within about 40 s.)

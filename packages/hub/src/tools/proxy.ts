@@ -28,6 +28,8 @@ const MAX_SCHEMA_STRING = 256;
 const MAX_SCHEMA_NAME = 64;
 /** How long the hub waits for an agent's inventory; the agent gives each server 20 s. */
 export const DEFAULT_INVENTORY_WAIT_MS = 25_000;
+/** Tool calls one user may have waiting at once; with the 60 s timeout this bounds what a user can hold open. */
+export const DEFAULT_MAX_PENDING_CALLS_PER_USER = 32;
 /** Largest list_tools response, wrapper included. */
 export const LIST_TOOLS_BUDGET_BYTES = 512 * 1024;
 const MAX_EXPOSED_NAME = 64;
@@ -42,6 +44,8 @@ export interface DirectModeOptions {
   callTimeoutMs?: number;
   /** How long the hub waits for an agent's tool inventory after it connects. Default 25 s. */
   listTimeoutMs?: number;
+  /** Tool calls one user may have waiting for an answer, across all machines. Default 32. */
+  maxPendingCallsPerUser?: number;
   log?: (line: string) => void;
 }
 
@@ -70,6 +74,7 @@ type ToolsResult = Extract<AgentToHub, { type: "tools.result" }>;
 
 interface PendingCall {
   machineId: string;
+  userId: string;
   resolve: (msg: ToolsResult) => void;
   reject: (err: Error) => void;
   timer: NodeJS.Timeout;
@@ -216,6 +221,7 @@ export class DirectMode {
   private readonly pendingCalls = new Map<string, PendingCall>();
   private readonly callTimeoutMs: number;
   private readonly listTimeoutMs: number;
+  private readonly maxPendingPerUser: number;
   private readonly log: (line: string) => void;
   private attached = false;
   private closed = false;
@@ -227,6 +233,7 @@ export class DirectMode {
   ) {
     this.callTimeoutMs = opts.callTimeoutMs ?? 60_000;
     this.listTimeoutMs = opts.listTimeoutMs ?? DEFAULT_INVENTORY_WAIT_MS;
+    this.maxPendingPerUser = opts.maxPendingCallsPerUser ?? DEFAULT_MAX_PENDING_CALLS_PER_USER;
     this.log = opts.log ?? ((line) => console.log(line));
   }
 
@@ -300,7 +307,8 @@ export class DirectMode {
 
   /**
    * Calls a tool on a machine the user can access (`machine` is an id or name). Throws NotFoundError,
-   * AmbiguousMachineError, MachineOfflineError or DirectModeError (args too large, disconnect, timeout).
+   * AmbiguousMachineError, MachineOfflineError or DirectModeError (args too large, too many pending calls,
+   * disconnect, timeout).
    */
   async call(userId: string, machine: string, server: string, tool: string, args: Record<string, unknown>): Promise<CallToolResult> {
     // Checked before any machine lookup, so it reveals nothing about machines.
@@ -310,6 +318,13 @@ export class DirectMode {
     }
     const m = this.resolve(userId, machine);
     if (!this.gateway.isOnline(m.id)) throw new MachineOfflineError();
+    let pending = 0;
+    for (const p of this.pendingCalls.values()) if (p.userId === userId) pending++;
+    if (pending >= this.maxPendingPerUser) {
+      throw new DirectModeError(
+        `too many tool calls in progress (the limit is ${this.maxPendingPerUser}); wait for one to finish and try again`,
+      );
+    }
     const callId = randomUUID();
     const answer = new Promise<ToolsResult>((resolve, reject) => {
       const timer = setTimeout(() => {
@@ -317,7 +332,7 @@ export class DirectMode {
         reject(new DirectModeError(`the tool call timed out after ${Math.round(this.callTimeoutMs / 1000)} s`));
       }, this.callTimeoutMs);
       timer.unref();
-      this.pendingCalls.set(callId, { machineId: m.id, resolve, reject, timer });
+      this.pendingCalls.set(callId, { machineId: m.id, userId, resolve, reject, timer });
     });
     try {
       this.gateway.send(m.id, { type: "tools.call", callId, userId, server, tool, args });
