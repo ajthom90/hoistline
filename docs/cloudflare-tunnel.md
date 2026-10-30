@@ -66,4 +66,7 @@ values got `429` from the 11th on through the published port, and none through l
 namespace. Not checked on a Linux Docker host, where the result through the published port is expected to be the
 same.
 
+With cloudflared on loopback, per-client buckets rely on Cloudflare sending the client's address in
+`X-Forwarded-For`. That was not checked here.
+
 The other routes are not rate limited by IP.
