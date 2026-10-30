@@ -5,7 +5,9 @@ cannot change or override it. The policy is `policy.json` in the agent's home (`
 `~/.hoistline`). See it with `hoistline-agent policy show`. The agent reads it for every job and tool call, so edits
 apply without a restart. A missing or invalid policy file denies everything.
 
-Every job is signed by the hub, and the agent checks the signature before anything else, in both modes.
+Every job (task mode) is signed by the hub, and the agent checks the signature before anything else, in restricted and
+trusted mode alike. Direct-mode tool calls are not signed; the agent checks them against the policy on every call (see
+[Residual risks](#residual-risks)).
 
 ## Restricted mode
 
