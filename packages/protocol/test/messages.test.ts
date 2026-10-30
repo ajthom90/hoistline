@@ -133,6 +133,16 @@ describe("job lifecycle additions", () => {
     expect(AgentToHub.parse(msg)).toEqual(msg);
     expect(AgentToHub.safeParse({ ...msg, truncated: "yes" }).success).toBe(false);
   });
+  it("accepts an optional hello.os of up to 64 printable ASCII characters", () => {
+    const hello = agentToHub[0] as Record<string, unknown>;
+    expect(hello.os).toBeUndefined();
+    expect(AgentToHub.safeParse(hello).success).toBe(true);
+    expect(AgentToHub.parse({ ...hello, os: "darwin-arm64" })).toMatchObject({ os: "darwin-arm64" });
+    expect(AgentToHub.safeParse({ ...hello, os: "x".repeat(64) }).success).toBe(true);
+    for (const os of ["", "x".repeat(65), "linux\nx64", "linux\u0000", "lïnux", "linux\u007f", 7]) {
+      expect(AgentToHub.safeParse({ ...hello, os }).success, JSON.stringify(os)).toBe(false);
+    }
+  });
   it("caps hello.runningJobs at 1000", () => {
     const hello = agentToHub[0] as Record<string, unknown>;
     const ids = (n: number) => Array.from({ length: n }, (_, i) => `j${i}`);

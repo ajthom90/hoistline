@@ -68,6 +68,11 @@ export const AgentToHub = z.discriminatedUnion("type", [
       type: z.literal("hello"),
       machineId: id,
       agentVersion: z.string().min(1).max(100),
+      /** The agent's platform, such as "darwin-arm64" (display only). Optional: older agents do not send it. */
+      os: z
+        .string()
+        .regex(/^[\x20-\x7e]{1,64}$/)
+        .optional(),
       runners: z.array(RunnerName),
       runningJobs: z.array(id).max(1000),
       servers: z.array(z.string().max(200)),
