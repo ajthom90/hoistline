@@ -8,6 +8,7 @@ import { killTrackedProcessGroups } from "../src/children.js";
 import type { PolicyConfig } from "../src/policy.js";
 import {
   ASK_DENIED_REASON,
+  DEFAULT_LIST_TIMEOUT_MS,
   McpProxy,
   defaultServersPath,
   loadServers,
@@ -29,8 +30,16 @@ afterEach(async () => {
 });
 
 type StubTool = { name: string; description?: string; inputSchema?: Record<string, unknown> };
-function stub(tools?: StubTool[], extra: Partial<ServerConfig> = {}, pidFile?: string): ServerConfig {
-  return { command: process.execPath, args: [STUB, JSON.stringify({ tools, pidFile })], ...extra };
+type StubBehaviour = {
+  junk?: boolean;
+  noInit?: boolean;
+  flood?: boolean;
+  exitAtStart?: boolean;
+  endlessPages?: number;
+  grandchild?: boolean;
+};
+function stub(tools?: StubTool[], extra: Partial<ServerConfig> = {}, pidFile?: string, behaviour: StubBehaviour = {}): ServerConfig {
+  return { command: process.execPath, args: [STUB, JSON.stringify({ tools, pidFile, ...behaviour })], ...extra };
 }
 
 const TOOLS: StubTool[] = [
@@ -197,25 +206,116 @@ describe("McpProxy", () => {
     expect(Date.now() - started).toBeLessThan(5000);
   });
 
-  it("restarts a crashed server with backoff (1 s, 2 s, 4 s ... at most 60 s)", async () => {
+  it("restarts a crashed server only on demand, after a backoff of 1 s, 2 s, 4 s ...", async () => {
     const pidFile = join(dir, "pids");
-    const delays: number[] = [];
-    const p = proxy({ stub: stub(TOOLS, {}, pidFile) }, { mode: "trusted" }, {
-      setTimeout: (fn, ms) => {
-        delays.push(ms);
-        return setTimeout(fn, 0);
-      },
-      clearTimeout: (h) => clearTimeout(h as NodeJS.Timeout),
-    });
+    let now = 1_000_000;
+    const p = proxy({ stub: stub(TOOLS, {}, pidFile) }, { mode: "trusted" }, { now: () => now });
     await p.call("stub", "echo", {});
-    for (let i = 1; i <= 3; i++) {
+    for (const [i, delay] of [1000, 2000, 4000].entries()) {
       await expect(p.call("stub", "crash", {})).rejects.toThrow();
-      await waitFor(() => pids(pidFile).length === i + 1, `restart ${i}`);
-      // Usable again once restarted.
-      await waitFor(() => p.isRunning("stub"), `server running after restart ${i}`);
+      await waitFor(() => !p.isRunning("stub"), `crash ${i + 1} noticed`);
+      // Nobody asks: nothing restarts it.
+      await new Promise((r) => setTimeout(r, 150));
+      expect(pids(pidFile)).toHaveLength(i + 1);
+      now += delay - 1;
+      await expect(p.call("stub", "echo", {})).rejects.toThrow(/stopped unexpectedly; try again in 1 s/);
+      expect(pids(pidFile)).toHaveLength(i + 1);
+      now += 1;
       await p.call("stub", "echo", {});
+      expect(pids(pidFile)).toHaveLength(i + 2);
     }
-    expect(delays).toEqual([1000, 2000, 4000]);
+  });
+
+  it("after 5 failed starts in a row, stays failed until a demand 60 s later", async () => {
+    const pidFile = join(dir, "pids");
+    let now = 1_000_000;
+    const p = proxy({ bad: stub(TOOLS, {}, pidFile, { exitAtStart: true }) }, { mode: "trusted" }, { now: () => now });
+    for (const [i, delay] of [1000, 2000, 4000, 8000].entries()) {
+      await expect(p.call("bad", "echo", {})).rejects.toThrow();
+      expect(pids(pidFile)).toHaveLength(i + 1);
+      now += delay;
+    }
+    await expect(p.call("bad", "echo", {})).rejects.toThrow();
+    expect(pids(pidFile)).toHaveLength(5);
+    now += 16_000;
+    await expect(p.call("bad", "echo", {})).rejects.toThrow(/try again in 44 s/);
+    now += 44_000 - 1;
+    await expect(p.call("bad", "echo", {})).rejects.toThrow(/try again in 1 s/);
+    expect(pids(pidFile)).toHaveLength(5);
+    now += 1;
+    await expect(p.call("bad", "echo", {})).rejects.toThrow();
+    expect(pids(pidFile)).toHaveLength(6);
+  });
+
+  it("skips stdout lines that are not JSON-RPC and keeps reading, logging once", async () => {
+    const lines: string[] = [];
+    const p = proxy({ stub: stub(TOOLS, {}, undefined, { junk: true }) }, { mode: "trusted" }, {
+      log: (l) => lines.push(l),
+      callTimeoutMs: 2000,
+      startTimeoutMs: 2000,
+    });
+    const started = Date.now();
+    expect(JSON.parse(textOf(await p.call("stub", "echo", { a: 1 })))).toEqual({ tool: "echo", args: { a: 1 } });
+    await p.call("stub", "echo", {});
+    expect(Date.now() - started).toBeLessThan(1500);
+    expect(lines.filter((l) => l.includes("not JSON-RPC"))).toHaveLength(1);
+  });
+
+  it("gives up on a server that never reads its input, within the start deadline, and still shuts down", async () => {
+    const pidFile = join(dir, "pids");
+    const p = proxy({ flood: stub(TOOLS, {}, pidFile, { flood: true }) }, { mode: "trusted" }, { startTimeoutMs: 500 });
+    const started = Date.now();
+    expect(await p.listTools()).toEqual([]);
+    expect(Date.now() - started).toBeLessThan(1500);
+    const pid = Number(pids(pidFile)[0]);
+    await waitFor(() => !alive(pid), "flooding server killed", 3000);
+    const closing = Date.now();
+    await p.close();
+    expect(Date.now() - closing).toBeLessThan(1000);
+  });
+
+  it("shutdown does not wait for a server that is still starting", async () => {
+    const pidFile = join(dir, "pids");
+    const p = proxy({ slow: stub(TOOLS, {}, pidFile, { noInit: true }) }, { mode: "trusted" }, { startTimeoutMs: 10_000 });
+    const listing = p.listTools();
+    await waitFor(() => pids(pidFile).length === 1, "server spawned");
+    const closing = Date.now();
+    await p.close();
+    expect(Date.now() - closing).toBeLessThan(1000);
+    expect(await listing).toEqual([]);
+    const pid = Number(pids(pidFile)[0]);
+    await waitFor(() => !alive(pid), "starting server killed", 3000);
+  });
+
+  it("lists the healthy servers' tools when another server's listing does not finish in time", async () => {
+    const lines: string[] = [];
+    const p = proxy(
+      { slow: stub(TOOLS, {}, undefined, { endlessPages: 100 }), stuck: stub(TOOLS, {}, undefined, { noInit: true }), ok: stub([{ name: "one" }]) },
+      { mode: "trusted" },
+      { listTimeoutMs: 400, startTimeoutMs: 10_000, log: (l) => lines.push(l) },
+    );
+    const started = Date.now();
+    const tools = await p.listTools();
+    expect(Date.now() - started).toBeLessThan(1500);
+    expect(tools.map((t) => `${t.server}.${t.name}`)).toEqual(["ok.one"]);
+    expect(lines.some((l) => l.includes("slow") && l.includes("cannot list tools"))).toBe(true);
+    expect(lines.some((l) => l.includes("stuck") && l.includes("cannot list tools"))).toBe(true);
+  });
+
+  it("lists within 20 s per server by default, below the hub's 25 s wait", () => {
+    expect(DEFAULT_LIST_TIMEOUT_MS).toBe(20_000);
+  });
+
+  it.runIf(posix)("kills the rest of a server's process group when the server exits", async () => {
+    const pidFile = join(dir, "pids");
+    const p = proxy({ stub: stub(TOOLS, {}, pidFile, { grandchild: true }) });
+    await p.listTools();
+    await waitFor(() => pids(pidFile).length === 2, "grandchild started");
+    const [leader, grandchild] = pids(pidFile).map(Number) as [number, number];
+    expect(alive(grandchild)).toBe(true);
+    await expect(p.call("stub", "crash", {})).rejects.toThrow();
+    await waitFor(() => !alive(leader), "leader exited");
+    await waitFor(() => !alive(grandchild), "grandchild killed", 3000);
   });
 
   it("caps the restart delay at 60 s", () => {
@@ -265,7 +365,7 @@ describe("McpProxy.onMessage", () => {
   }
 
   it("answers tools.list with the allowed tools, grouped by server, within the protocol limits", async () => {
-    const long = "d".repeat(5000);
+    const long = `${"d".repeat(1999)}\u{1F600}${"d".repeat(3000)}`;
     const p = proxy({
       stub: stub([...TOOLS, { name: "wordy", description: long }, { name: "n".repeat(300) }]),
     });
@@ -275,7 +375,10 @@ describe("McpProxy.onMessage", () => {
     const msg = sent[0]! as Extract<AgentToHub, { type: "tools.list" }>;
     expect(msg.callId).toBe("c1");
     const tools = msg.servers.find((s) => s.name === "stub")!.tools;
-    expect(tools.find((t) => t.name === "wordy")!.description!.length).toBeLessThanOrEqual(2000);
+    const wordy = tools.find((t) => t.name === "wordy")!.description!;
+    expect(wordy.length).toBeLessThanOrEqual(2000);
+    // Never cut between the two halves of a surrogate pair.
+    expect(wordy.isWellFormed()).toBe(true);
     expect(tools.some((t) => t.name.length > 200)).toBe(false);
     expect(tools.find((t) => t.name === "echo")!.inputSchema).toEqual({
       type: "object",

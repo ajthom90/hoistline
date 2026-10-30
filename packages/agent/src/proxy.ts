@@ -76,23 +76,30 @@ export interface ProxiedTool {
 export interface McpProxyOptions {
   /** Per-call timeout. Default 55 s (the hub gives up after 60 s). */
   callTimeoutMs?: number;
-  /** Timeout for starting a server and listing its tools. Default 30 s. */
+  /** Deadline for one server's whole tool listing (start included). Default 20 s (the hub waits 25 s). */
   listTimeoutMs?: number;
+  /** Deadline for starting a server: spawn, initialize and the initialized notification. Default 20 s. */
+  startTimeoutMs?: number;
   /** Where the agent's own environment comes from (for PATH, HOME, ...). Default process.env. */
   baseEnv?: Record<string, string | undefined>;
   /** Log lines (already escaped). Default: stderr. */
   log?: (line: string) => void;
-  /** Timer for restarts after a crash. */
-  setTimeout?: (fn: () => void, ms: number) => unknown;
-  clearTimeout?: (handle: unknown) => void;
+  /** Clock for the restart backoff. Default Date.now. */
+  now?: () => number;
 }
 
 const DEFAULT_CALL_TIMEOUT_MS = 55_000;
-const DEFAULT_LIST_TIMEOUT_MS = 30_000;
+/** Per-server listing deadline; below the hub's 25 s wait for the whole inventory. */
+export const DEFAULT_LIST_TIMEOUT_MS = 20_000;
+const DEFAULT_START_TIMEOUT_MS = 20_000;
 const RESTART_INITIAL_MS = 1000;
 const RESTART_MAX_MS = 60_000;
+/** After this many failures in a row a server is retried only on a demand 60 s later. */
+const MAX_QUICK_RETRIES = 5;
 /** A server that stayed up this long before crashing restarts from the shortest delay again. */
 const STABLE_UPTIME_MS = RESTART_MAX_MS;
+/** At most one "not JSON-RPC" log line per server per this many ms. */
+const BAD_LINE_LOG_INTERVAL_MS = 60_000;
 /** Protocol limits of AgentToHub tools.list (see @hoistline/protocol). */
 const MAX_TOOL_NAME = 200;
 const MAX_DESCRIPTION = 2000;
@@ -106,6 +113,8 @@ const RESULT_TEXT_KEEP = 1024 * 1024;
 const MAX_ERROR = 10_000;
 const MAX_STDERR_LINES = 1000;
 const MAX_STDERR_LINE = 300;
+/** Unwritten input queued for a server beyond this means it is not reading: further sends fail. */
+const MAX_STDIN_BACKLOG = 8 * 1024 * 1024;
 
 /** The environment a server gets before its configured env: only what a program needs to run. */
 function minimalEnv(base: Record<string, string | undefined>): Record<string, string> {
@@ -119,6 +128,12 @@ function minimalEnv(base: Record<string, string | undefined>): Record<string, st
   return env;
 }
 
+/** The first `max` UTF-16 units of `text`, never ending in half of a surrogate pair. */
+export function cutText(text: string, max: number): string {
+  if (text.length <= max) return text;
+  return text.slice(0, max).replace(/[\ud800-\udbff]$/, "");
+}
+
 /**
  * Stdio transport for the SDK Client that spawns the server in its own process group (POSIX) and registers it with
  * the children registry, so a forced stop SIGKILLs the server and everything it started. Gets exactly the env given.
@@ -129,10 +144,12 @@ class ServerTransport implements Transport {
   onmessage?: <T extends JSONRPCMessage>(message: T) => void;
   private child?: ChildProcessWithoutNullStreams;
   private readonly buffer = new ReadBuffer();
+  private drained?: Promise<void>;
 
   constructor(
     private readonly params: { command: string; args: string[]; env: Record<string, string>; cwd?: string },
     private readonly onStderr: (line: string) => void,
+    private readonly onBadLine: (error: Error) => void = () => {},
   ) {}
 
   get pid(): number | undefined {
@@ -166,18 +183,33 @@ class ServerTransport implements Transport {
         if (!spawned) reject(err);
         else this.onerror?.(err);
       });
+      // When the server exits, whatever it left running in its process group goes too. Done on exit, not only
+      // on close: a leftover process holding the pipes would delay close forever.
+      child.once("exit", () => signal(child, "SIGKILL"));
       child.once("close", () => {
+        signal(child, "SIGKILL");
         untrack();
         this.child = undefined;
         this.onclose?.();
       });
       child.stdin.on("error", (err) => this.onerror?.(err));
       child.stdout.on("data", (chunk: Buffer) => {
-        try {
-          this.buffer.append(chunk);
-          for (let msg = this.buffer.readMessage(); msg !== null; msg = this.buffer.readMessage()) this.onmessage?.(msg);
-        } catch (err) {
-          this.onerror?.(err as Error);
+        this.buffer.append(chunk);
+        // Each line on its own: a line that is not JSON-RPC is skipped, never stalling the ones after it.
+        for (;;) {
+          let msg: JSONRPCMessage | null;
+          try {
+            msg = this.buffer.readMessage();
+          } catch (err) {
+            this.onBadLine(err as Error);
+            continue;
+          }
+          if (msg === null) break;
+          try {
+            this.onmessage?.(msg);
+          } catch (err) {
+            this.onerror?.(err as Error);
+          }
         }
       });
       const decoder = new StringDecoder("utf8");
@@ -195,12 +227,39 @@ class ServerTransport implements Transport {
   }
 
   send(message: JSONRPCMessage): Promise<void> {
-    return new Promise((resolve, reject) => {
-      const child = this.child;
-      if (!child) return reject(new Error("server is not running"));
-      if (child.stdin.write(serializeMessage(message))) resolve();
-      else child.stdin.once("drain", resolve);
+    const child = this.child;
+    if (!child || child.stdin.destroyed || !child.stdin.writable) return Promise.reject(new Error("server is not running"));
+    const stdin = child.stdin;
+    if (stdin.writableLength > MAX_STDIN_BACKLOG) return Promise.reject(new Error("the server is not reading its input"));
+    if (stdin.write(serializeMessage(message))) return Promise.resolve();
+    // A server that stops reading must not hang the sender: one shared wait for drain, failing on error or close.
+    this.drained ??= new Promise<void>((resolve, reject) => {
+      const done = (err?: Error) => {
+        stdin.off("drain", onDrain);
+        stdin.off("error", onError);
+        stdin.off("close", onClose);
+        this.drained = undefined;
+        if (err) reject(err);
+        else resolve();
+      };
+      const onDrain = () => done();
+      const onError = (err: Error) => done(err);
+      const onClose = () => done(new Error("server input closed"));
+      stdin.on("drain", onDrain);
+      stdin.on("error", onError);
+      stdin.on("close", onClose);
     });
+    return this.drained;
+  }
+
+  /** SIGKILLs the server's process group at once; resolves when it closed (or after 2 s). */
+  async kill(): Promise<void> {
+    const child = this.child;
+    if (!child) return;
+    const exited = new Promise<void>((resolve) => child.once("close", () => resolve()));
+    signal(child, "SIGKILL");
+    child.stdin.destroy();
+    await Promise.race([exited, new Promise<void>((r) => setTimeout(r, 2000).unref())]);
   }
 
   async close(): Promise<void> {
@@ -238,10 +297,11 @@ interface ServerState {
   transport?: ServerTransport;
   starting?: Promise<Client>;
   startedAt: number;
-  /** Consecutive crashes; picks the next restart delay. */
-  crashes: number;
-  restartTimer?: unknown;
-  restartAt?: number;
+  /** Consecutive crashes and failed starts; picks the next delay. */
+  failures: number;
+  /** No start is tried before this time (on demand only: nothing restarts a server by itself). */
+  retryAt: number;
+  lastBadLineLog: number;
 }
 
 const isPlainObject = (v: unknown): v is Record<string, unknown> =>
@@ -259,10 +319,10 @@ export class McpProxy {
   private readonly loadPolicy: () => PolicyConfig;
   private readonly callTimeoutMs: number;
   private readonly listTimeoutMs: number;
+  private readonly startTimeoutMs: number;
   private readonly baseEnv: Record<string, string | undefined>;
   private readonly log: (line: string) => void;
-  private readonly setTimer: (fn: () => void, ms: number) => unknown;
-  private readonly clearTimer: (handle: unknown) => void;
+  private readonly now: () => number;
   private closed = false;
 
   /** The delay before restart number `crashes + 1`: 1 s, 2 s, 4 s ... at most 60 s. */
@@ -276,15 +336,15 @@ export class McpProxy {
     opts: McpProxyOptions = {},
   ) {
     for (const [name, config] of Object.entries(servers)) {
-      this.states.set(name, { name, config, startedAt: 0, crashes: 0 });
+      this.states.set(name, { name, config, startedAt: 0, failures: 0, retryAt: 0, lastBadLineLog: -Infinity });
     }
     this.loadPolicy = typeof policy === "function" ? policy : () => policy;
     this.callTimeoutMs = opts.callTimeoutMs ?? DEFAULT_CALL_TIMEOUT_MS;
     this.listTimeoutMs = opts.listTimeoutMs ?? DEFAULT_LIST_TIMEOUT_MS;
+    this.startTimeoutMs = opts.startTimeoutMs ?? DEFAULT_START_TIMEOUT_MS;
     this.baseEnv = opts.baseEnv ?? process.env;
     this.log = opts.log ?? ((line) => process.stderr.write(`${line}\n`));
-    this.setTimer = opts.setTimeout ?? ((fn, ms) => setTimeout(fn, ms).unref());
-    this.clearTimer = opts.clearTimeout ?? ((h) => clearTimeout(h as NodeJS.Timeout));
+    this.now = opts.now ?? Date.now;
   }
 
   /** The configured server names (for the hello). */
@@ -297,35 +357,57 @@ export class McpProxy {
     return this.states.get(server)?.client !== undefined;
   }
 
-  /** Every tool the policy allows (trusted: all), from every server that could be started. */
+  /**
+   * Every tool the policy allows (trusted: all), from every server that could be started. Each server gets one
+   * deadline for starting and listing; a server that misses it, or fails, contributes nothing (and is logged).
+   */
   async listTools(): Promise<ProxiedTool[]> {
     const policy = this.loadPolicy();
-    const lists = await Promise.all(
-      [...this.states.values()].map(async (state) => {
-        try {
-          const client = await this.ensure(state);
-          const tools: ProxiedTool[] = [];
-          let cursor: string | undefined;
-          for (let page = 0; page < 20; page++) {
-            const r = await client.listTools(cursor ? { cursor } : undefined, { timeout: this.listTimeoutMs });
-            for (const t of r.tools) {
-              if (evaluateToolCall(policy, state.name, t.name).result !== "allow") continue;
-              const tool: ProxiedTool = { server: state.name, name: t.name };
-              if (typeof t.description === "string") tool.description = t.description;
-              if (isPlainObject(t.inputSchema)) tool.inputSchema = t.inputSchema;
-              tools.push(tool);
-            }
-            cursor = r.nextCursor;
-            if (!cursor) break;
-          }
-          return tools;
-        } catch (err) {
-          this.log(`direct mode: server ${escapeForTerminal(state.name)}: cannot list tools: ${escapeForTerminal(message(err))}`);
-          return [];
+    const listOne = async (state: ServerState, signal: AbortSignal): Promise<ProxiedTool[]> => {
+      const client = await this.ensure(state);
+      const tools: ProxiedTool[] = [];
+      let cursor: string | undefined;
+      for (let page = 0; page < 20 && !signal.aborted; page++) {
+        const r = await client.listTools(cursor ? { cursor } : undefined, { timeout: this.listTimeoutMs, signal });
+        for (const t of r.tools) {
+          if (evaluateToolCall(policy, state.name, t.name).result !== "allow") continue;
+          const tool: ProxiedTool = { server: state.name, name: t.name };
+          if (typeof t.description === "string") tool.description = t.description;
+          if (isPlainObject(t.inputSchema)) tool.inputSchema = t.inputSchema;
+          tools.push(tool);
         }
+        cursor = r.nextCursor;
+        if (!cursor) break;
+      }
+      return tools;
+    };
+    const states = [...this.states.values()];
+    const settled = await Promise.allSettled(
+      states.map((state) => {
+        const abort = new AbortController();
+        let timer: NodeJS.Timeout | undefined;
+        const deadline = new Promise<never>((_, reject) => {
+          timer = setTimeout(() => {
+            abort.abort();
+            reject(new Error(`did not finish within ${this.listTimeoutMs / 1000} s`));
+          }, this.listTimeoutMs);
+          timer.unref();
+        });
+        const work = listOne(state, abort.signal);
+        work.catch(() => {});
+        return Promise.race([work, deadline]).finally(() => clearTimeout(timer));
       }),
     );
-    return lists.flat();
+    const out: ProxiedTool[] = [];
+    settled.forEach((r, i) => {
+      if (r.status === "fulfilled") {
+        out.push(...r.value);
+      } else {
+        const name = escapeForTerminal(states[i]!.name);
+        this.log(`direct mode: server ${name}: cannot list tools: ${escapeForTerminal(message(r.reason))}`);
+      }
+    });
+    return out;
   }
 
   /** Calls a tool if the policy allows it now. Throws with the reason otherwise, or when the call fails. */
@@ -359,29 +441,24 @@ export class McpProxy {
         const callId = msg.callId;
         void this.call(msg.server, msg.tool, msg.args)
           .then((result) => reply({ type: "tools.result", callId, ok: true, result: fitResult(result) }))
-          .catch((err: unknown) => reply({ type: "tools.result", callId, ok: false, error: message(err).slice(0, MAX_ERROR) }));
+          .catch((err: unknown) => reply({ type: "tools.result", callId, ok: false, error: cutText(message(err), MAX_ERROR) }));
       }
     } catch {
       // A malformed message must not take the connection down.
     }
   }
 
-  /** Stops every server and any pending restart. Later lists and calls fail. */
+  /** Stops every server: a running one gently (stdin closed, then signals), one still starting at once. */
   async close(): Promise<void> {
     this.closed = true;
     await Promise.all(
       [...this.states.values()].map(async (state) => {
-        if (state.restartTimer !== undefined) this.clearTimer(state.restartTimer);
-        state.restartTimer = undefined;
         const transport = state.transport;
+        const starting = state.starting !== undefined;
         state.client = undefined;
         state.transport = undefined;
-        try {
-          await state.starting;
-        } catch {
-          // Failed to start: nothing to stop.
-        }
-        await (state.transport ?? transport)?.close();
+        if (!transport) return;
+        await (starting ? transport.kill() : transport.close());
       }),
     );
   }
@@ -399,7 +476,7 @@ export class McpProxy {
         continue;
       }
       const info: { name: string; description?: string; inputSchema?: Record<string, unknown> } = { name: t.name };
-      if (t.description !== undefined) info.description = t.description.slice(0, MAX_DESCRIPTION);
+      if (t.description !== undefined) info.description = cutText(t.description, MAX_DESCRIPTION);
       if (t.inputSchema !== undefined) info.inputSchema = t.inputSchema;
       let size: number;
       try {
@@ -423,9 +500,10 @@ export class McpProxy {
     if (this.closed) return Promise.reject(new Error("direct mode is shut down"));
     if (state.client) return Promise.resolve(state.client);
     if (state.starting) return state.starting;
-    if (state.restartTimer !== undefined) {
-      const secs = Math.max(1, Math.ceil(((state.restartAt ?? Date.now()) - Date.now()) / 1000));
-      return Promise.reject(new Error(`server ${JSON.stringify(state.name)} stopped unexpectedly; restarting in ${secs} s`));
+    const wait = state.retryAt - this.now();
+    if (wait > 0) {
+      const secs = Math.max(1, Math.ceil(wait / 1000));
+      return Promise.reject(new Error(`server ${JSON.stringify(state.name)} stopped unexpectedly; try again in ${secs} s`));
     }
     state.starting = this.start(state).finally(() => {
       state.starting = undefined;
@@ -449,56 +527,77 @@ export class McpProxy {
         this.log(`server ${escapeForTerminal(state.name)}: ${escapeForTerminal(shown)}`);
         if (stderrLines === MAX_STDERR_LINES) this.log(`server ${escapeForTerminal(state.name)}: further stderr output not shown`);
       },
+      () => {
+        const now = this.now();
+        if (now - state.lastBadLineLog < BAD_LINE_LOG_INTERVAL_MS) return;
+        state.lastBadLineLog = now;
+        this.log(`direct mode: server ${escapeForTerminal(state.name)}: skipped output that is not JSON-RPC`);
+      },
     );
     const client = new Client({ name: "hoistline-agent", version: "0.0.0" });
     client.onerror = () => {
       // Transport errors surface as failed requests or a close.
     };
     let intentional = false;
+    let counted = false;
+    // One failure per start attempt, whether noticed by the close or by the failed start.
+    const fail = () => {
+      if (counted || this.closed) return;
+      counted = true;
+      this.failed(state);
+    };
     state.transport = transport;
     transport.onclose = () => {
       if (state.transport === transport) {
         state.transport = undefined;
         state.client = undefined;
       }
-      if (!intentional && !this.closed) this.crashed(state);
+      if (!intentional) fail();
     };
+    // Spawn, initialize and the initialized notification, all under one deadline.
+    let timer: NodeJS.Timeout | undefined;
+    const deadline = new Promise<never>((_, reject) => {
+      timer = setTimeout(
+        () => reject(new Error(`did not start within ${this.startTimeoutMs / 1000} s`)),
+        this.startTimeoutMs,
+      );
+      timer.unref();
+    });
+    const connecting = client.connect(transport, { timeout: this.startTimeoutMs });
+    connecting.catch(() => {});
     try {
-      await client.connect(transport, { timeout: this.listTimeoutMs });
+      await Promise.race([connecting, deadline]);
     } catch (err) {
-      // Could not spawn, exited, or did not initialize in time: a crash (crashed() schedules one restart at most).
       intentional = true;
       if (state.transport === transport) state.transport = undefined;
-      await transport.close();
-      if (!this.closed) this.crashed(state);
+      await transport.kill();
+      fail();
       throw err;
+    } finally {
+      clearTimeout(timer);
     }
     if (this.closed || state.transport !== transport) {
       intentional = true;
-      await transport.close();
+      await transport.kill();
       throw new Error("direct mode is shut down");
     }
     state.client = client;
-    state.startedAt = Date.now();
+    state.startedAt = this.now();
     return client;
   }
 
-  private crashed(state: ServerState): void {
-    if (state.restartTimer !== undefined) return;
-    if (state.startedAt > 0 && Date.now() - state.startedAt >= STABLE_UPTIME_MS) state.crashes = 0;
-    const delay = McpProxy.restartDelay(state.crashes);
-    state.crashes++;
+  /** A crash or failed start: no new start before the backoff delay, and only when something asks. */
+  private failed(state: ServerState): void {
+    const now = this.now();
+    if (state.startedAt > 0 && now - state.startedAt >= STABLE_UPTIME_MS) state.failures = 0;
+    state.failures++;
     state.startedAt = 0;
-    this.log(`direct mode: server ${escapeForTerminal(state.name)} stopped; restarting in ${delay / 1000} s`);
-    state.restartAt = Date.now() + delay;
-    state.restartTimer = this.setTimer(() => {
-      state.restartTimer = undefined;
-      state.restartAt = undefined;
-      if (this.closed) return;
-      this.ensure(state).catch(() => {
-        // Logged as a crash; the next restart is already scheduled.
-      });
-    }, delay);
+    const delay = state.failures >= MAX_QUICK_RETRIES ? RESTART_MAX_MS : McpProxy.restartDelay(state.failures - 1);
+    state.retryAt = now + delay;
+    this.log(
+      `direct mode: server ${escapeForTerminal(state.name)} stopped or did not start; it is started again on the ` +
+        `next use after ${delay / 1000} s`,
+    );
   }
 }
 
@@ -518,7 +617,7 @@ function fitResult(result: unknown): unknown {
   for (const item of content) {
     if (keep <= 0) break;
     if (isPlainObject(item) && item.type === "text" && typeof item.text === "string") {
-      const text = item.text.slice(0, keep);
+      const text = cutText(item.text, keep);
       keep -= text.length;
       parts.push(text);
     }

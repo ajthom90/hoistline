@@ -83,6 +83,7 @@ export {
 export { AGENT_VERSION, main, type CliDeps, type CliIO } from "./cli.js";
 export {
   ASK_DENIED_REASON,
+  DEFAULT_LIST_TIMEOUT_MS,
   McpProxy,
   SERVER_NAME,
   ServersFileSchema,
