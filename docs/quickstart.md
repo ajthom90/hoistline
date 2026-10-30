@@ -67,6 +67,10 @@ docker compose logs hub     # expect "Hoistline hub listening on port 3000"
 published), compose builds the image from the `Dockerfile` beside `docker-compose.yml`, so in that case run it from
 a checkout of this repository.
 
+A local build is tagged `ghcr.io/ajthom90/hoistline-hub:latest` too, and compose keeps using it from then on. To
+switch to the published image, run `docker compose pull` (then `docker compose up -d`), or
+`docker compose up -d --pull always`. Do the same to update.
+
 The hub listens on `127.0.0.1:3000` on the host only. On TrueNAS, see
 [deploy/truenas/README.md](../deploy/truenas/README.md).
 

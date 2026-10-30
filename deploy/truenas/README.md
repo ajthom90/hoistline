@@ -4,7 +4,9 @@ There is no Hoistline app in the TrueNAS catalog. You run the hub as a custom ap
 
 **Not verified on TrueNAS.** These steps follow the compose file that `scripts/smoke-docker.sh` tests on Docker, but
 nobody has run them on a TrueNAS system yet, and menu names differ between TrueNAS versions. TrueNAS 24.10
-(Electric Eel) and later run apps with Docker and accept compose YAML; earlier versions do not.
+(Electric Eel) and later run apps with Docker and accept compose YAML; earlier versions do not. The image's
+healthcheck uses `--start-interval`, which needs Docker Engine 25 or later; check the version your TrueNAS release
+ships (`docker version` in a host shell).
 
 Before you start, create the GitHub OAuth app and pick the public hostname as in
 [the quickstart](../../docs/quickstart.md), steps 1 and 2.
