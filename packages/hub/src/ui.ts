@@ -280,7 +280,8 @@ export function uiRouter(deps: UiDeps): express.Router {
       const description = j.reason === undefined ? undefined : describeReason(j.reason);
       const reason =
         j.reason === undefined ? "" : `<span class="mono">${h(j.reason)}</span>${description ? `<div>${h(description)}</div>` : ""}`;
-      const prompt = j.prompt.length > 120 ? `${j.prompt.slice(0, 120)}...` : j.prompt;
+      const points = [...j.prompt];
+      const prompt = points.length > 120 ? `${points.slice(0, 120).join("")}...` : j.prompt;
       const cancel = ACTIVE.includes(j.status)
         ? form(`/ui/jobs/${j.id}/cancel`, session.csrf, `<button type="submit">Cancel</button>`)
         : "";

@@ -570,6 +570,15 @@ describe("jobs", () => {
     expect(hub.jobs.status(alice.id, own.id)).toBe("cancelled");
   });
 
+  it("cuts long prompts at a code point, never inside a surrogate pair", async () => {
+    const { hub, alice, laptop } = await setup();
+    const prompt = `${"a".repeat(119)}😀${"b".repeat(10)}`;
+    hub.jobs.delegate(alice.id, { machine: laptop.machineId, ...delegateArgs, prompt });
+    const { html } = await page(hub, browser, "/ui/jobs");
+    expect(html).toContain(`${"a".repeat(119)}😀...`);
+    expect(html).not.toContain("�");
+  });
+
   it("escapes job prompts and reasons", async () => {
     const { hub, alice, laptop } = await setup();
     const job = hub.jobs.delegate(alice.id, { machine: laptop.machineId, ...delegateArgs, prompt: "<b>prompt</b>" });
