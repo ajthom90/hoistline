@@ -126,7 +126,7 @@ curl -s -X POST $HUB/register -H 'content-type: application/json' \
 
 ## PENDING: does claude.ai fetch the tool list again during a conversation?
 
-Direct mode (see `docs/direct-mode.md`) offers each online machine's proxied tools by name. The `/mcp` endpoint is
+Direct mode (see `docs/direct-mode.md`) offers the proxied tools of each online machine you own by name. The `/mcp` endpoint is
 stateless, so the hub cannot send `notifications/tools/list_changed`; every `tools/list` request is answered with the
 current tools, but only if the client asks again. **To be checked by the author:**
 
