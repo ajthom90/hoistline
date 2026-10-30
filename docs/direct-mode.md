@@ -79,7 +79,11 @@ The agent reads the policy again on every call, so a change applies at once.
 a tool that is not allowed is refused with: "this tool needs the owner's approval, which direct mode cannot wait
 for; ask the owner to allow it in the policy". Add the tool to `tools` to allow it.
 
-Tools the policy does not allow are left out of the tool list the hub sees.
+Tools the policy does not allow are left out of the tool list the hub sees. The hub asks the agent for that list
+each time the agent connects (at `run` start and on every reconnect) and keeps it until the connection ends; it is
+not refreshed when the policy changes. So after a policy edit, calls are allowed or refused at once (the agent checks
+every call), but a newly allowed tool appears in the hub's list, and a removed one leaves it, only after you restart
+`run` or the agent reconnects.
 
 ## 3. Use the tools
 

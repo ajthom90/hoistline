@@ -3,7 +3,8 @@
 Every machine's owner sets its policy on the machine, with `hoistline-agent setup`. The agent enforces it; the hub
 cannot change or override it. The policy is `policy.json` in the agent's home (`$HOISTLINE_AGENT_HOME`, default
 `~/.hoistline`). See it with `hoistline-agent policy show`. The agent reads it for every job and tool call, so edits
-apply without a restart. A missing or invalid policy file denies everything.
+apply without a restart (only the direct-mode tool list the hub shows waits for a restart or reconnect; see
+[direct mode](direct-mode.md)). A missing or invalid policy file denies everything.
 
 Every job (task mode) is signed by the hub, and the agent checks the signature before anything else, in restricted and
 trusted mode alike. Direct-mode tool calls are not signed; the agent checks them against the policy on every call (see
