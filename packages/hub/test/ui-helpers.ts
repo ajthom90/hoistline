@@ -85,14 +85,23 @@ export const oidcHub: Partial<AppDeps> = {
   oidc: { issuer: OIDC_ISSUER, clientId: "oidc-client", clientSecret: "oidc-secret" },
 };
 
-/** A user agent with its own cookie jar; requests never follow redirects. */
+/**
+ * A user agent with its own cookie jar; requests never follow redirects. Like a real browser, a cookie is sent only
+ * to request paths under its Path attribute (case-sensitive); hosts and ports are not distinguished.
+ */
 export class Browser {
   readonly cookies = new Map<string, string>();
+  readonly cookiePaths = new Map<string, string>();
   readonly setCookieHeaders: string[] = [];
 
   async request(url: string | URL, init: RequestInit = {}): Promise<Response> {
     const headers = new Headers(init.headers);
-    if (this.cookies.size) headers.set("cookie", [...this.cookies].map(([k, v]) => `${k}=${v}`).join("; "));
+    const pathname = new URL(url).pathname;
+    const sent = [...this.cookies].filter(([name]) => {
+      const path = this.cookiePaths.get(name) ?? "/";
+      return path === "/" || pathname === path || pathname.startsWith(`${path}/`);
+    });
+    if (sent.length) headers.set("cookie", sent.map(([k, v]) => `${k}=${v}`).join("; "));
     const res = await fetch(url, { ...init, headers, redirect: "manual" });
     for (const header of res.headers.getSetCookie()) {
       this.setCookieHeaders.push(header);
@@ -100,8 +109,13 @@ export class Browser {
       const eq = pair.indexOf("=");
       const name = pair.slice(0, eq);
       const value = pair.slice(eq + 1);
-      if (value === "" || /max-age=0/i.test(header)) this.cookies.delete(name);
-      else this.cookies.set(name, value);
+      if (value === "" || /max-age=0/i.test(header)) {
+        this.cookies.delete(name);
+        this.cookiePaths.delete(name);
+      } else {
+        this.cookies.set(name, value);
+        this.cookiePaths.set(name, /;\s*path=([^;]*)/i.exec(header)?.[1]?.trim() || "/");
+      }
     }
     return res;
   }

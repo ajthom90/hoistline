@@ -62,13 +62,13 @@ function isSecure(publicUrl: string): boolean {
  * hl_session cookie and lands on /ui.
  */
 export function uiLoginHandler(store: Store, sessions: UiSessions, publicUrl: string) {
-  return (identity: UserIdentity, res: Response): void => {
+  return (identity: UserIdentity, res: Response, previousSession?: string): void => {
     const key = userKey(identity);
     const user = key && store.getUserByKey(key.provider, key.subject);
     if (!user) throw new Error("the hub could not find the user that just logged in");
-    // The browser's previous session (whoever it belonged to) ends: one live session per browser.
-    const previous = parseCookies(res.req.headers.cookie).get(SESSION_COOKIE);
-    if (previous) sessions.delete(previous);
+    // The browser's previous session (whoever it belonged to) ends: one live session per browser. Its cookie is
+    // scoped to /ui, so it was read at GET /ui/login and carried through the login, not read here at the callback.
+    if (previousSession) sessions.delete(previousSession);
     const { id } = sessions.create(user.id);
     res.append(
       "Set-Cookie",
@@ -92,9 +92,9 @@ export function uiRouter(deps: UiDeps): express.Router {
   router.get("/ui/style.css", (_req, res) => {
     res.type("text/css").send(STYLE_CSS);
   });
-  router.get("/ui/login", async (_req, res, next) => {
+  router.get("/ui/login", async (req, res, next) => {
     try {
-      await login.startUi(res);
+      await login.startUi(res, parseCookies(req.headers.cookie).get(SESSION_COOKIE));
     } catch (err) {
       next(err);
     }

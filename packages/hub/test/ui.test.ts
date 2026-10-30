@@ -212,8 +212,10 @@ describe("CSRF and headers", () => {
     expect((await browser.postForm(`${hub.url}/UI/pair`, {})).status).toBe(303);
     expect((await browser.postForm(`${hub.url}/UI/TOKENS`, { name: "x" })).status).toBe(303);
     await uiLogin(hub, browser);
-    expect((await browser.postForm(`${hub.url}/UI/pair`, {})).status).toBe(403);
-    expect((await browser.postForm(`${hub.url}/Ui/Tokens`, { name: "x" })).status).toBe(403);
+    // Browsers keep the Path=/ui cookie off /UI paths; a client that sends it anyway still needs the CSRF token.
+    const session = { cookie: `hl_session=${browser.cookies.get("hl_session")}` };
+    expect((await browser.postForm(`${hub.url}/UI/pair`, {}, session)).status).toBe(403);
+    expect((await browser.postForm(`${hub.url}/Ui/Tokens`, { name: "x" }, session)).status).toBe(403);
     expect(hub.store.db.prepare("SELECT count(*) AS n FROM personal_access_tokens").get()).toEqual({ n: 0 });
     expect((await browser.request(`${hub.url}/ui/pair`, { method: "PUT" })).status).toBe(404);
   });
@@ -233,8 +235,9 @@ describe("CSRF and headers", () => {
       throw new Error("secret-internal-detail");
     };
     try {
+      const session = { cookie: `hl_session=${browser.cookies.get("hl_session")}` };
       for (const path of ["/ui", "/UI"]) {
-        const res = await browser.request(`${hub.url}${path}`);
+        const res = await browser.request(`${hub.url}${path}`, { headers: session });
         expect(res.status).toBe(500);
         expect(res.headers.get("content-type")).toContain("text/html");
         const html = await res.text();

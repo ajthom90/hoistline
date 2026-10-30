@@ -49,7 +49,7 @@ export interface LoginFlowOptions {
    * Completes a web UI login (started with startUi) for an allowed user, after onLogin: creates the session and
    * answers the browser. Without it, UI logins are not offered.
    */
-  onUiLogin?: (user: UserIdentity, res: Response) => void | Promise<void>;
+  onUiLogin?: (user: UserIdentity, res: Response, carry?: string) => void | Promise<void>;
   /**
    * Whether the user a refresh token was issued to may still use the hub. Defaults to the allowlist against the
    * identifiers the token carries; the hub passes its users table's saved identifiers instead.
@@ -61,6 +61,8 @@ export interface LoginFlowOptions {
 interface PendingUiLogin {
   browserNonce: string;
   expiresAt: number;
+  /** Opaque value from startUi handed back to onUiLogin (the browser's previous UI session, if any). */
+  carry?: string;
 }
 
 /** Binds an in-progress web UI login to the browser that started it (separate from the OAuth login cookie). */
@@ -116,12 +118,13 @@ export class LoginFlow {
 
   /**
    * GET /ui/login: starts a web UI login with the upstream identity provider. The state is random (32 bytes), lives
-   * 10 minutes, is single use and is bound to this browser by a nonce cookie, like an OAuth login.
+   * 10 minutes, is single use and is bound to this browser by a nonce cookie, like an OAuth login. `carry` is kept
+   * with the login and passed to onUiLogin when it completes.
    */
-  async startUi(res: Response): Promise<void> {
+  async startUi(res: Response, carry?: string): Promise<void> {
     if (!this.options.onUiLogin) throw new Error("web UI login is not configured");
     const state = random();
-    const pending: PendingUiLogin = { browserNonce: random(), expiresAt: now() + LOGIN_TTL };
+    const pending: PendingUiLogin = { browserNonce: random(), expiresAt: now() + LOGIN_TTL, ...(carry ? { carry } : {}) };
     this.prune();
     this.uiLogins.set(state, pending);
     res.append("Set-Cookie", this.cookie(UI_LOGIN_COOKIE, pending.browserNonce, LOGIN_TTL));
@@ -251,7 +254,7 @@ export class LoginFlow {
         );
       return;
     }
-    await this.options.onUiLogin!(result.user, res);
+    await this.options.onUiLogin!(result.user, res, pending.carry);
   }
 
   /** Resolves the provider's code to an allowed, recorded user, or says why the login is denied. */
