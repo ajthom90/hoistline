@@ -123,6 +123,20 @@ describe("web login", () => {
     expect((await callback(hub, last, { code: "code-alice", state: upstream.searchParams.get("state")! })).status).toBe(302);
   });
 
+  it("a new login in the same browser deletes the browser's previous session", async () => {
+    const hub = await startHub(ctx);
+    await uiLogin(hub, browser);
+    const previous = browser.cookies.get("hl_session")!;
+    const other = new Browser();
+    await uiLogin(hub, other);
+    await uiLogin(hub, browser);
+    expect(browser.cookies.get("hl_session")).not.toBe(previous);
+    expect(hub.store.db.prepare("SELECT count(*) AS n FROM ui_sessions").get()).toEqual({ n: 2 });
+    const replay = await fetch(`${hub.url}/ui`, { headers: { cookie: `hl_session=${previous}` }, redirect: "manual" });
+    expect(replay.status).toBe(303);
+    expect((await other.request(`${hub.url}/ui`)).status).toBe(200);
+  });
+
   it("logs out: deletes the session and clears the cookie", async () => {
     const hub = await startHub(ctx);
     await uiLogin(hub, browser);

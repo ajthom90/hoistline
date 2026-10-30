@@ -64,6 +64,9 @@ export function uiLoginHandler(store: Store, sessions: UiSessions, publicUrl: st
     const key = userKey(identity);
     const user = key && store.getUserByKey(key.provider, key.subject);
     if (!user) throw new Error("the hub could not find the user that just logged in");
+    // The browser's previous session (whoever it belonged to) ends: one live session per browser.
+    const previous = parseCookies(res.req.headers.cookie).get(SESSION_COOKIE);
+    if (previous) sessions.delete(previous);
     const { id } = sessions.create(user.id);
     res.append(
       "Set-Cookie",
