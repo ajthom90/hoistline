@@ -35,6 +35,7 @@ type StubBehaviour = {
   noInit?: boolean;
   flood?: boolean;
   exitAtStart?: boolean;
+  spewAtStart?: number;
   endlessPages?: number;
   grandchild?: boolean;
 };
@@ -259,6 +260,47 @@ describe("McpProxy", () => {
     await p.call("stub", "echo", {});
     expect(Date.now() - started).toBeLessThan(1500);
     expect(lines.filter((l) => l.includes("not JSON-RPC"))).toHaveLength(1);
+  });
+
+  it("stops a server whose output line is too large, keeps the others working, and restarts it on demand", async () => {
+    const pidFile = join(dir, "pids");
+    const lines: string[] = [];
+    let now = 1_000_000;
+    const p = proxy(
+      { spewer: stub([...TOOLS, { name: "spew" }], {}, pidFile), other: stub(TOOLS) },
+      { mode: "trusted" },
+      { log: (l) => lines.push(l), now: () => now, maxLineBytes: 64 * 1024 },
+    );
+    await p.call("other", "echo", {});
+    await p.call("spewer", "echo", {});
+    const pending = p.call("spewer", "hang", {});
+    pending.catch(() => {});
+    await expect(p.call("spewer", "spew", { bytes: 200 * 1024 })).rejects.toThrow(/server output too large/);
+    await expect(pending).rejects.toThrow(/server output too large/);
+    await waitFor(() => !p.isRunning("spewer"), "the spewer stopped");
+    expect(lines.filter((l) => l.includes("output too large"))).toHaveLength(1);
+    // The process group is gone, the agent is still here and the other server still answers.
+    const [first] = pids(pidFile);
+    if (posix) await waitFor(() => !alive(Number(first)), "the spewer's process gone");
+    expect(JSON.parse(textOf(await p.call("other", "echo", { a: 1 })))).toEqual({ tool: "echo", args: { a: 1 } });
+    // Normal backoff, then the next demand starts it again.
+    await expect(p.call("spewer", "echo", {})).rejects.toThrow(/try again in 1 s/);
+    now += 1000;
+    await p.call("spewer", "echo", {});
+    expect(pids(pidFile)).toHaveLength(2);
+  });
+
+  it("says why a server that writes too large a line while starting did not start", async () => {
+    const p = proxy({ s: stub(TOOLS, {}, undefined, { spewAtStart: 200 * 1024 }) }, { mode: "trusted" }, {
+      maxLineBytes: 64 * 1024,
+    });
+    await expect(p.call("s", "echo", {})).rejects.toThrow(/server output too large/);
+  });
+
+  it("survives an output line over the default 10 MiB limit", async () => {
+    const p = proxy({ spewer: stub([...TOOLS, { name: "spew" }]), other: stub(TOOLS) });
+    await expect(p.call("spewer", "spew", { bytes: 11 * 1024 * 1024 })).rejects.toThrow(/server output too large/);
+    await p.call("other", "echo", {});
   });
 
   it("gives up on a server that never reads its input, within the start deadline, and still shuts down", async () => {

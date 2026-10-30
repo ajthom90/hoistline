@@ -3,7 +3,7 @@ import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
-import { ReadBuffer, serializeMessage } from "@modelcontextprotocol/sdk/shared/stdio.js";
+import { ReadBuffer, STDIO_DEFAULT_MAX_BUFFER_SIZE, serializeMessage } from "@modelcontextprotocol/sdk/shared/stdio.js";
 import type { Transport } from "@modelcontextprotocol/sdk/shared/transport.js";
 import type { JSONRPCMessage } from "@modelcontextprotocol/sdk/types.js";
 import type { AgentToHub, HubToAgent } from "@hoistline/protocol";
@@ -86,6 +86,8 @@ export interface McpProxyOptions {
   log?: (line: string) => void;
   /** Clock for the restart backoff. Default Date.now. */
   now?: () => number;
+  /** Unfinished stdout a server may leave buffered (one line); more stops the server. Default 10 MiB. */
+  maxLineBytes?: number;
 }
 
 const DEFAULT_CALL_TIMEOUT_MS = 55_000;
@@ -143,14 +145,20 @@ class ServerTransport implements Transport {
   onerror?: (error: Error) => void;
   onmessage?: <T extends JSONRPCMessage>(message: T) => void;
   private child?: ChildProcessWithoutNullStreams;
-  private readonly buffer = new ReadBuffer();
+  private readonly buffer: ReadBuffer;
   private drained?: Promise<void>;
+  /** Set once the server wrote a line too large to buffer; it is being killed. */
+  overflowed = false;
 
   constructor(
     private readonly params: { command: string; args: string[]; env: Record<string, string>; cwd?: string },
     private readonly onStderr: (line: string) => void,
     private readonly onBadLine: (error: Error) => void = () => {},
-  ) {}
+    private readonly onOverflow: () => void = () => {},
+    maxLineBytes: number = STDIO_DEFAULT_MAX_BUFFER_SIZE,
+  ) {
+    this.buffer = new ReadBuffer({ maxBufferSize: maxLineBytes });
+  }
 
   get pid(): number | undefined {
     return this.child?.pid;
@@ -185,16 +193,25 @@ class ServerTransport implements Transport {
       });
       // When the server exits, whatever it left running in its process group goes too. Done on exit, not only
       // on close: a leftover process holding the pipes would delay close forever.
+      // Only here: by close the group id may already belong to someone else.
       child.once("exit", () => signal(child, "SIGKILL"));
       child.once("close", () => {
-        signal(child, "SIGKILL");
         untrack();
         this.child = undefined;
         this.onclose?.();
       });
       child.stdin.on("error", (err) => this.onerror?.(err));
       child.stdout.on("data", (chunk: Buffer) => {
-        this.buffer.append(chunk);
+        if (this.overflowed) return;
+        try {
+          this.buffer.append(chunk);
+        } catch {
+          // A line longer than the buffer allows (the buffer is cleared): a broken server, stopped like a crash.
+          this.overflowed = true;
+          this.onOverflow();
+          void this.kill();
+          return;
+        }
         // Each line on its own: a line that is not JSON-RPC is skipped, never stalling the ones after it.
         for (;;) {
           let msg: JSONRPCMessage | null;
@@ -323,6 +340,7 @@ export class McpProxy {
   private readonly baseEnv: Record<string, string | undefined>;
   private readonly log: (line: string) => void;
   private readonly now: () => number;
+  private readonly maxLineBytes: number;
   private closed = false;
 
   /** The delay before restart number `crashes + 1`: 1 s, 2 s, 4 s ... at most 60 s. */
@@ -345,6 +363,7 @@ export class McpProxy {
     this.baseEnv = opts.baseEnv ?? process.env;
     this.log = opts.log ?? ((line) => process.stderr.write(`${line}\n`));
     this.now = opts.now ?? Date.now;
+    this.maxLineBytes = opts.maxLineBytes ?? STDIO_DEFAULT_MAX_BUFFER_SIZE;
   }
 
   /** The configured server names (for the hello). */
@@ -365,10 +384,15 @@ export class McpProxy {
     const policy = this.loadPolicy();
     const listOne = async (state: ServerState, signal: AbortSignal): Promise<ProxiedTool[]> => {
       const client = await this.ensure(state);
+      const transport = state.transport;
       const tools: ProxiedTool[] = [];
       let cursor: string | undefined;
       for (let page = 0; page < 20 && !signal.aborted; page++) {
-        const r = await client.listTools(cursor ? { cursor } : undefined, { timeout: this.listTimeoutMs, signal });
+        const r = await this.explained(
+          state,
+          transport,
+          client.listTools(cursor ? { cursor } : undefined, { timeout: this.listTimeoutMs, signal }),
+        );
         for (const t of r.tools) {
           if (evaluateToolCall(policy, state.name, t.name).result !== "allow") continue;
           const tool: ProxiedTool = { server: state.name, name: t.name };
@@ -419,7 +443,28 @@ export class McpProxy {
     if (!state) throw new Error(`unknown server ${JSON.stringify(server)}`);
     if (!isPlainObject(args)) throw new Error("tool arguments must be an object");
     const client = await this.ensure(state);
-    return await client.callTool({ name: tool, arguments: args }, undefined, { timeout: this.callTimeoutMs });
+    const transport = state.transport;
+    return await this.explained(
+      state,
+      transport,
+      client.callTool({ name: tool, arguments: args }, undefined, { timeout: this.callTimeoutMs }),
+    );
+  }
+
+  /** The request's own result or error, except that a server stopped for oversized output says so. */
+  private async explained<T>(state: ServerState, transport: ServerTransport | undefined, request: Promise<T>): Promise<T> {
+    try {
+      return await request;
+    } catch (err) {
+      throw transport?.overflowed ? this.overflowError(state) : err;
+    }
+  }
+
+  private overflowError(state: ServerState): Error {
+    return new Error(
+      `server ${JSON.stringify(state.name)}: server output too large (a line over ${this.maxLineBytes} bytes); ` +
+        "the server was stopped",
+    );
   }
 
   /** Answers the hub's tools.list and tools.call; ignores everything else. Never throws. */
@@ -533,6 +578,13 @@ export class McpProxy {
         state.lastBadLineLog = now;
         this.log(`direct mode: server ${escapeForTerminal(state.name)}: skipped output that is not JSON-RPC`);
       },
+      () => {
+        this.log(
+          `direct mode: server ${escapeForTerminal(state.name)}: server output too large (a line over ` +
+            `${this.maxLineBytes} bytes); stopping it`,
+        );
+      },
+      this.maxLineBytes,
     );
     const client = new Client({ name: "hoistline-agent", version: "0.0.0" });
     client.onerror = () => {
@@ -572,7 +624,7 @@ export class McpProxy {
       if (state.transport === transport) state.transport = undefined;
       await transport.kill();
       fail();
-      throw err;
+      throw transport.overflowed ? this.overflowError(state) : err;
     } finally {
       clearTimeout(timer);
     }
