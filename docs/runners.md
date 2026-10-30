@@ -19,8 +19,8 @@ type RunnerContext = { cwd?: string };   // the worktree the job runs in
 
 Adapters are registered with `registerRunner(name, template)`. `buildCommand(spec, ctx?)` turns a signed job into
 `{ file, args, stdin? }`. A runner that has no registered adapter fails with `runner_not_implemented`. `ctx.cwd` is
-the absolute worktree path; Muse and Codex put it in their own workspace flag and refuse to build without it.
-`registerBuiltinRunners()` registers `muse`, `codex` and `build-test` (idempotent; Cursor and Grok come in Task 13).
+the absolute worktree path; Muse, Codex, Cursor and Grok put it in their own workspace flag and refuse to build
+without it. `registerBuiltinRunners()` registers `muse`, `codex`, `cursor`, `grok` and `build-test` (idempotent).
 
 ## Rules every adapter must follow
 
@@ -35,7 +35,10 @@ runner does:
    prompt is one positional argument placed **after a `--`**, so a prompt that starts with `-` can never be read as
    a flag.
 3. **Never interpolate the prompt into a flag.** No `--prompt=${prompt}`, no `-p${prompt}`, and no splitting the
-   prompt into several arguments. The prompt reaches the child exactly as given: spaces, quotes, `$()`, backticks,
+   prompt into several arguments. The one allowed exception is a CLI with no stdin form and a flag-only prompt
+   (Grok): the prompt is then exactly one argv element of the form `--flag=<prompt>`, never two elements. Clap
+   reads everything after the first `=` as that flag's value, so a prompt that begins with `--` cannot become a
+   flag of its own. Adapters that use it must still go through `wrapPromptForArgv` (120 KiB cap). The prompt reaches the child exactly as given: spaces, quotes, `$()`, backticks,
    `;`, newlines and very long text included.
 4. **Model names are validated before the adapter sees them.** `buildCommand` rejects any `model` that does not
    match `^[A-Za-z0-9][A-Za-z0-9._:/-]{0,99}$`, so a model can never look like a flag or carry shell syntax. Pass
@@ -173,7 +176,8 @@ shared mirror carrying over from one job into the next. It does not protect agai
 
 **Rules for adapters:**
 
-- Do not rely on a CLI's own sandbox to isolate one job from another.
+- Do not rely on a CLI's own sandbox to isolate one job from another. The Cursor and Grok adapters do not: neither
+  passes a sandbox flag (see their notes below), and neither adds the git mirror to any writable root.
 - Never add the shared mirror (`<cacheDir>/repos/...`) to a CLI sandbox's writable roots. Note that a worktree's git
   metadata lives in the mirror, so a sandbox that lets the runner commit already has write access to it.
 
@@ -227,12 +231,12 @@ once (`realpath`), builds the command with `buildCommand(spec, { cwd: <real path
     original error as `cause`). That covers `EACCES`, `E2BIG`, and the synchronous throw from `spawn` for an
     argument it cannot pass, such as one containing NUL. `JobSpecSchema` already refuses NUL in every string field.
   - A prompt too large for a CLI that takes it as an argument throws `PromptTooLargeError` from `buildCommand`
-    before anything is spawned (see Muse below).
+    before anything is spawned (see Muse below; Cursor and Grok have the same limit).
   - A `dir` that is not a directory throws a plain `Error`.
 
 ## Prompt preamble
 
-Muse and Codex never see the user's prompt alone. Their adapters send `RUNNER_PREAMBLE + PROMPT_DELIMITER + prompt`
+Muse, Codex, Cursor and Grok never see the user's prompt alone. Their adapters send `RUNNER_PREAMBLE + PROMPT_DELIMITER + prompt`
 (constants in `packages/agent/src/runners/prompt.ts`). The preamble tells the CLI to work only inside the current
 directory, not to run `git commit`, `git push`, `git config` or `git remote`, not to modify git configuration or
 files outside the working directory, and to leave its changes uncommitted (the agent commits afterwards). The
@@ -246,8 +250,8 @@ model, not a control: the sandbox notes below and the hardening above are what a
 | --- | --- | --- | --- | --- | --- |
 | Muse | Task 8 | `muse` (Muse Code 1.4.14) | `muse exec --json --approval-mode never --disable-request-user-input --workspace <worktree> [--model <model>] -- <preamble + prompt>` | one positional after `--` (no stdin form) | `--model <model>` |
 | Codex | Task 8 | `codex` (codex-cli 0.161.0) | `codex exec --json --ignore-user-config --ignore-rules --sandbox workspace-write -C <worktree> [--model <model>] -` | stdin (`-`) | `--model <model>` |
-| Cursor | Task 13 | _to be filled in by Task 13_ | _to be filled in by Task 13_ | | |
-| Grok | Task 13 | _to be filled in by Task 13_ | _to be filled in by Task 13_ | | |
+| Cursor | Task 13 | `cursor-agent` (2026.10.22-27dcf5f) | `cursor-agent -p --output-format stream-json --trust --force --workspace <worktree> [--model <model>] -- <preamble + prompt>` | one positional after `--` (help documents no stdin form) | `--model <model>` |
+| Grok | Task 13 | `grok` (grok 1.0.70) | `grok --output-format streaming-json --cwd <worktree> --always-approve [-m <model>] --single=<preamble + prompt>` | one argv element `--single=<prompt>` (help documents no stdin form) | `-m <model>` |
 | build-test | Task 8 | `sh` (Windows: `cmd.exe`) | `sh -c <command>` (Windows: `cmd.exe /d /s /c "<command>"`, verbatim arguments) | none; `command` is the one argument after `-c` | n/a |
 
 Sources: `muse --help`, `muse exec --help`, `codex --help` and `codex exec --help` on the owner's machine
@@ -298,6 +302,49 @@ the wrapped prompt goes on stdin and nothing from the job reaches the argument l
   the owner's interactive settings; neither should change what a job may run.
 - Not used: `--skip-git-repo-check` (the worktree is a git checkout; not verified against a worktree whose `.git`
   is a file, so a later task should confirm with a real run), `--approve-for-me`, `--worktree`, `--add-dir`.
+
+Cursor and Grok sources: `cursor-agent --help`, `grok --help`, `grok help` and `--version` (2026-10-29). No model
+call was made to check them.
+
+**Cursor.** `cursor-agent -p` prints the response and exits ("has access to all tools, including write and
+shell"). Its help does not say that `-p` reads the prompt from stdin, so the wrapped prompt is the one positional
+after `--` (the `[prompt...]` argument), built with `wrapPromptForArgv` and subject to the 120 KiB limit
+(`prompt_too_large: ... for cursor`).
+
+- `--output-format stream-json`: machine-readable events on stdout, for later tasks to parse.
+- `--force`: a headless run cannot answer approval prompts, so commands must be allowed without asking (denies
+  configured in Cursor still apply, per its help: "unless explicitly denied"). This is a trusted-mode style
+  grant to the runner inside the worktree, with no sandbox backing it (see below).
+- `--trust`: trusts the workspace without a prompt, which a headless run cannot answer.
+- `--workspace <worktree>`: roots the agent at the worktree (it is also the `cwd`).
+- `--sandbox enabled` is **not** passed. The help only says "Explicitly enable or disable sandbox mode (overrides
+  config)"; it does not say the sandbox still lets the agent write inside the workspace, and a sandbox that blocked
+  writes would make every job fail. Without that evidence the flag is omitted, so Cursor runs with whatever sandbox
+  mode the owner's Cursor config sets. A later task may add it after a real run confirms it.
+- Not used: `--approve-mcps` (a repository's MCP config is untrusted repo content), `-w`/`--worktree` (Hoistline
+  manages worktrees), `--resume` and `--continue` (every job is a fresh session), `--yolo` (alias of `--force`).
+
+**Grok.** `grok --single <prompt>` (`-p`) runs one turn headless and exits. `grok --help` and `grok help` document
+no stdin form for the prompt (`--prompt-file` exists but needs a file in the workspace, for the reasons given under
+Muse), so the wrapped prompt is passed as the single argv element `--single=<prompt>`, built with
+`wrapPromptForArgv` (`prompt_too_large: ... for grok` above 120 KiB). This is the allowed exception to rule 3:
+the prompt is one element, and clap reads everything after `=` as the flag's value, so a prompt starting with `--`
+or `-` cannot be taken as another flag. The tests check that such a prompt stays inside that one element.
+
+- `--output-format streaming-json`: streaming JSON events on stdout, for later tasks to parse.
+- `--cwd <worktree>`: the working directory.
+- `--always-approve`: a headless run cannot answer approval prompts. This turns off Grok's tool approvals
+  entirely, with no sandbox behind it (see below).
+- `--sandbox <PROFILE>` is **not** passed: the help shows the flag (and `GROK_SANDBOX`) but documents no profile
+  names or what they allow, so none can be shown to give workspace-write behavior. Grok runs with whatever
+  sandbox the owner's environment or config sets.
+- Not used: `-w`/`--worktree`, `-c`/`--continue`, `-r`/`--resume`.
+
+**Cursor and Grok are not sandboxed by Hoistline, and not isolated from each other.** Neither adapter relies on a
+CLI sandbox to separate one job from another, and neither adds the shared git mirror to any writable root. Both are
+run with their approval prompts off, as the owner's user, so they fall under the accepted residual risk above: they
+can write anywhere the owner can. A worktree's git metadata lives in the mirror, so a runner that can commit can
+also write there.
 
 **Muse and Codex are not configured the same way.** Muse keeps its web tools, its sandbox network mode is
 `proxy-only` (network through Muse's proxy), and it still loads the owner's user config. Codex has network off

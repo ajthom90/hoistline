@@ -42,6 +42,8 @@ export {
   buildCommand,
   buildTestTemplate,
   codexTemplate,
+  cursorTemplate,
+  grokTemplate,
   museTemplate,
   registerBuiltinRunners,
   registerRunner,

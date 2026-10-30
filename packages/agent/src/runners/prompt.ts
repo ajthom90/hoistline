@@ -2,7 +2,7 @@ import { isAbsolute } from "node:path";
 import type { RunnerContext } from "./template.js";
 
 /**
- * Fixed text put in front of every Muse and Codex prompt. The agent commits and pushes the worktree itself, so the
+ * Fixed text put in front of every Muse, Codex, Cursor and Grok prompt. The agent commits and pushes the worktree itself, so the
  * CLI must leave git alone and stay inside its working directory. This is an instruction to the model, not a
  * sandbox (see docs/runners.md).
  */

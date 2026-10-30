@@ -7,7 +7,8 @@ export type RunnerContext = { cwd?: string };
  * A runner adapter: how to turn a job into one child process. `args` and `stdin` receive a spec whose `model` is
  * already validated and whose `command` is stripped unless the runner is `build-test`, plus the context the job
  * runs in. Adapters must pass the prompt via stdin when the CLI supports it, else as a single positional after
- * `--`, and never inside a flag (see docs/runners.md).
+ * `--`, and never inside a flag. The one exception is the single element `--flag=<prompt>` (Grok's `--single=`):
+ * clap cannot read its value as a separate flag (see docs/runners.md).
  */
 export type RunnerTemplate = {
   file: string;

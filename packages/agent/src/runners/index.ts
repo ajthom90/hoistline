@@ -9,6 +9,8 @@ export {
 export { MAX_ARGV_PROMPT_BYTES, PROMPT_DELIMITER, PromptTooLargeError, RUNNER_PREAMBLE } from "./prompt.js";
 export { museTemplate } from "./muse.js";
 export { codexTemplate } from "./codex.js";
+export { cursorTemplate } from "./cursor.js";
+export { grokTemplate } from "./grok.js";
 export { buildTestTemplate } from "./build-test.js";
 export { registerBuiltinRunners } from "./builtin.js";
 export {

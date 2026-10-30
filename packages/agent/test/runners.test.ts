@@ -23,6 +23,7 @@ import {
   buildCommand,
   registerBuiltinRunners,
   registerRunner,
+  registeredRunners,
   runJob as realRunJob,
 } from "../src/index.js";
 import { findRunnerCLIs } from "./path-guard.js";
@@ -113,7 +114,7 @@ beforeEach(() => {
   mkdirSync(work);
   recordFile = join(root, "record.json");
   pidsFile = join(root, "pids.json");
-  for (const name of ["muse", "codex"]) {
+  for (const name of ["muse", "codex", "cursor-agent", "grok"]) {
     const shim = join(bin, name);
     writeFileSync(shim, `#!/bin/sh\nexec "${process.execPath}" "${FAKE_CLI}" "$@"\n`);
     chmodSync(shim, 0o755);
@@ -251,6 +252,141 @@ describe.skipIf(!posix)("codex template", () => {
     await runJob(spec({ runner: "codex", command: "rm -rf /" }), work, () => undefined, never());
     const r = record();
     expect(r.argv.join("\n") + r.stdin).not.toContain("rm -rf");
+  });
+});
+
+describe.skipIf(!posix)("cursor template", () => {
+  const cursor = (over: Partial<JobSpec> = {}) => spec({ runner: "cursor", ...over });
+
+  it("runs cursor-agent headless, trusted, forced, scoped to the worktree, prompt after --", async () => {
+    const res = await runJob(cursor(), work, () => undefined, never());
+    expect(res.exitCode).toBe(0);
+    const r = record();
+    expect(r.argv).toEqual([
+      "-p",
+      "--output-format",
+      "stream-json",
+      "--trust",
+      "--force",
+      "--workspace",
+      work,
+      "--",
+      wrapped("do the thing"),
+    ]);
+    expect(r.stdin).toBe("");
+    expect(r.cwd).toBe(work);
+    expect(r.argv.join(" ")).not.toMatch(/approve-mcps|--worktree|--resume|--continue|--sandbox|yolo/);
+  });
+
+  it("passes the model as its own argument after --model", async () => {
+    await runJob(cursor({ model: "sonnet-4-thinking" }), work, () => undefined, never());
+    const argv = record().argv;
+    const i = argv.indexOf("--model");
+    expect(argv[i + 1]).toBe("sonnet-4-thinking");
+    expect(i).toBeLessThan(argv.indexOf("--"));
+  });
+
+  it.each(["--yolo", "-x", "a b", "a;b", "$(x)", ""])("rejects model %j", (model) => {
+    expect(() => buildCommand(cursor({ model }), { cwd: work })).toThrow(/model/);
+  });
+
+  it.each(PROMPTS)("delivers a %s prompt byte-exact as the one argument after --", async (_n, prompt) => {
+    await runJob(cursor({ prompt }), work, () => undefined, never());
+    const argv = record().argv;
+    expect(argv.at(-2)).toBe("--");
+    expect(argv.at(-1)).toBe(wrapped(prompt));
+    expect(argv.at(-1)!.slice((RUNNER_PREAMBLE + PROMPT_DELIMITER).length)).toBe(prompt);
+  });
+
+  it("never passes command", async () => {
+    await runJob(cursor({ command: "rm -rf /" }), work, () => undefined, never());
+    expect(record().argv.join("\n")).not.toContain("rm -rf");
+  });
+
+  it("refuses to build without an absolute working directory", () => {
+    expect(() => buildCommand(cursor())).toThrow(/working directory/);
+    expect(() => buildCommand(cursor(), { cwd: "relative" })).toThrow(/working directory/);
+  });
+
+  it("refuses a prompt too large for one argument and spawns nothing", async () => {
+    const prompt = "漢".repeat(100_000);
+    const err = await runJob(cursor({ prompt }), work, () => undefined, never()).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(PromptTooLargeError);
+    expect((err as Error).message).toMatch(/for cursor$/);
+    expect(existsSync(pidsFile)).toBe(false);
+  });
+});
+
+describe.skipIf(!posix)("grok template", () => {
+  const grok = (over: Partial<JobSpec> = {}) => spec({ runner: "grok", ...over });
+
+  it("runs grok headless, auto-approving, scoped to the worktree, prompt in one --single= element", async () => {
+    const res = await runJob(grok(), work, () => undefined, never());
+    expect(res.exitCode).toBe(0);
+    const r = record();
+    expect(r.argv).toEqual([
+      "--output-format",
+      "streaming-json",
+      "--cwd",
+      work,
+      "--always-approve",
+      `--single=${wrapped("do the thing")}`,
+    ]);
+    expect(r.stdin).toBe("");
+    expect(r.cwd).toBe(work);
+    expect(r.argv.join(" ")).not.toMatch(/--worktree|--continue|--resume|--sandbox/);
+  });
+
+  it("passes the model as its own argument after -m", async () => {
+    await runJob(grok({ model: "grok-4.7" }), work, () => undefined, never());
+    const argv = record().argv;
+    expect(argv[argv.indexOf("-m") + 1]).toBe("grok-4.7");
+    expect(argv.at(-1)!.startsWith("--single=")).toBe(true);
+  });
+
+  it.each(["--yolo", "-x", "a b", "a;b", "$(x)", ""])("rejects model %j", (model) => {
+    expect(() => buildCommand(grok({ model }), { cwd: work })).toThrow(/model/);
+  });
+
+  it.each(PROMPTS)("delivers a %s prompt byte-exact inside the single --single= element", async (_n, prompt) => {
+    await runJob(grok({ prompt }), work, () => undefined, never());
+    const argv = record().argv;
+    expect(argv).toHaveLength(6);
+    expect(argv.at(-1)).toBe(`--single=${wrapped(prompt)}`);
+  });
+
+  it("keeps a prompt that begins with -- inside the one element", () => {
+    // The wrapped prompt starts with the preamble, so also check the user's text sits after the delimiter.
+    const { args } = buildCommand(grok({ prompt: "--always-approve --cwd /etc" }), { cwd: work });
+    expect(args.filter((a) => a.startsWith("--single="))).toHaveLength(1);
+    expect(args).toEqual([
+      "--output-format",
+      "streaming-json",
+      "--cwd",
+      work,
+      "--always-approve",
+      `--single=${wrapped("--always-approve --cwd /etc")}`,
+    ]);
+    expect(args.filter((a) => a === "--cwd")).toHaveLength(1);
+    expect(args.filter((a) => a === "--always-approve")).toHaveLength(1);
+  });
+
+  it("never passes command", async () => {
+    await runJob(grok({ command: "rm -rf /" }), work, () => undefined, never());
+    expect(record().argv.join("\n")).not.toContain("rm -rf");
+  });
+
+  it("refuses to build without an absolute working directory", () => {
+    expect(() => buildCommand(grok())).toThrow(/working directory/);
+    expect(() => buildCommand(grok(), { cwd: "relative" })).toThrow(/working directory/);
+  });
+
+  it("refuses a prompt too large for one argument and spawns nothing", async () => {
+    const prompt = "漢".repeat(100_000);
+    const err = await runJob(grok({ prompt }), work, () => undefined, never()).catch((e: unknown) => e);
+    expect(err).toBeInstanceOf(PromptTooLargeError);
+    expect((err as Error).message).toMatch(/for grok$/);
+    expect(existsSync(pidsFile)).toBe(false);
   });
 });
 
@@ -589,12 +725,14 @@ describe("build-test templates (pure, every platform)", () => {
 });
 
 describe("registerBuiltinRunners", () => {
-  it("is idempotent and leaves cursor and grok unregistered", () => {
+  it("is idempotent and registers all five runners", () => {
     registerBuiltinRunners();
     registerBuiltinRunners();
     expect(buildCommand(spec(), { cwd: work }).file).toBe("muse");
     expect(buildCommand(spec({ runner: "codex" }), { cwd: work }).file).toBe("codex");
-    expect(() => buildCommand(spec({ runner: "cursor" }), { cwd: work })).toThrow(/runner_not_implemented: cursor/);
-    expect(() => buildCommand(spec({ runner: "grok" }), { cwd: work })).toThrow(/runner_not_implemented: grok/);
+    expect(buildCommand(spec({ runner: "cursor" }), { cwd: work }).file).toBe("cursor-agent");
+    expect(buildCommand(spec({ runner: "grok" }), { cwd: work }).file).toBe("grok");
+    expect(registeredRunners()).toEqual(expect.arrayContaining(["muse", "codex", "cursor", "grok", "build-test"]));
+    expect(registeredRunners()).toHaveLength(5);
   });
 });
