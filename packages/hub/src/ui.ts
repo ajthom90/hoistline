@@ -26,6 +26,8 @@ export interface UiDeps {
 }
 
 const ACTIVE: readonly string[] = ACTIVE_JOB_STATUSES;
+/** GitHub's login syntax: up to 39 letters, digits and hyphens. */
+const GITHUB_LOGIN = /^[A-Za-z0-9-]{1,39}$/;
 
 interface Ctx {
   user: User;
@@ -238,8 +240,14 @@ export function uiRouter(deps: UiDeps): express.Router {
 
   /** The store's share target: `github:<login>` on GitHub hubs; on OIDC hubs an existing user only, as `user:<id>`. */
   const shareTarget = (login: string): string => {
-    if (!deps.oidcProvider) return `github:${login}`;
-    return login.startsWith("user:") ? login : `user:${login}`;
+    if (deps.oidcProvider) return login.startsWith("user:") ? login : `user:${login}`;
+    if (/^user:/i.test(login)) {
+      throw new UiError(400, "This hub signs in with GitHub: share by GitHub login, not by user id.");
+    }
+    if (!GITHUB_LOGIN.test(login)) {
+      throw new UiError(400, "Enter a GitHub login (letters, digits and hyphens), such as octocat.");
+    }
+    return `github:${login}`;
   };
 
   router.post("/ui/unshare", (req, res) => {

@@ -8,6 +8,7 @@ import {
   disposeContext,
   mcpClient,
   newContext,
+  oidcHub,
   onlineAgent,
   page,
   pair,
@@ -341,6 +342,52 @@ describe("machines", () => {
     ]);
     // Unknown logins are refused.
     expect((await post(hub, browser, "/ui/share", { machineId: laptop.machineId, login: "nobody" })).status).toBe(400);
+  });
+
+  it("refuses sharing a machine with its owner", async () => {
+    const hub = await startHub(ctx);
+    const alice = await uiLogin(hub, browser);
+    const laptop = await pair(hub, alice, "laptop");
+    for (const login of ["alice", "ALICE"]) {
+      const res = await post(hub, browser, "/ui/share", { machineId: laptop.machineId, login });
+      expect(res.status).toBe(400);
+      expect(await res.text()).toContain("You own this machine; share it with someone else.");
+    }
+    expect(hub.store.listShares(alice.id, laptop.machineId)).toEqual([]);
+  });
+
+  it("on a GitHub hub, refuses a pasted user:<id> or anything that is not a GitHub login, with a clear message", async () => {
+    const hub = await startHub(ctx);
+    const alice = await uiLogin(hub, browser);
+    const bob = await uiLogin(hub, new Browser(), "code-bob");
+    const laptop = await pair(hub, alice, "laptop");
+    const byId = await post(hub, browser, "/ui/share", { machineId: laptop.machineId, login: `user:${bob.id}` });
+    expect(byId.status).toBe(400);
+    expect(await byId.text()).toContain("This hub signs in with GitHub: share by GitHub login, not by user id.");
+    const bad = await post(hub, browser, "/ui/share", { machineId: laptop.machineId, login: "github:bob" });
+    expect(bad.status).toBe(400);
+    expect(await bad.text()).toContain("Enter a GitHub login");
+    expect(hub.store.listShares(alice.id, laptop.machineId)).toEqual([]);
+  });
+
+  it("on an OIDC hub, shares and unshares by user:<id> (with or without the prefix)", async () => {
+    const hub = await startHub(ctx, oidcHub);
+    const ada = await uiLogin(hub, browser, "oidc-ada");
+    const beaBrowser = new Browser();
+    const bea = await uiLogin(hub, beaBrowser, "oidc-bea");
+    expect((await page(hub, beaBrowser)).html).toContain(`user:${bea.id}`);
+    const laptop = await pair(hub, ada, "laptop");
+    expect((await post(hub, browser, "/ui/share", { machineId: laptop.machineId, login: `user:${bea.id}` })).status).toBe(303);
+    expect(hub.store.machinesFor(bea.id).map((m) => m.id)).toEqual([laptop.machineId]);
+    expect((await page(hub, beaBrowser)).html).toContain("laptop");
+    const unshare = await post(hub, browser, "/ui/unshare", { machineId: laptop.machineId, target: `user:${bea.id}` });
+    expect(unshare.status).toBe(303);
+    expect(hub.store.machinesFor(bea.id)).toEqual([]);
+    expect((await post(hub, browser, "/ui/share", { machineId: laptop.machineId, login: bea.id })).status).toBe(303);
+    expect(hub.store.machinesFor(bea.id).map((m) => m.id)).toEqual([laptop.machineId]);
+    // Logins are not unique on OIDC hubs, so they are not accepted.
+    expect((await post(hub, browser, "/ui/share", { machineId: laptop.machineId, login: "bea" })).status).toBe(400);
+    expect((await post(hub, browser, "/ui/share", { machineId: laptop.machineId, login: `user:${ada.id}` })).status).toBe(400);
   });
 
   it("never lets a grantee share or unshare, and hides other machines", async () => {

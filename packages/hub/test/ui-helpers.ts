@@ -48,6 +48,43 @@ export const githubFetch = (async (input: string | URL | Request, init?: Request
   throw new Error(`unexpected fetch ${url}`);
 }) as typeof fetch;
 
+export const OIDC_ISSUER = "https://issuer.test";
+/** OIDC codes the stub answers, with the userinfo each one yields. */
+export const OIDC_USERS: Record<string, { sub: string; preferred_username: string }> = {
+  "oidc-ada": { sub: "ada-sub", preferred_username: "ada" },
+  "oidc-bea": { sub: "bea-sub", preferred_username: "bea" },
+};
+
+/** OIDC discovery, token and userinfo for OIDC_USERS only; anything else fails the test. */
+export const oidcFetch = (async (input: string | URL | Request, init?: RequestInit) => {
+  const url = new URL(input instanceof Request ? input.url : input);
+  if (url.href === `${OIDC_ISSUER}/.well-known/openid-configuration`) {
+    return json({
+      issuer: OIDC_ISSUER,
+      authorization_endpoint: `${OIDC_ISSUER}/auth`,
+      token_endpoint: `${OIDC_ISSUER}/token`,
+      userinfo_endpoint: `${OIDC_ISSUER}/userinfo`,
+    });
+  }
+  if (url.href === `${OIDC_ISSUER}/token`) {
+    const code = new URLSearchParams(String(init?.body)).get("code") ?? "";
+    if (!OIDC_USERS[code]) return new Response(JSON.stringify({ error: "invalid_grant" }), { status: 400 });
+    return json({ access_token: `oa-${code}`, token_type: "Bearer" });
+  }
+  if (url.href === `${OIDC_ISSUER}/userinfo`) {
+    const auth = new Headers(init?.headers).get("authorization") ?? "";
+    const user = OIDC_USERS[auth.replace(/^Bearer oa-/, "")];
+    return user ? json(user) : new Response("unauthorized", { status: 401 });
+  }
+  throw new Error(`unexpected fetch ${url}`);
+}) as typeof fetch;
+
+/** Hub options for an OIDC hub answered by oidcFetch. */
+export const oidcHub: Partial<AppDeps> = {
+  fetch: oidcFetch,
+  oidc: { issuer: OIDC_ISSUER, clientId: "oidc-client", clientSecret: "oidc-secret" },
+};
+
 /** A user agent with its own cookie jar; requests never follow redirects. */
 export class Browser {
   readonly cookies = new Map<string, string>();
@@ -159,6 +196,8 @@ export async function uiLogin(hub: Hub, browser: Browser, code = "code-alice"): 
   );
   expect(res.status).toBe(302);
   expect(res.headers.get("location")).toBe("/ui");
+  const oidc = OIDC_USERS[code];
+  if (oidc) return hub.store.getUserByKey(`oidc:${OIDC_ISSUER}`, oidc.sub)!;
   const gh = GITHUB_USERS[code]!;
   return hub.store.getUserByKey("github", String(gh.id))!;
 }

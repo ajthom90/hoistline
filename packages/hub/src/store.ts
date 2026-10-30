@@ -307,6 +307,7 @@ export class Store {
   shareMachine(ownerId: string, machineId: string, target: string): User {
     this.requireOwned(ownerId, machineId);
     const user = this.resolveTarget(target);
+    if (user.id === ownerId) throw new Error("You own this machine; share it with someone else.");
     this.db.prepare("INSERT OR IGNORE INTO machine_shares (machine_id, user_id) VALUES (?, ?)").run(machineId, user.id);
     return toUser(user);
   }
