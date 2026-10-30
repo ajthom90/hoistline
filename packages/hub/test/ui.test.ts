@@ -111,6 +111,18 @@ describe("web login", () => {
     expect(replay.status).toBe(303);
   });
 
+  it("re-checks the allowlist on every request and ends the session of a removed user", async () => {
+    const hub = await startHub(ctx, { allowedUsers: ["github:alice", "github:bob"] });
+    await uiLogin(hub, browser);
+    expect((await browser.request(`${hub.url}/ui`)).status).toBe(200);
+    // The same database served by a hub whose allowlist no longer has alice.
+    const narrowed = await startHub(ctx, { allowedUsers: ["github:bob"] }, hub);
+    const res = await browser.request(`${narrowed.url}/ui`);
+    expect(res.status).toBe(303);
+    expect(res.headers.get("location")).toBe("/ui/login");
+    expect(hub.store.db.prepare("SELECT count(*) AS n FROM ui_sessions").get()).toEqual({ n: 0 });
+  });
+
   it("expires sessions after 12 hours", async () => {
     const hub = await startHub(ctx);
     await uiLogin(hub, browser);

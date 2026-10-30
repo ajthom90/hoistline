@@ -27,6 +27,9 @@ export const GITHUB_USERS: Record<string, { id: number; login: string }> = {
   "code-alice": { id: 1, login: "alice" },
   "code-bob": { id: 2, login: "bob" },
   "code-carol": { id: 3, login: "carol" },
+  // Two GitHub accounts that held the login "octo" one after the other (the first one renamed).
+  "code-octo-old": { id: 10, login: "octo" },
+  "code-octo-new": { id: 11, login: "octo" },
 };
 
 /** GitHub's token exchange and user API, answering the codes in GITHUB_USERS only; anything else fails the test. */

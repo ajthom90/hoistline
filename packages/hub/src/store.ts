@@ -172,9 +172,19 @@ export class Store {
           .run(JSON.stringify(identity.identifiers), record.id);
       }
       if (provider === "github" && login) {
-        this.db
-          .prepare("UPDATE users SET login = '' WHERE provider = ? AND id != ? AND lower(login) = lower(?)")
-          .run(provider, record.id, login);
+        // The stale holders also lose their saved `github:<login>` identifier, so it can no longer satisfy a
+        // `github:<login>` allowlist entry that now names a different account.
+        const stale = this.db
+          .prepare("SELECT id, identifiers FROM users WHERE provider = ? AND id != ? AND lower(login) = lower(?)")
+          .all(provider, record.id, login) as { id: string; identifiers: string | null }[];
+        const staleIdentifier = `github:${login.toLowerCase()}`;
+        for (const user of stale) {
+          const ids = user.identifiers ? (JSON.parse(user.identifiers) as unknown) : null;
+          const kept = Array.isArray(ids) ? ids.filter((id) => typeof id !== "string" || id.toLowerCase() !== staleIdentifier) : null;
+          this.db
+            .prepare("UPDATE users SET login = '', identifiers = ? WHERE id = ?")
+            .run(kept === null ? null : JSON.stringify(kept), user.id);
+        }
       }
       return toUser(record);
     })();
@@ -262,14 +272,6 @@ export class Store {
     if (!row?.identifiers) return null;
     const parsed: unknown = JSON.parse(row.identifiers);
     return Array.isArray(parsed) ? parsed.filter((v): v is string => typeof v === "string") : null;
-  }
-
-  /** Users of one provider whose display login is exactly `login` (logins are not unique outside GitHub). */
-  usersByLogin(provider: string, login: string): User[] {
-    const rows = this.db
-      .prepare("SELECT * FROM users WHERE provider = ? AND login = ? AND login != '' ORDER BY created_at, id")
-      .all(provider, login) as UserRecord[];
-    return rows.map(toUser);
   }
 
   getUser(userId: string): User | null {

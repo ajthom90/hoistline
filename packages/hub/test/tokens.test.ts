@@ -156,6 +156,21 @@ describe("personal access tokens", () => {
     expect(await mcpStatus(byId, token)).toBe(200);
   });
 
+  it("does not let a stale github:<login> identifier match after another account takes the login", async () => {
+    const hub = await startHub(ctx);
+    await uiLogin(hub, browser, "code-octo-old");
+    const oldToken = await createPat(hub, browser, "old");
+    const newBrowser = new Browser();
+    await uiLogin(hub, newBrowser, "code-octo-new");
+    const newToken = await createPat(hub, newBrowser, "new");
+    const byLogin = await startHub(ctx, { allowedUsers: ["github:octo"] }, hub);
+    expect(await mcpStatus(byLogin, oldToken)).toBe(401);
+    expect(await mcpStatus(byLogin, newToken)).toBe(200);
+    // Another identifier of the old account still counts.
+    const byId = await startHub(ctx, { allowedUsers: ["github-id:10"] }, hub);
+    expect(await mcpStatus(byId, oldToken)).toBe(200);
+  });
+
   it("survives logout: revocation is explicit", async () => {
     const hub = await startHub(ctx);
     await uiLogin(hub, browser);

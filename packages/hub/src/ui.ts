@@ -109,6 +109,13 @@ export function uiRouter(deps: UiDeps): express.Router {
       res.redirect(303, "/ui/login");
       return;
     }
+    // A user removed from the allowlist loses the UI at once, like their access tokens.
+    if (!login.isAllowed(store.getUserIdentifiers(user.id) ?? [])) {
+      sessions.delete(sessionId);
+      res.append("Set-Cookie", serializeCookie(SESSION_COOKIE, "", { secure, maxAge: 0, path: "/ui" }));
+      res.redirect(303, "/ui/login");
+      return;
+    }
     res.locals.ui = { user, session, sessionId } satisfies Ctx;
     next();
   };
@@ -159,7 +166,7 @@ export function uiRouter(deps: UiDeps): express.Router {
         "/ui/share",
         csrf,
         hidden("machineId", m.id) +
-          `<input name="login" required maxlength="100" placeholder="${deps.oidcProvider ? "login or user:&lt;id&gt;" : "GitHub login"}"> <button type="submit">Share</button>`,
+          `<input name="login" required maxlength="100" placeholder="${deps.oidcProvider ? "user:&lt;id&gt;" : "GitHub login"}"> <button type="submit">Share</button>`,
       );
       const del = form(
         `/ui/machines/${m.id}/delete`,
@@ -176,7 +183,7 @@ export function uiRouter(deps: UiDeps): express.Router {
       (m) => `<tr><td>${h(m.name)}</td><td>${h(store.getUser(m.ownerId)?.login || "(no login)")}</td><td>${status(m.id)}</td></tr>`,
     );
     const shareId = deps.oidcProvider
-      ? `<p class="muted">Others share machines with you by your login or by <code>user:${h(user.id)}</code>.</p>`
+      ? `<p class="muted">Others share machines with you by your id: <code>user:${h(user.id)}</code>.</p>`
       : "";
     const body =
       notice +
@@ -222,11 +229,7 @@ export function uiRouter(deps: UiDeps): express.Router {
   /** The store's share target: `github:<login>` on GitHub hubs; on OIDC hubs an existing user only, as `user:<id>`. */
   const shareTarget = (login: string): string => {
     if (!deps.oidcProvider) return `github:${login}`;
-    if (login.startsWith("user:")) return login;
-    const users = store.usersByLogin(deps.oidcProvider, login);
-    if (users.length === 0) throw new UiError(400, `${login} has not signed in to Hoistline yet`);
-    if (users.length > 1) throw new UiError(400, `more than one user is called ${login}; share with user:<id> instead`);
-    return `user:${users[0]!.id}`;
+    return login.startsWith("user:") ? login : `user:${login}`;
   };
 
   router.post("/ui/unshare", (req, res) => {
