@@ -6,6 +6,7 @@ import { CLOSE_AUTH_FAILED, type Gateway } from "./gateway.js";
 import { describeReason, type Jobs } from "./jobs.js";
 import { ACTIVE_JOB_STATUSES, type Store, type User } from "./store.js";
 import { AccessTokens, PAT_DEFAULT_DAYS, PAT_MAX_DAYS, TokenRequestError } from "./tokens.js";
+import { SECURITY_HEADERS } from "./ui/headers.js";
 import { form, h, hidden, page, STYLE_CSS, when } from "./ui/render.js";
 import { SESSION_COOKIE, SESSION_TTL_MS, UiSessions, type UiSession } from "./ui/session.js";
 
@@ -23,14 +24,6 @@ export interface UiDeps {
   /** For OIDC hubs, the users-table provider (`oidc:<issuer>`); shares then resolve to existing users only. */
   oidcProvider?: string;
 }
-
-const SECURITY_HEADERS = {
-  "Cache-Control": "no-store",
-  "Content-Security-Policy":
-    "default-src 'none'; style-src 'self'; img-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
-  "X-Frame-Options": "DENY",
-  "Referrer-Policy": "no-referrer",
-};
 
 const ACTIVE: readonly string[] = ACTIVE_JOB_STATUSES;
 

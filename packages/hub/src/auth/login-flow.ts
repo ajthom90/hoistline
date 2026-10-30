@@ -7,6 +7,7 @@ import { parseAllowedUsers } from "./allowlist.js";
 import { CookieSigner, parseCookies, safeEqual, serializeCookie } from "./cookies.js";
 import type { IdentityProvider, UserIdentity } from "./identity.js";
 import type { HubOAuthProvider } from "./in-memory-provider.js";
+import { SECURITY_HEADERS } from "../ui/headers.js";
 
 export const CONSENT_PATH = "/oauth/consent";
 export const LOGIN_CALLBACK_PATH = "/oauth/callback";
@@ -64,6 +65,8 @@ interface PendingUiLogin {
 
 /** Binds an in-progress web UI login to the browser that started it (separate from the OAuth login cookie). */
 const UI_LOGIN_COOKIE = "hl_ui_login";
+/** Live web UI logins kept at most; starting another evicts the oldest. */
+const MAX_UI_LOGINS = 1000;
 
 const now = () => Math.floor(Date.now() / 1000);
 const random = () => randomBytes(32).toString("base64url");
@@ -241,7 +244,7 @@ export class LoginFlow {
       res
         .status(403)
         .type("html")
-        .set({ "Cache-Control": "no-store", "Content-Security-Policy": "default-src 'none'", "X-Frame-Options": "DENY" })
+        .set(SECURITY_HEADERS)
         .send(
           `<!doctype html>\n<html lang="en"><head><meta charset="utf-8"><title>Access denied</title></head>` +
             `<body><h1>Access denied</h1><p>${escapeHtml(result.denied)}</p></body></html>\n`,
@@ -299,9 +302,20 @@ export class LoginFlow {
     return serializeCookie(name, value, { secure: this.secure, maxAge, path: "/" });
   }
 
+  /**
+   * Drops expired logins. Every entry has the same lifetime and a Map iterates in insertion order, so the expired
+   * ones are at the front: the walk stops at the first live entry (O(expired) per call). UI logins (unauthenticated
+   * and cheap to start) are also capped, evicting the oldest.
+   */
   private prune(): void {
-    for (const [state, login] of this.logins) if (login.expiresAt <= now()) this.logins.delete(state);
-    for (const [state, login] of this.uiLogins) if (login.expiresAt <= now()) this.uiLogins.delete(state);
+    const t = now();
+    for (const map of [this.logins, this.uiLogins] as Map<string, { expiresAt: number }>[]) {
+      for (const [state, login] of map) {
+        if (login.expiresAt > t) break;
+        map.delete(state);
+      }
+    }
+    while (this.uiLogins.size >= MAX_UI_LOGINS) this.uiLogins.delete(this.uiLogins.keys().next().value!);
   }
 
   private consentPage(state: string, pending: PendingLogin): string {

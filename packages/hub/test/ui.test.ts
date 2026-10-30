@@ -81,6 +81,12 @@ describe("web login", () => {
     const res = await callback(hub, bob, { code: "code-bob", state: upstream.searchParams.get("state")! });
     expect(res.status).toBe(403);
     expect((await res.text()).toLowerCase()).toContain("access denied");
+    expect(res.headers.get("cache-control")).toBe("no-store");
+    expect(res.headers.get("content-security-policy")).toBe(
+      "default-src 'none'; style-src 'self'; img-src 'self'; form-action 'self'; frame-ancestors 'none'; base-uri 'none'",
+    );
+    expect(res.headers.get("x-frame-options")).toBe("DENY");
+    expect(res.headers.get("referrer-policy")).toBe("no-referrer");
     expect(bob.cookies.has("hl_session")).toBe(false);
     expect(hub.store.getUserByKey("github", "2")).toBeNull();
   });
@@ -96,6 +102,25 @@ describe("web login", () => {
     browser.cookies.delete("hl_session");
     expect((await callback(hub, browser, { code: "code-alice", state })).status).toBe(400);
     expect(browser.cookies.has("hl_session")).toBe(false);
+  });
+
+  it("keeps at most 1000 pending UI logins, evicting the oldest", async () => {
+    const hub = await startHub(ctx);
+    const first = await startUiLogin(hub, browser);
+    for (let batch = 0; batch < 20; batch++) {
+      await Promise.all(
+        Array.from({ length: 50 }, async () => {
+          const res = await fetch(`${hub.url}/ui/login`, { redirect: "manual" });
+          expect(res.status).toBe(302);
+        }),
+      );
+    }
+    // 1001 started: the first was evicted.
+    const evicted = await callback(hub, browser, { code: "code-alice", state: first.searchParams.get("state")! });
+    expect(evicted.status).toBe(400);
+    const last = new Browser();
+    const upstream = await startUiLogin(hub, last);
+    expect((await callback(hub, last, { code: "code-alice", state: upstream.searchParams.get("state")! })).status).toBe(302);
   });
 
   it("logs out: deletes the session and clears the cookie", async () => {
