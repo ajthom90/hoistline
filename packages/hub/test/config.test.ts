@@ -52,6 +52,11 @@ describe("configFromEnv", () => {
     expect(withAllow("email:")).toThrow(/"email:"/);
   });
 
+  it("reads HOISTLINE_VERSION as the MCP server version, leaving it unset when empty", () => {
+    expect(configFromEnv({ ...github, HOISTLINE_VERSION: " 1.2.3-rc.1 " }).deps.version).toBe("1.2.3-rc.1");
+    expect(configFromEnv({ ...github, HOISTLINE_VERSION: "" }).deps).not.toHaveProperty("version");
+  });
+
   it("requires PUBLIC_URL and a login provider", () => {
     expect(() => configFromEnv({ GITHUB_CLIENT_ID: "id", GITHUB_CLIENT_SECRET: "s" })).toThrow(/PUBLIC_URL/);
     expect(() => configFromEnv({ PUBLIC_URL: "https://hub.example.com" })).toThrow(/GITHUB_CLIENT_ID/);

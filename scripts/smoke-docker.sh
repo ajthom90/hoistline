@@ -37,6 +37,10 @@ cleanup() {
   if [ "$status" -eq 0 ]; then echo "smoke: PASS"; else echo "smoke: FAIL" >&2; fi
 }
 trap cleanup EXIT
+# bash skips the EXIT trap when killed by a signal it doesn't trap; exit instead so cleanup runs.
+trap 'exit 143' TERM
+trap 'exit 129' HUP
+trap 'exit 130' INT
 
 fail() {
   echo "smoke: $*" >&2

@@ -29,6 +29,9 @@ export function configFromEnv(env: Env): HubConfig {
   );
   const config = loginConfig(env, publicUrl, port);
   if (allowedUsers.length) config.deps.allowedUsers = allowedUsers;
+  // Set by the release image; the hub falls back to its package.json version.
+  const version = env.HOISTLINE_VERSION?.trim();
+  if (version) config.deps.version = version;
   return config;
 }
 

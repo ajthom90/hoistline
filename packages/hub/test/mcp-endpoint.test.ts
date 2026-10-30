@@ -1,5 +1,5 @@
 import { createHash, randomBytes } from "node:crypto";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { createServer, type Server } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
@@ -290,6 +290,27 @@ describe("MCP endpoint", () => {
       expect(result.content).toEqual([{ type: "text", text: "pong" }]);
     } finally {
       await client.close();
+    }
+  });
+
+  it("reports the configured version in serverInfo, else the package.json version", async () => {
+    const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as { version: string };
+    for (const [extra, expected] of [
+      [{ version: "9.9.9-test" }, "9.9.9-test"],
+      [{}, pkg.version],
+    ] as const) {
+      const hub = await startHub({ fetch: githubStub().fetch, ...extra });
+      const { tokens } = await githubLogin(hub);
+      const client = new Client({ name: "test", version: "0.0.0" });
+      const transport = new StreamableHTTPClientTransport(new URL(`${hub}/mcp`), {
+        requestInit: { headers: { authorization: `Bearer ${String(tokens.access_token)}` } },
+      });
+      await client.connect(transport);
+      try {
+        expect(client.getServerVersion()).toMatchObject({ name: "hoistline", version: expected });
+      } finally {
+        await client.close();
+      }
     }
   });
 });

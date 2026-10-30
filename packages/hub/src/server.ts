@@ -1,4 +1,5 @@
 import { randomBytes } from "node:crypto";
+import { readFileSync } from "node:fs";
 import express from "express";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
@@ -61,7 +62,14 @@ export interface AppDeps {
   jobs?: Jobs;
   /** Direct mode: proxied MCP tools (create it over the same store and gateway, and attach it, separately). */
   directMode?: DirectMode;
+  /** Version reported in the MCP serverInfo; the hub package.json version when omitted. */
+  version?: string;
 }
+
+/** The hub package version (package.json sits one directory above both src/ and dist/). */
+const PACKAGE_VERSION = (
+  JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8")) as { version: string }
+).version;
 
 interface ToolContext {
   store: Store;
@@ -89,8 +97,8 @@ function identityOf(user: User, identifiers: string[]): UserIdentity {
   return { provider: "github", subject: user.subject, name: user.login, identifiers };
 }
 
-function buildMcpServer(ctx?: ToolContext): McpServer {
-  const server = new McpServer({ name: "hoistline", version: "0.0.0" });
+function buildMcpServer(version: string, ctx?: ToolContext): McpServer {
+  const server = new McpServer({ name: "hoistline", version });
   server.registerTool("ping", { description: "Check that the Hoistline hub is reachable." }, async () => ({
     content: [{ type: "text", text: "pong" }],
   }));
@@ -234,7 +242,7 @@ export function createApp(deps: AppDeps): express.Express {
     const hubUser = req.auth?.extra?.hubUser as User | undefined;
     const ctx: ToolContext | undefined =
       machines && hubUser ? { ...machines, jobs: deps.jobs, directMode: deps.directMode, user: hubUser } : undefined;
-    const server = buildMcpServer(ctx);
+    const server = buildMcpServer(deps.version ?? PACKAGE_VERSION, ctx);
     const transport = new StreamableHTTPServerTransport({ sessionIdGenerator: undefined });
     res.on("close", () => {
       void transport.close();

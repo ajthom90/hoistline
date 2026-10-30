@@ -31,12 +31,17 @@ WORKDIR /app
 COPY --from=build /out/package.json ./package.json
 COPY --from=build /out/node_modules ./node_modules
 COPY --from=build /out/dist ./dist
+# The version the hub reports in MCP serverInfo (the release workflow passes the tag's). Empty means the
+# package.json version.
+ARG VERSION=""
 ENV NODE_ENV=production \
     PORT=3000 \
-    DATABASE_PATH=/data/hoistline.db
+    DATABASE_PATH=/data/hoistline.db \
+    HOISTLINE_VERSION=$VERSION
 USER 10001:10001
 VOLUME /data
 EXPOSE 3000
+# --start-interval needs Docker Engine 25 or later (untested on older engines).
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --start-interval=2s --retries=3 \
   CMD node -e "fetch('http://127.0.0.1:'+(process.env.PORT||3000)+'/.well-known/oauth-authorization-server').then(r=>process.exit(r.ok?0:1),()=>process.exit(1))"
 ENTRYPOINT ["/usr/bin/tini", "--"]
