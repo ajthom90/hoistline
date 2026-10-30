@@ -200,7 +200,8 @@ class ServerTransport implements Transport {
         this.child = undefined;
         this.onclose?.();
       });
-      child.stdin.on("error", (err) => this.onerror?.(err));
+      // An unhandled stream error would take the whole agent down; report it as this server's error instead.
+      for (const stream of [child.stdin, child.stdout, child.stderr]) stream.on("error", (err) => this.onerror?.(err));
       child.stdout.on("data", (chunk: Buffer) => {
         if (this.overflowed) return;
         try {
