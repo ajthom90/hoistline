@@ -13,6 +13,12 @@ const CLOSE_PROTOCOL_ERROR = 4400;
 
 const MAX_PAYLOAD = 8 * 1024 * 1024;
 
+/**
+ * Default idle window: the hub pings every 15 s (gateway.ts), so 45 s of silence (3 missed pings) means the
+ * connection is dead, typically half-open after sleep or a network change.
+ */
+export const DEFAULT_IDLE_TIMEOUT_MS = 45_000;
+
 export interface AgentHandlers {
   /** State announced in the hello on every (re)connect. */
   hello(): { agentVersion: string; os?: string; runners: RunnerName[]; runningJobs: string[]; servers: string[] };
@@ -40,6 +46,11 @@ export interface ConnectOptions {
   maxDelayMs?: number;
   /** Give up on a connection that has not been welcomed within this time. Default 10 s. */
   handshakeTimeoutMs?: number;
+  /**
+   * After the handshake, drop the connection (and reconnect) when nothing, not even a ping, has arrived from the
+   * hub for this long. Default 45 s; must comfortably exceed the hub's ping interval (15 s).
+   */
+  idleTimeoutMs?: number;
   /** Jitter source in [0, 1). */
   random?: () => number;
   setTimeout?: (fn: () => void, ms: number) => unknown;
@@ -58,13 +69,15 @@ export function agentSocketUrl(hubUrl: string): string {
 
 /**
  * Keeps an outbound WebSocket to the hub: proves the machine key on each connection, dispatches validated hub
- * messages and reconnects with capped exponential backoff plus jitter. Pings are answered by the socket.
+ * messages and reconnects with capped exponential backoff plus jitter. Pings are answered by the socket; a hub that
+ * sends nothing (no message, ping or pong) for the idle window is treated as gone and the socket is terminated.
  */
 export function connect(identity: AgentIdentity, handlers: AgentHandlers, opts: ConnectOptions = {}): AgentConnection {
   const url = agentSocketUrl(identity.hubUrl);
   const initialDelay = opts.initialDelayMs ?? 1000;
   const maxDelay = opts.maxDelayMs ?? 60_000;
   const handshakeTimeout = opts.handshakeTimeoutMs ?? 10_000;
+  const idleTimeout = opts.idleTimeoutMs ?? DEFAULT_IDLE_TIMEOUT_MS;
   const random = opts.random ?? Math.random;
   const setTimer = opts.setTimeout ?? ((fn, ms) => setTimeout(fn, ms));
   const clearTimer = opts.clearTimeout ?? ((h) => clearTimeout(h as NodeJS.Timeout));
@@ -82,11 +95,25 @@ export function connect(identity: AgentIdentity, handlers: AgentHandlers, opts: 
     socket = ws;
     let phase: "challenge" | "welcome" | "ready" = "challenge";
     const handshakeTimer = setTimer(() => ws.terminate(), handshakeTimeout);
+    let idleTimer: unknown;
+    let closed = false;
+    // Any sign of life from the hub (message, ping, pong) pushes the idle deadline back. A half-open TCP connection
+    // never errors on an idle agent, so this deadline is what notices it and hands over to the reconnect backoff.
+    const touch = (): void => {
+      if (phase !== "ready" || closed) return;
+      if (idleTimer !== undefined) clearTimer(idleTimer);
+      idleTimer = setTimer(() => ws.terminate(), idleTimeout);
+      // Never keep the process alive just for this timer.
+      (idleTimer as { unref?: () => void } | undefined)?.unref?.();
+    };
 
     ws.on("error", () => {
       // A close event follows; reconnecting is handled there.
     });
+    ws.on("ping", touch);
+    ws.on("pong", touch);
     ws.on("message", (data, isBinary) => {
+      touch();
       const msg = isBinary ? undefined : parse(data.toString());
       if (!msg) return ws.close(CLOSE_PROTOCOL_ERROR);
       if (phase === "challenge") {
@@ -106,6 +133,7 @@ export function connect(identity: AgentIdentity, handlers: AgentHandlers, opts: 
         phase = "ready";
         connected = true;
         attempt = 0;
+        touch();
         handlers.onConnected?.();
       } else {
         if (msg.type === "challenge" || msg.type === "welcome") return ws.close(CLOSE_PROTOCOL_ERROR);
@@ -113,7 +141,10 @@ export function connect(identity: AgentIdentity, handlers: AgentHandlers, opts: 
       }
     });
     ws.on("close", (code) => {
+      closed = true;
       clearTimer(handshakeTimer);
+      if (idleTimer !== undefined) clearTimer(idleTimer);
+      idleTimer = undefined;
       if (socket !== ws) return;
       socket = undefined;
       connected = false;
